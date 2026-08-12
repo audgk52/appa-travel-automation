@@ -1,5 +1,8 @@
 """Production-specific dispatch constants (APPA). Swap this file per production."""
 
+# Send the dispatch request this many days before the dispatch date.
+SEND_LEAD_DAYS = 2
+
 HOTEL = "소피텔 (서울 송파구 잠실로 209)"
 
 _AIRPORT_TERMINALS = {

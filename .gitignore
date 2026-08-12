@@ -9,6 +9,7 @@ APPA_Notes_Compiled.md
 *Passport*
 
 # --- Build artifacts ---
+*.app/
 __pycache__/
 *.pyc
 .pytest_cache/
