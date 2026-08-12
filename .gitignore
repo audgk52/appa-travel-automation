@@ -1,0 +1,15 @@
+# --- Sensitive production data (PII) — NEVER commit/push, keep local only ---
+Reference Files/
+05. Hotel Ops/
+APPA_Notes_Compiled.md
+*.xlsx
+*.pdf
+# real Travel Memos / passports / itineraries if ever placed elsewhere
+*passport*
+*Passport*
+
+# --- Build artifacts ---
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
