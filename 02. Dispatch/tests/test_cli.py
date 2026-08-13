@@ -49,3 +49,39 @@ def test_build_schedule_row_pickup():
     assert row["Send Date"] == date(2026, 5, 16)
     assert row["Flight"] == "AC 63"
     assert "공항 픽업" in row["Message"]
+
+
+from dispatch_agent.cli import sync_row_to_calendar
+
+
+class _OkCalendar:
+    def upsert_event(self, row):
+        return "created"
+
+
+class _FailCalendar:
+    def upsert_event(self, row):
+        raise RuntimeError("boom")
+
+
+def test_sync_row_to_calendar_success():
+    status, err = sync_row_to_calendar(_OkCalendar(), {"Name": "X", "Direction": "pickup"})
+    assert status == "created"
+    assert err is None
+
+
+def test_sync_row_to_calendar_surfaces_failure():
+    status, err = sync_row_to_calendar(_FailCalendar(), {"Name": "X", "Direction": "pickup"})
+    assert status is None
+    assert isinstance(err, RuntimeError)
+
+
+def test_main_calendar_disabled_when_unconfigured(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
+    monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
+    sheet = tmp_path / "master.xlsx"
+    from dispatch_agent.cli import main
+
+    main(["--memo", str(MEMO), "--notes", "N/A", "--sheet", str(sheet)])
+    out = capsys.readouterr().out
+    assert "[calendar] disabled" in out
