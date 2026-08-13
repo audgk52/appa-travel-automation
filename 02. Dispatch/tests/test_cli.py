@@ -36,7 +36,7 @@ def test_build_schedule_row_sendoff():
     assert row["Terminal"] == "1"
     assert row["Flight Time"] == "19:35"
     assert row["Dispatch Time"] == "15:35"
-    assert row["Notes"] == "VIP"
+    assert row["Notes"] == "US Line Producer (VIP)"  # role prefill + ad-hoc
     assert "공항 샌딩" in row["Message"]
     assert row["Rev / Updated"].startswith("PINK")
 

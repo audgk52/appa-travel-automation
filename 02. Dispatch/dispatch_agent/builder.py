@@ -1,12 +1,15 @@
 """Build a render-ready DispatchRecord from a TravelMemo + direction + notes."""
 from dispatch_agent import config
-from dispatch_agent.records import DispatchRecord, dispatch_time_and_basis
+from dispatch_agent.records import DispatchRecord, compose_notes, dispatch_time_and_basis
 
 
 def build_record(memo, direction: str, notes: str = "") -> DispatchRecord:
     if direction == "sendoff":
         leg = memo.korea_departure
-        time, basis = dispatch_time_and_basis("sendoff", leg.flight_no, dep_time=leg.depart)
+        lead = config.sendoff_lead_hours(leg.from_code)
+        time, basis = dispatch_time_and_basis(
+            "sendoff", leg.flight_no, dep_time=leg.depart, lead_hours=lead
+        )
         origin = config.HOTEL
         destination = config.airport_address(leg.from_code, leg.terminal)
     elif direction == "pickup":
@@ -20,10 +23,10 @@ def build_record(memo, direction: str, notes: str = "") -> DispatchRecord:
     return DispatchRecord(
         direction=direction,
         date=leg.date.strftime("%Y.%m.%d"),
-        passengers=memo.passenger,
+        passengers=", ".join(memo.travelers),
         dispatch_time=time,
         time_basis=basis,
         origin=origin,
         destination=destination,
-        notes=notes or "N/A",
+        notes=compose_notes(memo.group_note, notes),
     )
