@@ -52,3 +52,51 @@ def build_event(row, *, hour=9, duration_min=15, tz=_TZ):
         "end": {"dateTime": end.isoformat(timespec="seconds"), "timeZone": tz},
         "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 0}]},
     }
+
+
+class CalendarSync:
+    """Idempotent Calendar sync mirroring ScheduleStore's upsert contract.
+
+    The event is an agent-owned derived artifact, so we overwrite the full
+    resource with events().update() (not patch).
+    """
+
+    def __init__(self, service, calendar_id, hour=9):
+        self.service = service
+        self.calendar_id = calendar_id
+        self.hour = hour
+
+    def upsert_event(self, row) -> str:
+        from googleapiclient.errors import HttpError  # lazy: offline-safe import
+
+        eid = event_id_for(row["Name"], row["Direction"])
+        body = build_event(row, hour=self.hour)
+        body["id"] = eid
+        try:
+            self.service.events().get(
+                calendarId=self.calendar_id, eventId=eid
+            ).execute()
+        except HttpError as e:
+            if e.resp.status == 404:
+                return self._insert(eid, body)
+            raise
+        self.service.events().update(
+            calendarId=self.calendar_id, eventId=eid, body=body
+        ).execute()
+        return "updated"
+
+    def _insert(self, eid, body) -> str:
+        from googleapiclient.errors import HttpError
+
+        try:
+            self.service.events().insert(
+                calendarId=self.calendar_id, body=body
+            ).execute()
+        except HttpError as e:
+            if e.resp.status == 409:  # race: another run created it first
+                self.service.events().update(
+                    calendarId=self.calendar_id, eventId=eid, body=body
+                ).execute()
+                return "created"
+            raise
+        return "created"

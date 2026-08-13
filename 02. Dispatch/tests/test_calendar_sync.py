@@ -69,3 +69,120 @@ def test_build_event_normalizes_datetime_send_date():
 def test_build_event_respects_hour_override():
     ev = build_event(_row(date(2026, 5, 16)), hour=8)
     assert ev["start"]["dateTime"] == "2026-05-16T08:00:00"
+
+
+import pytest
+from googleapiclient.errors import HttpError
+
+from dispatch_agent.calendar_sync import CalendarSync
+
+
+class _Resp:  # minimal httplib2-style response for HttpError
+    def __init__(self, status):
+        self.status = status
+        self.reason = "err"
+
+
+def _http_error(status):
+    return HttpError(_Resp(status), b"{}")
+
+
+class _Exec:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def execute(self):
+        return self._fn()
+
+
+class FakeEvents:
+    def __init__(self, store, force_get_404=False):
+        self.store = store
+        self.force_get_404 = force_get_404
+
+    def get(self, calendarId, eventId):
+        def do():
+            if self.force_get_404 or eventId not in self.store:
+                raise _http_error(404)
+            return self.store[eventId]
+        return _Exec(do)
+
+    def insert(self, calendarId, body):
+        def do():
+            if body["id"] in self.store:
+                raise _http_error(409)
+            self.store[body["id"]] = dict(body)
+            return self.store[body["id"]]
+        return _Exec(do)
+
+    def update(self, calendarId, eventId, body):
+        def do():
+            self.store[eventId] = dict(body)
+            return self.store[eventId]
+        return _Exec(do)
+
+
+class FakeService:
+    def __init__(self, force_get_404=False):
+        self.store = {}
+        self._events = FakeEvents(self.store, force_get_404)
+
+    def events(self):
+        return self._events
+
+
+def _prow(send_date=date(2026, 5, 16)):
+    return {
+        "Send Date": send_date,
+        "Direction": "pickup",
+        "Name": "Elizabeth Marie Tedder",
+        "Message": "hello",
+    }
+
+
+def test_upsert_creates_when_missing():
+    svc = FakeService()
+    result = CalendarSync(svc, "cal@x").upsert_event(_prow())
+    assert result == "created"
+    eid = event_id_for("Elizabeth Marie Tedder", "pickup")
+    assert svc.store[eid]["summary"].startswith("🚗 배차 요청")
+
+
+def test_upsert_updates_when_present():
+    svc = FakeService()
+    sync = CalendarSync(svc, "cal@x")
+    sync.upsert_event(_prow())
+    result = sync.upsert_event(_prow())
+    assert result == "updated"
+
+
+def test_upsert_revised_date_patches_same_event():
+    svc = FakeService()
+    sync = CalendarSync(svc, "cal@x")
+    sync.upsert_event(_prow(date(2026, 5, 16)))
+    sync.upsert_event(_prow(date(2026, 5, 20)))
+    eid = event_id_for("Elizabeth Marie Tedder", "pickup")
+    assert len(svc.store) == 1
+    assert svc.store[eid]["start"]["dateTime"] == "2026-05-20T09:00:00"
+
+
+def test_upsert_handles_insert_race_409():
+    # GET returns 404 but the id already exists -> insert 409 -> update.
+    svc = FakeService(force_get_404=True)
+    eid = event_id_for("Elizabeth Marie Tedder", "pickup")
+    svc.store[eid] = {"id": eid, "summary": "stale"}
+    result = CalendarSync(svc, "cal@x").upsert_event(_prow())
+    assert result == "created"
+    assert svc.store[eid]["summary"].startswith("🚗 배차 요청")
+
+
+def test_upsert_reraises_other_http_errors():
+    class Boom(FakeService):
+        def events(self_inner):
+            class E(FakeEvents):
+                def get(self_e, calendarId, eventId):
+                    return _Exec(lambda: (_ for _ in ()).throw(_http_error(403)))
+            return E(self_inner.store)
+
+    with pytest.raises(HttpError):
+        CalendarSync(Boom(), "cal@x").upsert_event(_prow())
