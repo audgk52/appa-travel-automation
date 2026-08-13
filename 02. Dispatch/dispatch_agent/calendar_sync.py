@@ -22,8 +22,9 @@ def _canonicalize(s: str) -> str:
 def event_id_for(name: str, direction: str) -> str:
     """Deterministic, Google-legal (base32hex) event id for one (Name, Direction).
 
-    Invariant: one active dispatch per (Name, Direction) — the same identity
-    ScheduleStore uses. Changing that identity is a coordinated change in both.
+    Invariant: one active dispatch per (Name, Direction) — a canonicalized
+    (NFC + whitespace-collapsed) form of the (Name, Direction) identity
+    ScheduleStore keys on. Changing that identity is a coordinated change in both.
     """
     key = _canonicalize(f"appa|{name}|{direction}")
     digest = hashlib.sha256(key.encode("utf-8")).digest()[:16]

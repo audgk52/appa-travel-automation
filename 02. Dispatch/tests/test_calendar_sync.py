@@ -152,11 +152,13 @@ def test_upsert_updates_when_present():
     svc = FakeService()
     sync = CalendarSync(svc, "cal@x")
     sync.upsert_event(_prow())
+    # FakeEvents has no patch() method, so an accidental patch() call would raise
+    # AttributeError — an implicit guard for the update-not-patch invariant.
     result = sync.upsert_event(_prow())
     assert result == "updated"
 
 
-def test_upsert_revised_date_patches_same_event():
+def test_upsert_revised_date_updates_same_event():
     svc = FakeService()
     sync = CalendarSync(svc, "cal@x")
     sync.upsert_event(_prow(date(2026, 5, 16)))
@@ -194,3 +196,17 @@ from dispatch_agent.calendar_sync import build_calendar_service
 def test_build_calendar_service_missing_key_raises():
     with pytest.raises(FileNotFoundError):
         build_calendar_service("/no/such/service_account.json")
+
+
+def test_no_top_level_google_import_and_pure_helpers_work():
+    import ast
+    from pathlib import Path
+    src = Path(__file__).resolve().parent.parent / "dispatch_agent" / "calendar_sync.py"
+    for node in ast.parse(src.read_text(encoding="utf-8")).body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mod = node.module if isinstance(node, ast.ImportFrom) else ",".join(a.name for a in node.names)
+            assert not (mod and "google" in mod), f"top-level google import: {mod}"
+    assert event_id_for("Offline User", "pickup").startswith("appa")
+    ev = build_event({"Send Date": date(2026, 5, 16), "Direction": "pickup",
+                      "Name": "Offline User", "Message": "x"})
+    assert ev["start"]["timeZone"] == "Asia/Seoul"
