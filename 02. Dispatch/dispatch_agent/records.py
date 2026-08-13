@@ -6,7 +6,7 @@ Send-off : car time = outbound departure - 4 hours.    basis "(FLIGHT 출발 {de
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-_PURPOSE = {"pickup": "공항 픽업", "sendoff": "공항 샌딩"}
+PURPOSE = {"pickup": "공항 픽업", "sendoff": "공항 샌딩"}
 
 
 def compose_notes(group_note: str, adhoc: str) -> str:
@@ -36,7 +36,7 @@ class DispatchRecord:
 
     @property
     def purpose(self) -> str:
-        return _PURPOSE[self.direction]
+        return PURPOSE[self.direction]
 
 
 def dispatch_time_and_basis(direction, flight_no, dep_time=None, arr_time=None, lead_hours=4):
