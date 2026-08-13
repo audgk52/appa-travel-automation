@@ -8,6 +8,11 @@ APPA_Notes_Compiled.md
 *passport*
 *Passport*
 
+# --- Google service-account secrets — NEVER commit ---
+*service_account*.json
+*service-account*.json
+*.credentials.json
+
 # --- Build artifacts ---
 *.app/
 __pycache__/

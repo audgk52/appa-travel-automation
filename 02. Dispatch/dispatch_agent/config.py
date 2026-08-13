@@ -1,4 +1,5 @@
 """Production-specific dispatch constants (APPA). Swap this file per production."""
+import os
 
 # Send the dispatch request this many days before the dispatch date.
 SEND_LEAD_DAYS = 2
@@ -32,3 +33,33 @@ def airport_address(code: str, terminal: str | None) -> str:
 def sendoff_lead_hours(code: str) -> int:
     """Hours before departure the car should leave the hotel, per airport."""
     return _SENDOFF_LEAD_OVERRIDE.get(code, SENDOFF_LEAD_HOURS)
+
+
+class CalendarConfigError(ValueError):
+    """Calendar is partially or invalidly configured — a mistake, not offline mode."""
+
+
+def calendar_config():
+    """Calendar configuration state.
+
+    - Neither var set  -> None (intentionally offline / disabled).
+    - Both vars set     -> {key_path, calendar_id, hour}.
+    - Exactly one set, or an invalid hour -> raise CalendarConfigError so the
+      caller surfaces it (never a silent false "disabled").
+    """
+    key = os.environ.get("APPA_GOOGLE_SA_KEY")
+    cal = os.environ.get("APPA_GCAL_CALENDAR_ID")
+    if not key and not cal:
+        return None
+    if not (key and cal):
+        raise CalendarConfigError(
+            "Set both APPA_GOOGLE_SA_KEY and APPA_GCAL_CALENDAR_ID (only one is set)."
+        )
+    raw_hour = os.environ.get("APPA_GCAL_HOUR", "9")
+    try:
+        hour = int(raw_hour)
+    except ValueError:
+        raise CalendarConfigError(f"APPA_GCAL_HOUR must be an integer 0-23, got {raw_hour!r}")
+    if not (0 <= hour <= 23):
+        raise CalendarConfigError(f"APPA_GCAL_HOUR must be 0-23, got {hour}")
+    return {"key_path": key, "calendar_id": cal, "hour": hour}

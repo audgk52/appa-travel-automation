@@ -6,10 +6,12 @@ By default it processes BOTH directions present in the memo, asking ad-hocs up f
 """
 import argparse
 import re
+import sys
 from datetime import date, timedelta
 
 from dispatch_agent import config
 from dispatch_agent.builder import build_record
+from dispatch_agent.calendar_sync import CalendarSync, build_calendar_service
 from dispatch_agent.memo import DocxMemoSource
 from dispatch_agent.renderer import render_kakao
 from dispatch_agent.schedule import ScheduleStore
@@ -56,6 +58,14 @@ def build_schedule_row(memo, rec, direction: str, color: str = "original") -> di
     }
 
 
+def sync_row_to_calendar(calendar, row):
+    """Push one row to Calendar. Returns (status, None) or (None, exception)."""
+    try:
+        return calendar.upsert_event(row), None
+    except Exception as e:  # surfaced by the caller — never silently swallowed
+        return None, e
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="APPA Dispatch (PE) — KakaoTalk drafts + master schedule from a Travel Memo."
@@ -84,6 +94,31 @@ def main(argv=None):
             n = input(f"특이사항 for {direction} (Enter for N/A): ").strip()
         notes_by_dir[direction] = n
 
+    calendar = None
+    had_failure = False
+    try:
+        cfg = config.calendar_config()
+    except config.CalendarConfigError as e:
+        # A config mistake (partial vars / bad hour) is a failure, not offline mode —
+        # surface it but still save the local schedule below, then exit non-zero.
+        print(f"[WARN] Calendar config error; saving local schedule only — {e}", file=sys.stderr)
+        cfg = None
+        had_failure = True
+    if not had_failure:
+        if cfg is None:
+            print("[calendar] disabled — local schedule only")
+        else:
+            try:
+                calendar = CalendarSync(
+                    build_calendar_service(cfg["key_path"]), cfg["calendar_id"], hour=cfg["hour"]
+                )
+            except Exception as e:
+                print(
+                    f"[WARN] Calendar init failed; saving local schedule only — {e}",
+                    file=sys.stderr,
+                )
+                had_failure = True
+
     store = ScheduleStore(args.sheet)
     for direction in directions:
         rec = build_record(memo, direction, notes_by_dir[direction])
@@ -91,6 +126,20 @@ def main(argv=None):
         row = build_schedule_row(memo, rec, direction, color=color)
         result = store.upsert(row)
         print(f"[{direction}] schedule: {result} — {row['Name']} (send by {row['Send Date']})")
+        if calendar is not None:
+            status, err = sync_row_to_calendar(calendar, row)
+            if err is None:
+                print(f"[{direction}] calendar: {status}")
+            else:
+                print(
+                    f"[WARN] Calendar sync failed for {direction}; "
+                    f"local schedule was saved — {err}",
+                    file=sys.stderr,
+                )
+                had_failure = True
+
+    if had_failure:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
