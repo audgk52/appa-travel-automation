@@ -36,10 +36,12 @@ def test_calendar_config_none_when_unset(monkeypatch):
     assert config.calendar_config() is None
 
 
-def test_calendar_config_none_when_partial(monkeypatch):
+def test_calendar_config_partial_raises(monkeypatch):
+    # exactly one var set is a config MISTAKE, not intentional offline mode.
     monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
     monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
-    assert config.calendar_config() is None
+    with pytest.raises(config.CalendarConfigError):
+        config.calendar_config()
 
 
 def test_calendar_config_present(monkeypatch):
@@ -59,3 +61,19 @@ def test_calendar_config_default_hour(monkeypatch):
     monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
     monkeypatch.delenv("APPA_GCAL_HOUR", raising=False)
     assert config.calendar_config()["hour"] == 9
+
+
+def test_calendar_config_non_integer_hour_raises(monkeypatch):
+    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    monkeypatch.setenv("APPA_GCAL_HOUR", "9:00")
+    with pytest.raises(config.CalendarConfigError):
+        config.calendar_config()
+
+
+def test_calendar_config_out_of_range_hour_raises(monkeypatch):
+    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    monkeypatch.setenv("APPA_GCAL_HOUR", "24")
+    with pytest.raises(config.CalendarConfigError):
+        config.calendar_config()

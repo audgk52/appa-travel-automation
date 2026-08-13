@@ -94,19 +94,30 @@ def main(argv=None):
             n = input(f"특이사항 for {direction} (Enter for N/A): ").strip()
         notes_by_dir[direction] = n
 
-    cfg = config.calendar_config()
     calendar = None
     had_failure = False
-    if cfg is None:
-        print("[calendar] disabled — local schedule only")
-    else:
-        try:
-            calendar = CalendarSync(
-                build_calendar_service(cfg["key_path"]), cfg["calendar_id"], hour=cfg["hour"]
-            )
-        except Exception as e:
-            print(f"[WARN] Calendar init failed; saving local schedule only — {e}", file=sys.stderr)
-            had_failure = True
+    try:
+        cfg = config.calendar_config()
+    except config.CalendarConfigError as e:
+        # A config mistake (partial vars / bad hour) is a failure, not offline mode —
+        # surface it but still save the local schedule below, then exit non-zero.
+        print(f"[WARN] Calendar config error; saving local schedule only — {e}", file=sys.stderr)
+        cfg = None
+        had_failure = True
+    if not had_failure:
+        if cfg is None:
+            print("[calendar] disabled — local schedule only")
+        else:
+            try:
+                calendar = CalendarSync(
+                    build_calendar_service(cfg["key_path"]), cfg["calendar_id"], hour=cfg["hour"]
+                )
+            except Exception as e:
+                print(
+                    f"[WARN] Calendar init failed; saving local schedule only — {e}",
+                    file=sys.stderr,
+                )
+                had_failure = True
 
     store = ScheduleStore(args.sheet)
     for direction in directions:
