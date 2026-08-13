@@ -26,7 +26,7 @@ def event_id_for(name: str, direction: str) -> str:
     (NFC + whitespace-collapsed) form of the (Name, Direction) identity
     ScheduleStore keys on. Changing that identity is a coordinated change in both.
     """
-    key = _canonicalize(f"appa|{name}|{direction}")
+    key = f"appa|{_canonicalize(name)}|{_canonicalize(direction)}"
     digest = hashlib.sha256(key.encode("utf-8")).digest()[:16]
     b32 = base64.b32hexencode(digest).decode("ascii").rstrip("=").lower()
     return "appa" + b32
@@ -51,7 +51,11 @@ def build_event(row, *, hour=9, duration_min=15, tz=_TZ):
         "description": row["Message"],
         "start": {"dateTime": start.isoformat(timespec="seconds"), "timeZone": tz},
         "end": {"dateTime": end.isoformat(timespec="seconds"), "timeZone": tz},
-        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 0}]},
+        # Use the calendar/user's DEFAULT reminders. A service-account event-level
+        # popup override does NOT become the human user's personal reminder, so the
+        # user configures a default notification on the APPA Dispatch calendar (see
+        # SETUP_GoogleCalendar.md) and we defer to it.
+        "reminders": {"useDefault": True},
     }
 
 
@@ -71,8 +75,7 @@ class CalendarSync:
         from googleapiclient.errors import HttpError  # lazy: offline-safe import
 
         eid = event_id_for(row["Name"], row["Direction"])
-        body = build_event(row, hour=self.hour)
-        body["id"] = eid
+        body = build_event(row, hour=self.hour)  # base body — no "id" (update-safe)
         try:
             self.service.events().get(
                 calendarId=self.calendar_id, eventId=eid
@@ -89,9 +92,11 @@ class CalendarSync:
     def _insert(self, eid, body) -> str:
         from googleapiclient.errors import HttpError
 
+        # The client-defined id is set only on insert; update takes eventId as a
+        # path param, so its body must stay id-free.
         try:
             self.service.events().insert(
-                calendarId=self.calendar_id, body=body
+                calendarId=self.calendar_id, body={**body, "id": eid}
             ).execute()
         except HttpError as e:
             if e.resp.status == 409:  # race: another run created it first

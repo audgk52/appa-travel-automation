@@ -34,6 +34,11 @@ def test_event_id_normalizes_whitespace():
     assert event_id_for("Carey  Mumford", "pickup") == event_id_for("Carey Mumford", "pickup")
 
 
+def test_event_id_trims_leading_trailing_whitespace():
+    # canonicalize name/direction separately so surrounding spaces don't survive.
+    assert event_id_for("  Carey   Mumford  ", "pickup") == event_id_for("Carey Mumford", "pickup")
+
+
 from dispatch_agent.calendar_sync import build_event
 
 
@@ -53,10 +58,11 @@ def test_build_event_maps_time_and_body():
     assert ev["description"] == _row(date(2026, 5, 16))["Message"]
     assert "Elizabeth Marie Tedder" in ev["summary"]
     assert "공항 픽업" in ev["summary"]  # Korean, user-facing (not "pickup")
-    assert ev["reminders"] == {
-        "useDefault": False,
-        "overrides": [{"method": "popup", "minutes": 0}],
-    }
+    # Reminder ownership: use the calendar/user's DEFAULT reminders. A service
+    # account's event-level popup override does not become the human user's
+    # personal reminder, so we must not force one here.
+    assert ev["reminders"] == {"useDefault": True}
+    assert "overrides" not in ev["reminders"]
 
 
 def test_build_event_normalizes_datetime_send_date():
@@ -99,6 +105,7 @@ class FakeEvents:
     def __init__(self, store, force_get_404=False):
         self.store = store
         self.force_get_404 = force_get_404
+        self.update_bodies = []  # records bodies passed to update() for assertions
 
     def get(self, calendarId, eventId):
         def do():
@@ -117,6 +124,7 @@ class FakeEvents:
 
     def update(self, calendarId, eventId, body):
         def do():
+            self.update_bodies.append(dict(body))
             self.store[eventId] = dict(body)
             return self.store[eventId]
         return _Exec(do)
@@ -166,6 +174,17 @@ def test_upsert_revised_date_updates_same_event():
     eid = event_id_for("Elizabeth Marie Tedder", "pickup")
     assert len(svc.store) == 1
     assert svc.store[eid]["start"]["dateTime"] == "2026-05-20T09:00:00"
+
+
+def test_update_body_excludes_event_id():
+    # Google sets the event id only on insert; the update endpoint takes eventId
+    # as a path param, so the update BODY must not carry "id".
+    svc = FakeService()
+    sync = CalendarSync(svc, "cal@x")
+    sync.upsert_event(_prow())  # insert
+    sync.upsert_event(_prow())  # update
+    assert svc.events().update_bodies, "expected an update call"
+    assert "id" not in svc.events().update_bodies[-1]
 
 
 def test_upsert_handles_insert_race_409():
