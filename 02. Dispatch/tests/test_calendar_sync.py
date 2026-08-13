@@ -186,3 +186,11 @@ def test_upsert_reraises_other_http_errors():
 
     with pytest.raises(HttpError):
         CalendarSync(Boom(), "cal@x").upsert_event(_prow())
+
+
+from dispatch_agent.calendar_sync import build_calendar_service
+
+
+def test_build_calendar_service_missing_key_raises():
+    with pytest.raises(FileNotFoundError):
+        build_calendar_service("/no/such/service_account.json")

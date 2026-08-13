@@ -100,3 +100,18 @@ class CalendarSync:
                 return "created"
             raise
         return "created"
+
+
+def build_calendar_service(key_path):
+    """Construct a Calendar v3 service from a service-account key file.
+
+    Google packages are imported here (not at module top) so the rest of the
+    module — and the whole Phase A CLI — imports and runs without them.
+    """
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    creds = service_account.Credentials.from_service_account_file(
+        key_path, scopes=["https://www.googleapis.com/auth/calendar"]
+    )
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
