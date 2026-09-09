@@ -36,10 +36,18 @@ def test_calendar_config_none_when_unset(monkeypatch):
     assert config.calendar_config() is None
 
 
-def test_calendar_config_partial_raises(monkeypatch):
-    # exactly one var set is a config MISTAKE, not intentional offline mode.
+def test_calendar_config_key_only_is_disabled_not_error(monkeypatch):
+    # The SA key is shared with Sheets, so key-present + no calendar id means the
+    # calendar is simply disabled (not a partial-config mistake).
     monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
     monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
+    assert config.calendar_config() is None
+
+
+def test_calendar_config_id_without_key_raises(monkeypatch):
+    # A calendar id set but no SA key to build the service is a genuine mistake.
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
     with pytest.raises(config.CalendarConfigError):
         config.calendar_config()
 
@@ -77,3 +85,35 @@ def test_calendar_config_out_of_range_hour_raises(monkeypatch):
     monkeypatch.setenv("APPA_GCAL_HOUR", "24")
     with pytest.raises(config.CalendarConfigError):
         config.calendar_config()
+
+
+def test_sheet_config_none_when_unset(monkeypatch):
+    monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
+    monkeypatch.delenv("APPA_GSHEET_ID", raising=False)
+    assert config.sheet_config() is None
+
+
+def test_sheet_config_partial_raises(monkeypatch):
+    # exactly one var set is a config MISTAKE (Sheets is the source of truth, no fallback).
+    monkeypatch.setenv("APPA_GSHEET_ID", "sheet-id-123")
+    monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
+    with pytest.raises(config.SheetConfigError):
+        config.sheet_config()
+
+
+def test_sheet_config_present_defaults_tab_to_schedule(monkeypatch):
+    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+    monkeypatch.setenv("APPA_GSHEET_ID", "sheet-id-123")
+    monkeypatch.delenv("APPA_GSHEET_TAB", raising=False)
+    assert config.sheet_config() == {
+        "key_path": "/tmp/key.json",
+        "spreadsheet_id": "sheet-id-123",
+        "tab": "Schedule",
+    }
+
+
+def test_sheet_config_custom_tab(monkeypatch):
+    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+    monkeypatch.setenv("APPA_GSHEET_ID", "sheet-id-123")
+    monkeypatch.setenv("APPA_GSHEET_TAB", "Dispatch")
+    assert config.sheet_config()["tab"] == "Dispatch"

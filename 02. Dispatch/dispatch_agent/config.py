@@ -49,11 +49,13 @@ def calendar_config():
     """
     key = os.environ.get("APPA_GOOGLE_SA_KEY")
     cal = os.environ.get("APPA_GCAL_CALENDAR_ID")
-    if not key and not cal:
+    # The calendar id is the enable signal. The SA key is shared with Sheets, so its
+    # presence alone does not imply intent to use Calendar — only the calendar id does.
+    if not cal:
         return None
-    if not (key and cal):
+    if not key:
         raise CalendarConfigError(
-            "Set both APPA_GOOGLE_SA_KEY and APPA_GCAL_CALENDAR_ID (only one is set)."
+            "APPA_GCAL_CALENDAR_ID is set but APPA_GOOGLE_SA_KEY is missing."
         )
     raw_hour = os.environ.get("APPA_GCAL_HOUR", "9")
     try:
@@ -63,3 +65,30 @@ def calendar_config():
     if not (0 <= hour <= 23):
         raise CalendarConfigError(f"APPA_GCAL_HOUR must be 0-23, got {hour}")
     return {"key_path": key, "calendar_id": cal, "hour": hour}
+
+
+class SheetConfigError(ValueError):
+    """Google Sheet is partially or invalidly configured — a mistake, not disabled."""
+
+
+def sheet_config():
+    """Google Sheets (source-of-truth) configuration state.
+
+    - Neither var set -> None (unconfigured; the CLI treats this as a hard error
+      because there is no local-Excel fallback in the normal write path).
+    - Both set        -> {key_path, spreadsheet_id, tab}.
+    - Exactly one set -> raise SheetConfigError so the caller surfaces it.
+
+    Reuses the shared service-account key (APPA_GOOGLE_SA_KEY); adds APPA_GSHEET_ID
+    and the optional APPA_GSHEET_TAB (default "Schedule").
+    """
+    key = os.environ.get("APPA_GOOGLE_SA_KEY")
+    sid = os.environ.get("APPA_GSHEET_ID")
+    if not key and not sid:
+        return None
+    if not (key and sid):
+        raise SheetConfigError(
+            "Set both APPA_GOOGLE_SA_KEY and APPA_GSHEET_ID (only one is set)."
+        )
+    tab = os.environ.get("APPA_GSHEET_TAB", "Schedule")
+    return {"key_path": key, "spreadsheet_id": sid, "tab": tab}

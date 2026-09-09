@@ -2,7 +2,6 @@
 from datetime import date
 from pathlib import Path
 
-import openpyxl
 import pytest
 
 from dispatch_agent.builder import build_record
@@ -79,66 +78,171 @@ def test_sync_row_to_calendar_surfaces_failure():
     assert isinstance(err, RuntimeError)
 
 
-def test_main_calendar_disabled_when_unconfigured(tmp_path, monkeypatch, capsys):
+# --- Sheets-backed main() flow (Phase C): Sheets is the source of truth; a
+# --- successful Sheet write gates the downstream Calendar event. ------------
+
+class _RecordingStore:
+    """Fake GoogleSheetStore: records upserted rows."""
+    def __init__(self, *a, **k):
+        self.rows = []
+
+    def upsert(self, row):
+        self.rows.append(row)
+        return "inserted"
+
+
+class _FailingStore:
+    def __init__(self, *a, **k):
+        pass
+
+    def upsert(self, row):
+        raise RuntimeError("sheets boom")
+
+
+class _RecordingCalendar:
+    """Fake CalendarSync: records rows it was asked to sync."""
+    calls = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    def upsert_event(self, row):
+        _RecordingCalendar.calls.append(row)
+        return "created"
+
+
+def _sheets_configured(monkeypatch):
+    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+    monkeypatch.setenv("APPA_GSHEET_ID", "sheet-id-123")
+
+
+def _use_store(monkeypatch, climod, store_cls):
+    monkeypatch.setattr(climod, "build_sheets_service", lambda _p: object())
+    monkeypatch.setattr(climod, "GoogleSheetStore", store_cls)
+
+
+def test_main_sheets_unconfigured_is_hard_error_and_skips_calendar(tmp_path, monkeypatch, capsys):
+    # No Sheets config -> refuse to run (no Excel fallback), Calendar never touched.
     monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
-    monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
-    sheet = tmp_path / "master.xlsx"
+    monkeypatch.delenv("APPA_GSHEET_ID", raising=False)
+    import dispatch_agent.cli as climod
+
+    _RecordingCalendar.calls = []
+    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
+    monkeypatch.setattr(climod, "CalendarSync", _RecordingCalendar)
+    with pytest.raises(SystemExit) as exc:
+        climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    assert exc.value.code == 1
+    assert "[ERROR]" in capsys.readouterr().err
+    assert _RecordingCalendar.calls == []  # calendar never reached
+
+
+def test_main_sheets_partial_config_is_hard_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("APPA_GSHEET_ID", "sheet-id-123")
+    monkeypatch.delenv("APPA_GOOGLE_SA_KEY", raising=False)
     from dispatch_agent.cli import main
 
-    main(["--memo", str(MEMO), "--notes", "N/A", "--sheet", str(sheet)])
-    out = capsys.readouterr().out
-    assert "[calendar] disabled" in out
+    with pytest.raises(SystemExit) as exc:
+        main(["--memo", str(MEMO), "--notes", "N/A"])
+    assert exc.value.code == 1
+    assert "[ERROR]" in capsys.readouterr().err
 
 
-def test_main_configured_failure_exits_nonzero_but_saves_local(tmp_path, monkeypatch, capsys):
-    # Configured but Calendar init fails: WARN to stderr, exit non-zero, yet the
-    # local schedule must still be written (local-first invariant).
-    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
+def test_main_sheets_write_failure_skips_calendar_and_exits_nonzero(tmp_path, monkeypatch, capsys):
+    # Sheet write fails -> DO NOT create/update the Calendar event; clear error; exit 1.
+    _sheets_configured(monkeypatch)
     monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
     import dispatch_agent.cli as climod
+
+    _use_store(monkeypatch, climod, _FailingStore)
+    _RecordingCalendar.calls = []
+    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
+    monkeypatch.setattr(climod, "CalendarSync", _RecordingCalendar)
+    with pytest.raises(SystemExit) as exc:
+        climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err and "Calendar NOT updated" in err
+    assert _RecordingCalendar.calls == []  # calendar never called after a failed Sheet write
+
+
+def test_main_calendar_disabled_still_writes_sheets(tmp_path, monkeypatch, capsys):
+    _sheets_configured(monkeypatch)
+    monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
+    import dispatch_agent.cli as climod
+
+    store = _RecordingStore()
+    _use_store(monkeypatch, climod, lambda *a, **k: store)
+    climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    out = capsys.readouterr().out
+    assert "[calendar] disabled" in out
+    assert len(store.rows) == 2  # both directions persisted to Sheets
+
+
+def test_main_sheets_success_then_calendar_success(tmp_path, monkeypatch, capsys):
+    _sheets_configured(monkeypatch)
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    import dispatch_agent.cli as climod
+
+    store = _RecordingStore()
+    _use_store(monkeypatch, climod, lambda *a, **k: store)
+    _RecordingCalendar.calls = []
+    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
+    monkeypatch.setattr(climod, "CalendarSync", _RecordingCalendar)
+    climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    out = capsys.readouterr().out
+    assert "schedule: inserted" in out
+    assert "calendar: created" in out
+    assert len(store.rows) == 2
+    assert len(_RecordingCalendar.calls) == 2  # calendar reached only after Sheet success
+
+
+class _RaisingCalendar:
+    """Fake CalendarSync whose upsert_event raises at sync time (not init)."""
+    def __init__(self, *a, **k):
+        pass
+
+    def upsert_event(self, row):
+        raise RuntimeError("calendar api 500")
+
+
+def test_main_calendar_upsert_failure_after_sheets_success_persists_and_warns(
+    tmp_path, monkeypatch, capsys
+):
+    # Sheets write succeeds, THEN CalendarSync.upsert_event() raises: the Sheet row
+    # must remain persisted, a WARN is surfaced, and the run exits non-zero.
+    _sheets_configured(monkeypatch)
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    import dispatch_agent.cli as climod
+
+    store = _RecordingStore()
+    _use_store(monkeypatch, climod, lambda *a, **k: store)
+    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
+    monkeypatch.setattr(climod, "CalendarSync", _RaisingCalendar)
+    with pytest.raises(SystemExit) as exc:
+        climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "[WARN]" in err and "Calendar sync failed" in err
+    assert len(store.rows) == 2  # both rows persisted to Sheets despite calendar failure
+
+
+def test_main_calendar_init_failure_still_persists_sheets(tmp_path, monkeypatch, capsys):
+    # Calendar (downstream) init fails: WARN + exit non-zero, but the Sheet — the
+    # source of truth — is already written.
+    _sheets_configured(monkeypatch)
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    import dispatch_agent.cli as climod
+
+    store = _RecordingStore()
+    _use_store(monkeypatch, climod, lambda *a, **k: store)
 
     def boom(_key_path):
         raise RuntimeError("no creds")
 
     monkeypatch.setattr(climod, "build_calendar_service", boom)
-    sheet = tmp_path / "master.xlsx"
     with pytest.raises(SystemExit) as exc:
-        climod.main(["--memo", str(MEMO), "--notes", "N/A", "--sheet", str(sheet)])
+        climod.main(["--memo", str(MEMO), "--notes", "N/A"])
     assert exc.value.code == 1
     assert "[WARN]" in capsys.readouterr().err
-    assert sheet.exists()
-    assert openpyxl.load_workbook(sheet)["Schedule"].max_row >= 2  # local rows written
-
-
-def test_main_partial_config_exits_nonzero_but_saves_local(tmp_path, monkeypatch, capsys):
-    # Only one env var set -> CalendarConfigError must not crash before local save.
-    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
-    monkeypatch.delenv("APPA_GCAL_CALENDAR_ID", raising=False)
-    from dispatch_agent.cli import main
-
-    sheet = tmp_path / "master.xlsx"
-    with pytest.raises(SystemExit) as exc:
-        main(["--memo", str(MEMO), "--notes", "N/A", "--sheet", str(sheet)])
-    assert exc.value.code == 1
-    assert "[WARN]" in capsys.readouterr().err
-    assert sheet.exists()
-    assert openpyxl.load_workbook(sheet)["Schedule"].max_row >= 2  # local rows written
-
-
-def test_main_configured_success_prints_calendar_status(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("APPA_GOOGLE_SA_KEY", "/tmp/key.json")
-    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
-    import dispatch_agent.cli as climod
-
-    class _FakeCalendar:
-        def __init__(self, *a, **k):
-            pass
-
-        def upsert_event(self, row):
-            return "created"
-
-    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
-    monkeypatch.setattr(climod, "CalendarSync", _FakeCalendar)
-    sheet = tmp_path / "master.xlsx"
-    climod.main(["--memo", str(MEMO), "--notes", "N/A", "--sheet", str(sheet)])
-    assert "calendar: created" in capsys.readouterr().out
+    assert len(store.rows) == 2  # Sheets still written despite calendar failure
