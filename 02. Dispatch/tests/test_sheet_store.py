@@ -17,7 +17,13 @@ from datetime import date, datetime
 
 import pytest
 
-from dispatch_agent.sheet_store import COLUMNS, GoogleSheetStore, RECORD_ID, record_id_for
+from dispatch_agent.sheet_store import (
+    COLUMNS,
+    GoogleSheetStore,
+    RECORD_ID,
+    SchemaError,
+    record_id_for,
+)
 
 _ALLOWED_ID_CHARS = set("0123456789abcdefghijklmnopqrstuv")  # base32hex + rid letters
 _A1 = re.compile(r"^(?P<tab>[^!]+)!(?P<c0>[A-Z]+)(?P<r0>\d+):(?P<c1>[A-Z]+)(?P<r1>\d+)$")
@@ -248,36 +254,97 @@ def test_sorted_ascending_by_send_date_via_server_side_sortrange():
     assert sort["sortSpecs"][0]["sortOrder"] == "ASCENDING"
 
 
-def test_human_side_column_stays_attached_to_its_row_after_sort():
-    # A human adds an ops note in column O (beyond the managed A:N range) on "Late".
+# O = Driver, P = Note — Transportation-team collaboration columns (beyond A:N).
+_DRIVER = len(COLUMNS)          # column O
+_NOTE = len(COLUMNS) + 1        # column P
+
+
+def test_driver_and_note_columns_stay_attached_to_their_row_after_sort():
+    # Transportation fills O:Driver and P:Note on "Late" (beyond the managed A:N range).
     svc = FakeSheetsService()
     store = _store(svc)
     store.upsert(_row("Late", "sendoff", date(2026, 6, 20), date(2026, 6, 22)))
     late_idx = 1  # header + first data row
-    _ensure(svc.rows()[late_idx], len(COLUMNS))          # column O
-    svc.rows()[late_idx][len(COLUMNS)] = "driver: Kim"
+    _ensure(svc.rows()[late_idx], _NOTE)
+    svc.rows()[late_idx][_DRIVER] = "Kim"                 # O: Driver
+    svc.rows()[late_idx][_NOTE] = "meet at gate 3"        # P: Note
     # Insert an earlier row -> triggers a re-sort that moves Late below Early.
     store.upsert(_row("Early", "pickup", date(2026, 5, 16), date(2026, 5, 18)))
     late_row = next(r for r in svc.data_rows() if r[_col("Name")] == "Late")
-    assert late_row[len(COLUMNS)] == "driver: Kim"       # note moved WITH the logical row
+    assert late_row[_DRIVER] == "Kim"                     # Driver moved WITH the logical row
+    assert late_row[_NOTE] == "meet at gate 3"            # Note moved WITH the logical row
 
 
-# -------------------------------------------------- backward-compat migration
+def test_update_never_overwrites_driver_or_note():
+    # An A:N revision must never touch the Transportation-owned O:Driver / P:Note.
+    svc = FakeSheetsService()
+    store = _store(svc)
+    store.upsert(_row("A", "sendoff", date(2026, 6, 20), date(2026, 6, 22), message="orig"))
+    _ensure(svc.data_rows()[0], _NOTE)
+    svc.data_rows()[0][_DRIVER] = "Park"
+    svc.data_rows()[0][_NOTE] = "VIP van"
+    store.upsert(_row("A", "sendoff", date(2026, 6, 21), date(2026, 6, 23), message="revised"))
+    row = svc.data_rows()[0]
+    assert row[_col("Message")] == "revised"             # managed A:N updated
+    assert row[_DRIVER] == "Park" and row[_NOTE] == "VIP van"  # O:P left untouched
 
-def test_legacy_row_without_record_id_is_migrated_not_duplicated():
-    # A pre-existing sheet: header without Record ID + a legacy row lacking one.
-    legacy_header = [c for c in COLUMNS if c != RECORD_ID]  # old 13-col header
-    legacy_row = [""] * len(legacy_header)
-    legacy_row[legacy_header.index("Send Date")] = "2026-06-20"
-    legacy_row[legacy_header.index("Direction")] = "sendoff"
-    legacy_row[legacy_header.index("Name")] = "Alex Mosley"
-    legacy_row[legacy_header.index("Message")] = "old"
-    svc = FakeSheetsService(FakeSheet(grid=[legacy_header, legacy_row]))
+
+# -------------------------------------------------- schema validation (detection)
+
+def test_valid_schema_write_proceeds():
+    # A sheet with a valid A:N header lets writes proceed normally.
+    svc = FakeSheetsService()
+    _store(svc).upsert(_row("A", "sendoff", date(2026, 6, 20), date(2026, 6, 22)))
+    result = _store(svc).upsert(_row("B", "pickup", date(2026, 5, 16), date(2026, 5, 18)))
+    assert result == "inserted"
+    assert len(svc.data_rows()) == 2
+
+
+def test_missing_managed_column_fails_before_write():
+    # 'Airport' deleted from the managed header -> A:N no longer matches -> hard error.
+    broken = [c for c in COLUMNS if c != "Airport"]
+    svc = FakeSheetsService(FakeSheet(grid=[list(broken)]))
+    vals = svc.spreadsheets().values()
+    with pytest.raises(SchemaError):
+        _store(svc).upsert(_row("A", "sendoff", date(2026, 6, 20), date(2026, 6, 22)))
+    assert vals.appends == [] and vals.updates == []       # nothing written
+
+
+def test_reordered_managed_column_fails_before_write():
+    reordered = list(COLUMNS)
+    i, j = reordered.index("Name"), reordered.index("Direction")
+    reordered[i], reordered[j] = reordered[j], reordered[i]
+    svc = FakeSheetsService(FakeSheet(grid=[reordered]))
+    vals = svc.spreadsheets().values()
+    with pytest.raises(SchemaError):
+        _store(svc).upsert(_row("A", "sendoff", date(2026, 6, 20), date(2026, 6, 22)))
+    assert vals.appends == [] and vals.updates == []       # nothing written
+
+
+def test_schema_failure_does_not_silently_repair_header():
+    broken = [c for c in COLUMNS if c != "Airport"]
+    svc = FakeSheetsService(FakeSheet(grid=[list(broken)]))
+    with pytest.raises(SchemaError):
+        _store(svc).upsert(_row("A", "sendoff", date(2026, 6, 20), date(2026, 6, 22)))
+    assert svc.rows()[0] == broken                         # header left exactly as-is
+
+
+# -------------------------------------- data-row adoption (no header repair)
+
+def test_manual_row_without_record_id_is_adopted_not_duplicated():
+    # Correct A:N header, but a hand-added data row has no Record ID value yet. The
+    # next TMO run for that identity adopts/back-fills it in place — never duplicated.
+    header = list(COLUMNS)
+    manual = [""] * len(COLUMNS)
+    manual[_col("Send Date")] = "2026-06-20"
+    manual[_col("Direction")] = "sendoff"
+    manual[_col("Name")] = "Alex Mosley"
+    manual[_col("Message")] = "old"                        # Record ID cell left blank
+    svc = FakeSheetsService(FakeSheet(grid=[header, manual]))
 
     result = _store(svc).upsert(_row("Alex Mosley", "sendoff", date(2026, 6, 21), date(2026, 6, 23)))
-    assert result == "updated"                             # matched the legacy row, no duplicate
+    assert result == "updated"                             # matched the manual row, no duplicate
     assert len(svc.data_rows()) == 1
-    assert svc.rows()[0] == list(COLUMNS)                  # header migrated to include Record ID
     assert svc.data_rows()[0][_col(RECORD_ID)] == record_id_for("Alex Mosley", "sendoff")
 
 

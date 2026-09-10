@@ -99,6 +99,16 @@ class _FailingStore:
         raise RuntimeError("sheets boom")
 
 
+class _SchemaFailingStore:
+    """Fake GoogleSheetStore whose upsert raises SchemaError (managed A:N mismatch)."""
+    def __init__(self, *a, **k):
+        pass
+
+    def upsert(self, row):
+        from dispatch_agent.sheet_store import SchemaError
+        raise SchemaError("managed header (A:N) does not match the expected schema")
+
+
 class _RecordingCalendar:
     """Fake CalendarSync: records rows it was asked to sync."""
     calls = []
@@ -164,6 +174,28 @@ def test_main_sheets_write_failure_skips_calendar_and_exits_nonzero(tmp_path, mo
     err = capsys.readouterr().err
     assert "[ERROR]" in err and "Calendar NOT updated" in err
     assert _RecordingCalendar.calls == []  # calendar never called after a failed Sheet write
+
+
+def test_main_schema_validation_failure_skips_calendar_and_exits_nonzero(
+    tmp_path, monkeypatch, capsys
+):
+    # Managed A:N schema validation fails inside the store -> no Calendar event,
+    # clear error, exit 1. (Live finding D.2: a corrupted managed header must never
+    # silently proceed to Calendar.)
+    _sheets_configured(monkeypatch)
+    monkeypatch.setenv("APPA_GCAL_CALENDAR_ID", "cal@x")
+    import dispatch_agent.cli as climod
+
+    _use_store(monkeypatch, climod, _SchemaFailingStore)
+    _RecordingCalendar.calls = []
+    monkeypatch.setattr(climod, "build_calendar_service", lambda _p: object())
+    monkeypatch.setattr(climod, "CalendarSync", _RecordingCalendar)
+    with pytest.raises(SystemExit) as exc:
+        climod.main(["--memo", str(MEMO), "--notes", "N/A"])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "[ERROR]" in err and "Calendar NOT updated" in err
+    assert _RecordingCalendar.calls == []  # calendar never reached after schema failure
 
 
 def test_main_calendar_disabled_still_writes_sheets(tmp_path, monkeypatch, capsys):

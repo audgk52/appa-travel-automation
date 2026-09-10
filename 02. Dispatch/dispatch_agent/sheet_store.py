@@ -12,8 +12,20 @@ store performs the smallest possible writes:
 
 Row identity is a system-owned, deterministic `Record ID` (base32hex of a
 normalized Name+Direction). Name and Direction remain business/display fields;
-lookups prefer the Record ID once present. Legacy rows lacking a Record ID are
-matched by (Name, Direction) and back-filled in place, never duplicated.
+lookups prefer the Record ID once present. A data row lacking a Record ID *value*
+(e.g. a row added by hand) is matched by (Name, Direction) and back-filled in
+place, never duplicated.
+
+Schema safety: the managed header (A:N) is validated before every write. A blank
+tab is initialized once; a non-empty tab whose A:N header does not match the
+expected columns (a deleted/reordered/renamed managed column) is a hard SchemaError
+— the store fails before writing and never silently rewrites the header, because
+live verification (finding D.2) showed a silent repair misaligns existing data.
+The CLI surfaces the error and does NOT create the downstream Calendar event.
+
+Column ownership: A:N are Dispatch/Travel-owned, system-managed. Columns O
+(`Driver`) and P (`Note`) are Transportation-team collaboration fields — the store
+never writes them, and the server-side sort keeps them attached to their row.
 
 Concurrency note: this removes whole-tab clobbering but does NOT make the sheet
 transactionally safe — a small locate->write race remains (see module docstring in
@@ -33,7 +45,7 @@ from dispatch_agent.schedule import COLUMNS as _BUSINESS_COLUMNS
 RECORD_ID = "Record ID"
 # Managed columns written by the tool (A:N). The business columns are the
 # human-facing schedule; Record ID is the system-owned technical identity, kept
-# last so existing A:M layouts stay put and legacy rows migrate by back-fill.
+# last so existing A:M layouts stay put and hand-added rows adopt an ID by back-fill.
 COLUMNS = list(_BUSINESS_COLUMNS) + [RECORD_ID]
 _NAME = COLUMNS.index("Name")
 _DIRECTION = COLUMNS.index("Direction")
@@ -87,6 +99,15 @@ def _col_letter(n: int) -> str:
 _END_COL = _col_letter(len(COLUMNS))  # last managed column, e.g. "N"
 
 
+class SchemaError(ValueError):
+    """The managed A:N header does not match the expected schema.
+
+    Raised before any write so a corrupted/edited managed header is a detected,
+    fail-fast condition — never silently repaired (which would misalign data) and
+    never allowed to proceed to the downstream Calendar write.
+    """
+
+
 class GoogleSheetStore:
     """Idempotent single-tab schedule store on a shared Google Sheet.
 
@@ -131,18 +152,39 @@ class GoogleSheetStore:
         return result
 
     def _read_grid(self):
-        """Read the tab; ensure the header row exists and includes Record ID."""
+        """Read the tab and validate the managed A:N header before any write.
+
+        A brand-new (empty) tab is initialized once with the canonical header — there
+        is no data to misalign. A non-empty tab whose A:N header does not match the
+        expected schema is a hard SchemaError: we fail before writing and never
+        silently rewrite the header (finding D.2 — a silent repair misaligns data).
+        """
         resp = self._values().get(spreadsheetId=self.spreadsheet_id, range=self.tab).execute()
         grid = [list(r) for r in (resp.get("values") or [])]
         if not grid:
             self._write_header()
             return [list(COLUMNS)]
-        if _get(grid[0], _RECORD_ID) != RECORD_ID:
-            # Migrate a legacy header to include Record ID; human header cells beyond
-            # the managed range are left untouched (targeted A1:N1 write).
-            self._write_header()
-            grid[0] = list(COLUMNS) + grid[0][len(COLUMNS):]
+        self._validate_header(grid[0])
         return grid
+
+    @staticmethod
+    def _validate_header(header):
+        """Fail before writing unless the A:N managed header matches exactly.
+
+        Verifies both presence AND order of every managed column (A:N). Human
+        columns O+ (`Driver`, `Note`) are intentionally not inspected — they belong
+        to the Transportation team. Raises SchemaError; the CLI surfaces it and skips
+        the downstream Calendar write.
+        """
+        actual = [_get(header, i) for i in range(len(COLUMNS))]
+        if actual != list(COLUMNS):
+            raise SchemaError(
+                "Managed schedule header (A:N) does not match the expected schema; "
+                "refusing to write and NOT rewriting the header (a silent repair would "
+                "misalign existing data). "
+                f"expected {list(COLUMNS)!r}, found {actual!r}. "
+                "Restore the A:N managed columns (names and order) and re-run."
+            )
 
     def _write_header(self):
         self._values().update(
@@ -156,9 +198,9 @@ class GoogleSheetStore:
     def _locate(data, rid, row):
         """Row index (0-based within data) to update, or None to append.
 
-        Prefer the Record ID. Fall back to a legacy row matching (Name, Direction)
-        that has no Record ID yet, so pre-migration rows update in place rather than
-        duplicating.
+        Prefer the Record ID. Fall back to a data row matching (Name, Direction) that
+        has no Record ID value yet (e.g. one a human added by hand), so it is adopted
+        and back-filled in place rather than duplicated.
         """
         for i, r in enumerate(data):
             if _get(r, _RECORD_ID) == rid:
@@ -187,7 +229,7 @@ class GoogleSheetStore:
         for c, col in enumerate(COLUMNS):
             if col in row:
                 existing[c] = _cell(row[col])
-        existing[_RECORD_ID] = rid  # fill/keep the identity (back-fills legacy rows)
+        existing[_RECORD_ID] = rid  # fill/keep the identity (back-fills adopted rows)
         row_number = target_idx + 2  # header is row 1; data is 0-based
         # Write only the managed range A:N — cells beyond N (human columns) are preserved.
         self._values().update(
