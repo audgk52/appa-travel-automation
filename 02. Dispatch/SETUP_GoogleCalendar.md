@@ -40,9 +40,10 @@ That is why Step 6 is required, not optional.
    export APPA_GCAL_CALENDAR_ID="....@group.calendar.google.com"
    # optional (default 9): export APPA_GCAL_HOUR=9
    ```
-   Then `source ~/.zshrc`. Set **both** `APPA_*` vars or **neither** — setting only one
-   is treated as a configuration error (the run warns and exits non-zero, but your
-   local schedule is still saved).
+   Then `source ~/.zshrc`. The **calendar id** is the enable signal: set it to turn the
+   calendar on (the SA key is shared with Google Sheets). Setting a calendar id but no SA
+   key is a configuration error (warns, exits non-zero); the schedule is still saved to
+   Sheets. See `SETUP_GoogleSheets.md` for the Sheets source-of-truth setup.
 
 8. **Install dependencies** — `pip install -r requirements.txt`.
 
@@ -58,10 +59,9 @@ actually gets notified:
 
 ## Day-to-day behavior
 
-- **Both vars set:** `python dispatch.py --memo ...` also creates/updates a reminder
-  event per Send Date (`[pickup] calendar: created/updated`). Re-running a memo (incl.
-  BLUE/PINK revisions) updates the same event — no duplicates.
-- **Neither var set:** prints `[calendar] disabled — local schedule only` and behaves
-  exactly like Phase A.
-- **Calendar error** (one var missing, bad hour, or API failure): the local schedule is
-  still written, a `[WARN]` is printed, and the run exits non-zero so the problem is visible.
+- **Calendar id set:** `python dispatch.py --memo ...` also creates/updates a reminder
+  event per Send Date (`[pickup] calendar: created/updated`), *after* the row is saved to
+  Sheets. Re-running a memo (incl. BLUE/PINK revisions) updates the same event — no duplicates.
+- **Calendar id unset:** prints `[calendar] disabled — schedule saved to Sheets only`.
+- **Calendar error** (id set but no key, bad hour, or API failure): the schedule is still
+  written to Sheets, a `[WARN]` is printed, and the run exits non-zero so the problem is visible.
