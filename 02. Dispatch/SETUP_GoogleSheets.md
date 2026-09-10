@@ -15,9 +15,10 @@ You only add the Sheets API + one spreadsheet + one env var.
 
 2. **Create the spreadsheet** — at sheets.google.com create a spreadsheet named e.g.
    **"APPA Dispatch — Master Schedule"**. You create and own it; never let the service
-   account own it. The tool manages a tab named **`Schedule`** (created/headed automatically
-   on first write). You may leave the default first tab renamed to `Schedule`, or let the
-   tool populate whatever tab you point it at via `APPA_GSHEET_TAB`.
+   account own it. The tool manages a tab named **`Schedule`**, but it does **not** create the
+   tab — **the target tab must already exist**. Rename the default first tab to `Schedule` (or
+   point `APPA_GSHEET_TAB` at an existing tab). When that existing tab is **empty**, Dispatch
+   initializes the **A:N** headers on first write; a missing tab is an error, not auto-created.
 
    **Column ownership.** The tool manages columns **A:N** — the business columns plus a
    **system-owned `Record ID`** (column N). These are Dispatch/Travel-owned, system-managed:

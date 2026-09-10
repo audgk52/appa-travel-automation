@@ -63,7 +63,7 @@ transactions in this increment — acceptable for the current low-frequency, few
 
 ---
 
-# Architecture decisions (finalized 2026-09-11, after live verification)
+# Architecture decisions (finalized 2026-09-10, after live verification)
 
 ## Live verification results (2026-09-10, real Google Sheets APIs)
 
