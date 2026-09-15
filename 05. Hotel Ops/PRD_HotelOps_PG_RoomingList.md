@@ -1,12 +1,12 @@
-# PRD — ⑤ Hotel Ops · PG (Rooming List Update) — v3
+# PRD — ⑤ Hotel Ops · PG (Rooming List Update) — v3.1
 
-*Revised 2026-09-16 · Status: **DRAFT — checkpoint remediation** (Astra Medium architecture checkpoint returned **NOT READY TO IMPLEMENT**; this revision resolves the identified blockers) · No code · Writes only `01. Rooming List`*
-*Supersedes v2 (2026-09-16, "architecture checkpoint locked" — that lock claim is withdrawn). Change log at end.*
+*Revised 2026-09-16 · Status: **DRAFT — checkpoint remediation** (Astra Medium architecture checkpoint returned **NOT READY TO IMPLEMENT**; this revision resolves the identified blockers — the formal checkpoint is **not yet passed**) · No code · Writes only `01. Rooming List`*
+*Supersedes v3 (2026-09-16); v3.1 applies final checkpoint clarifications. The v2 "architecture checkpoint locked" claim remains withdrawn. Change log at end.*
 *Evidence legend:* **[A]** artifact evidence · **[M]** Myungha / domain decision · **[⌂]** architecture decision/assumption · **[impl]** implementation-owned detail (not an architecture blocker)
 
 > **Note on names:** illustrative traveler names are role placeholders (e.g. "Traveler E — US Line Producer"; "James" in examples). Rooming-list spreadsheets containing real PII remain gitignored and are never committed.
 
-> **One-liner:** From either a revised itinerary **or** a short natural-language ops instruction, produce a single structured **`RoomingChange`** — *one logical operational decision that may touch one or several rooming records* — that, after human review, writes targeted cells to `01. Rooming List`, recalculates nights, appends NTF Request History for **verified** effects, and drafts the hotel-manager Kakao + email. **Yellow highlighting is a separate, on-demand baseline-diff view — not a commit-time output.** Nothing is written or sent without confirmation, and outputs describe **verified** state, never merely intended state.
+> **One-liner:** From either a revised itinerary **or** a short natural-language ops instruction, produce a single structured **`RoomingChange`** — *one logical operational decision that may touch one or several rooming records* — that, after human review, writes targeted cells to `01. Rooming List`, recalculates nights, appends NTF Request History for **verified** effects, and drafts the hotel-manager Kakao + email. **Yellow highlighting is a separate, on-demand baseline-diff view — not a commit-time output.** **No BUSINESS write occurs before confirmation** (authorized `rooming_record_id` system-maintenance adoption is the explicit exception, under the pre-validation contract of §2), nothing is sent without review, and outputs describe **verified** state, never merely intended state.
 
 ---
 
@@ -14,6 +14,8 @@
 
 - **PG v1 operational source of truth is a native Google Sheet copy** derived from the **Main Unit** workbook — the live `01. Rooming List` tab PG reads and writes.
 - **Historical `.xlsx` files are reference / local-backup artifacts only** — never the runtime target, never written by PG.
+
+**PG-owned durable state boundary [⌂]:** `01. Rooming List` is the **only BUSINESS-SHEET write target.** PG **may** maintain its own **durable operational metadata/state** required by this PRD — including **baseline state (§8–9)** and **execution/idempotency state (§14–15)**. **No other business tab is a PG write target.** The **ownership / persistence requirements** for that PG state are **architecture** (governed here); the **exact storage mechanism is [impl]**.
 
 ## 1. Current state
 
@@ -33,6 +35,8 @@ PG distinguishes **two write classes**:
 
 **System-maintenance writes** — PG housekeeping that carries no business decision.
 - **Assigning a missing `rooming_record_id` is an authorized PG maintenance action** and does **not** require business-change confirmation.
+
+**ID adoption eligibility [⌂]:** only an **eligible operational Rooming List data row** receives a `rooming_record_id`. For PG v1, an eligible record is a **data row whose `NAME` field contains a traveler or operational placeholder.** **Blank layout rows, headings, separators, summaries, and other non-record rows must NOT receive an ID.**
 
 **Ordering guarantee for ID adoption (must be strictly sequential):**
 1. **Schema validation completes first** (headers resolve by name; §12).
@@ -98,6 +102,8 @@ When the primary change would create a detected **overlap / gap / inconsistency*
 
 A generic rejection must **not** silently authorize an unexplained inconsistency. **Minimum v1 behavior = impact detection + explicit disposition.** No broader automatic stay rules.
 
+**Detector scope [⌂]:** for PG v1, **automatic related-impact detection is guaranteed only for date-boundary overlap/gap conditions between records belonging to the same confirmed `stay_id`.** Other possible relationship implications must **not** become automatic rules in v1 — surface them for human review rather than inventing broader business logic.
+
 **Example**
 > User: *"James Production checkout 6/19 → 6/21."* If another record under the same confirmed `stay_id` starts Personal coverage on 6/19, PG detects the overlap, shows both proposed changes, and requires disposition A/B/C.
 
@@ -106,11 +112,24 @@ A generic rejection must **not** silently authorize an unexplained inconsistency
 Managed fields are **not one set**. PG separates:
 
 - **A. Business / editable fields** — human/PG-editable operational values (e.g. `Check-in`, `Check-out`, `Room No.`, `TYPE OF ROOM`, `Rate`, `Payment`, `Late Check out`, `Remark`, `Reservation No.`, `Airport Arrival`, `In Room?`). Business changes require confirmation (§2).
-- **B. Yellow-comparison fields** — the subset of business fields whose value differences render yellow (§8). *(Exact field list to finalize in implementation from A, excluding C/D.)*
-- **C. Derived / formula / physical-location fields** — e.g. `Total # of Nights` (derived), `Row Number` (physical-location echo). PG recomputes only what this PRD explicitly owns (nights, §16). **Preserve existing formulas otherwise.**
+- **B. Yellow-comparison fields** — the fields whose value differences render yellow at refresh (§8). **This set is governed by the architecture contract below, not left entirely to implementation.**
+- **C. Derived / formula / physical-location fields** — `Total # of Nights` (PG-owned derived), `Row Number` (physical-location echo). PG recomputes only what this PRD explicitly owns (nights, §16). **Preserve existing formulas otherwise.**
 - **D. System metadata** — `rooming_record_id`, `stay_id`.
 
-**Excluded from yellow business-diff at minimum:** `rooming_record_id`, `stay_id`, `Row Number`, and any other physical-location/system metadata. **`Row Number` changing due to row reorder must never create yellow.** **NTF Request History is NOT a business-value yellow diff** — it is chronology/context, not a new operational change signal.
+**Yellow-comparison set [⌂] — surfaces *visible operational changes*:**
+
+**Include:**
+- business / editable operational fields (A),
+- the PG-owned derived `Total # of Nights`,
+- **`NTF Request History`.**
+
+**Exclude:**
+- `rooming_record_id`,
+- `stay_id`,
+- `Row Number`,
+- other system metadata / physical-location-only fields.
+
+**`Row Number` changing due to row reorder must never create yellow.** **`NTF Request History` IS in the yellow-comparison set:** it remains chronology/context and manual edits stay Myungha-owned (§17) — including it in yellow only means a **changed history cell is visually surfaced at the next refresh**, not that PG treats history as a new operational change signal or authors it from a diff.
 
 ## 8. Yellow highlight — on-demand baseline diff [⌂]
 
@@ -135,6 +154,13 @@ normal manual / agent changes accumulate
 **Refresh** and **Reset** are **separate operations**:
 - **Refresh** — keeps the existing baseline; re-diffs current values; renders current accumulated differences.
 - **Reset** — establishes a **new** baseline; closes the previous change window.
+
+**Initial baseline [⌂] — there is no automatic first baseline.** If **no active baseline exists** and Myungha requests a yellow **refresh**, PG must **STOP and explain that no baseline exists**, then **ask whether the current Rooming List should become the initial baseline.** The normal initial workflow is:
+1. Myungha handles any existing/pending legacy yellow changes;
+2. Myungha explicitly requests *"현재 상태를 baseline으로 잡고 yellow reset해줘"* (or equivalent);
+3. PG captures the current state as the **initial baseline** and resets the change window (per §9).
+
+**Do not infer historical meaning from pre-existing yellow formatting.**
 
 **Alignment is by `rooming_record_id`, not row position.**
 - **New record absent from baseline** → surfaced as *new*; its yellow-comparison values highlighted.
@@ -320,11 +346,13 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 
 ## 23. Entry-path workflows
 
-**Shared spine:** `input → read + validate(schema→dup-ID→adopt blanks) → resolve record(s) by ID → build RoomingChange → detect related impacts (A/B/C) → preview → confirm scope → revalidate dependencies → targeted writes → post-write verify → per-record NTF for verified effects → drafts`. Yellow is separate/on-demand (§8). No write and no send before confirm.
+**Shared spine:** `input → read + validate(schema→dup-ID→adopt blanks) → resolve record(s) by ID → build RoomingChange → detect related impacts (A/B/C) → preview → confirm scope → revalidate dependencies → targeted writes → post-write verify → per-record NTF for verified effects → drafts`. Yellow is separate/on-demand (§8). **No BUSINESS write and no send before confirm** — authorized `rooming_record_id` system-maintenance adoption is the explicit exception and follows the §2 pre-validation contract.
 
-**Path A — Itinerary-driven reconciliation [A/M]:** ingest itinerary facts → read+validate → resolve by ID (**0/>1 → user selects; non-trivial implication → propose/ask, don't invent**) → deterministic deltas + nights → surface HotelPolicy/ArrivalEstimate, payer, hotel-confirmation, related impacts → preview → confirm → revalidate → execute → verify → drafts. *Path A stays thin.*
+**Match resolution (both paths):** **exactly 1 valid match → continue** · **0 match → STOP / manual handoff** (never create a missing row/stay) · **>1 plausible match → human selects among existing candidates.**
 
-**Path B — Quick Ops (NL) [A/M]:** parse short instruction (e.g. `"James Production checkout 6/19 → 6/21"`) → read+validate → resolve by ID (**0/>1 → user selects; zero match → STOP/handoff**) → build (possibly multi-record) `RoomingChange` + related impacts → preview → confirm → revalidate → execute → verify → drafts.
+**Path A — Itinerary-driven reconciliation [A/M]:** ingest itinerary facts → read+validate → resolve by ID (**apply match resolution above; non-trivial itinerary→rooming implication → propose/ask, never invent the booking decision or create a row/stay**) → deterministic deltas + nights → surface HotelPolicy/ArrivalEstimate, payer, hotel-confirmation, related impacts → preview → confirm → revalidate → execute → verify → drafts. *Path A stays thin.*
+
+**Path B — Quick Ops (NL) [A/M]:** parse short instruction (e.g. `"James Production checkout 6/19 → 6/21"`) → read+validate → resolve by ID (**apply match resolution above**) → build (possibly multi-record) `RoomingChange` + related impacts → preview → confirm → revalidate → execute → verify → drafts.
 
 ## 24. User decision points [M]
 
@@ -343,14 +371,14 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 | # | Rule | Type |
 |---|---|---|
 | BR-1 | Nights = booked Check-out − Check-in (≥1); 50% previous-night = full booked night, never 0.5. | **[A/M]** |
-| BR-2 | ID adoption is an authorized system-maintenance write, permitted **only after** schema + duplicate-ID validation pass for the whole sheet; never partial-then-fail. | **[⌂]** |
+| BR-2 | ID adoption is an authorized system-maintenance write, permitted **only after** schema + duplicate-ID validation pass for the whole sheet; never partial-then-fail. Only **eligible data rows** (`NAME` = traveler/operational placeholder) get an id; layout/heading/separator/summary rows do not. | **[⌂]** |
 | BR-3 | Duplicate `rooming_record_id` → STOP; no adoption/business write until repaired. | **[⌂]** |
 | BR-4 | `rooming_record_id` is immutable through reorder/edits; a repurposed row = ended record + NEW id; unsafe continuity → STOP/ask. | **[⌂]** |
 | BR-5 | `stay_id` grouping is suggested-with-evidence but **confirmed by Myungha** the first time, then persisted; missing = not-yet-established. | **[⌂]** |
-| BR-6 | Related impact = detect→suggest→confirm; rejection offers A/B/C; never silent inconsistency; never auto-propagate. | **[⌂]** |
-| BR-7 | Yellow = on-demand diff of current vs active ID-keyed baseline (manual + PG edits); no polling/on-edit/auto-refresh; commit does not auto-yellow. | **[⌂]** |
+| BR-6 | Related impact = detect→suggest→confirm; rejection offers A/B/C; never silent inconsistency; never auto-propagate. v1 auto-detection is guaranteed **only** for date-boundary overlap/gap within the same confirmed `stay_id`; other implications are surfaced, not automated. | **[⌂]** |
+| BR-7 | Yellow = on-demand diff of current vs active ID-keyed baseline (manual + PG edits); no polling/on-edit/auto-refresh; commit does not auto-yellow. **No automatic first baseline** — a refresh with no active baseline STOPs and asks whether to capture the initial baseline. | **[⌂]** |
 | BR-8 | Reset = capture→persist→verify→re-read→re-diff→render; partial failure reported, never silently "done". | **[⌂]** |
-| BR-9 | Yellow-comparison excludes `rooming_record_id`, `stay_id`, `Row Number`, other system/physical metadata, and NTF Request History. | **[⌂]** |
+| BR-9 | Yellow-comparison (architecture-governed) **includes** business fields, PG-owned `Total # of Nights`, and `NTF Request History`; **excludes** `rooming_record_id`, `stay_id`, `Row Number`, and other system/physical-location metadata. | **[⌂]** |
 | BR-10 | Revalidation covers targets **and** dependencies/relationships; position-only move continues by ID; material change re-previews. | **[⌂]** |
 | BR-11 | No transactional-atomicity promise; optimistic best-effort; never overwrite newer human edits; no blind retry. | **[⌂]** |
 | BR-12 | Multi-record partial/uncertain → report per-effect truth, re-read, propose recovery from observed state, renewed confirmation. | **[⌂]** |
@@ -366,6 +394,7 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 ## 26. Acceptance criteria
 
 - **AC-1 (maintenance ID adoption after pre-validation):** on a structurally valid sheet with no duplicate IDs, a blank `rooming_record_id` is adopted **without** business-change confirmation; adoption occurs only after schema + duplicate checks pass.
+- **AC-1b (adoption eligibility):** only an eligible data row (`NAME` contains a traveler/operational placeholder) receives an id; blank layout rows, headings, separators, summaries, and other non-record rows receive **no** id.
 - **AC-2 (adoption never partial-then-fail):** if a duplicate/schema failure exists, **no** blank ID is assigned; PG halts before any adoption write.
 - **AC-3 (duplicate ID halts):** duplicate `rooming_record_id` stops all adoption and business mutation until repaired.
 - **AC-4 (row repurpose → new id):** a row fully repurposed for a different traveler/stay ends the old record and receives a **new** `rooming_record_id`; ambiguous continuity → STOP/ask.
@@ -396,12 +425,19 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 - **AC-29 (early-check-in boundary / missing input):** HotelPolicy tiers and ArrivalEstimate ranges are surfaced separately; a range crossing a threshold does not auto-select a tier; missing arrival/policy input stays unresolved.
 - **AC-30 (schema safety):** required fields resolve by header name; missing/duplicate required header fails fast before any write; a resolvable column reorder still works.
 - **AC-31 (per-effect ExecutionResult):** ExecutionResult separately reports business writes, nights recalc, NTF append, verification, and draft generation; yellow is not among commit outputs.
+- **AC-32 (no automatic first baseline):** a yellow **refresh** requested when no active baseline exists STOPs, explains that no baseline exists, and asks whether the current sheet should become the initial baseline; PG does not silently create one.
+- **AC-33 (initial baseline capture):** after Myungha explicitly requests capturing the current state as baseline + reset, PG persists it as the initial baseline and opens the change window (per §9); pre-existing yellow formatting is not interpreted as historical meaning.
+- **AC-34 (NTF history in yellow set):** a changed `NTF Request History` cell is surfaced yellow at the next refresh; PG still neither authors nor infers history reasons from the diff.
+- **AC-35 (nights in yellow set):** a change in the PG-owned `Total # of Nights` is surfaced yellow at the next refresh; `rooming_record_id`/`stay_id`/`Row Number`/system metadata never render yellow.
+- **AC-36 (related-impact detector scope):** automatic related-impact detection fires for a date-boundary overlap/gap between records under the same confirmed `stay_id`; other relationship implications are surfaced for human review, not auto-applied.
+- **AC-37 (match resolution):** exactly 1 valid match continues; 0 match stops with manual handoff and creates no row/stay (both paths); >1 plausible match defers to human selection among existing candidates.
+- **AC-38 (PG durable-state boundary):** PG writes business cells only to `01. Rooming List`; baseline and execution/idempotency state persist in PG-owned storage; no other business tab is written.
 
 ## 27. Test obligations
 
 **Kept separate:** **(a) unit/integration tests** (deterministic, against a `FakeSheetsService` mirroring Dispatch) · **(b) live Google Sheets verification** (manual, throwaway copy, recorded as evidence, out of CI) · **(c) Myungha UAT** (draft wording/style, operational fit).
 
-- **Unit/integration** must give **unique expected behavior** for each of: maintenance ID adoption after pre-validation; duplicate-ID → no adoption/mutation; confirmed vs missing/unconfirmed stay grouping; row repurpose → new id; row reorder → no false yellow; explicit-refresh-only; separate reset; accumulated manual+agent changes before refresh; edit during reset; related-impact A/B/C; dependency change after preview; position-only movement after preview; partial multi-record execution; uncertain/timeout; recovery requiring renewed confirmation; persisted confirmed-operation identity; idempotent history after restart/retry; per-record verified history; request-vs-hotel-confirmed truthfulness; zero-match handoff; payment literal-value; missing late-checkout time; Payment Tracker residual warning; early-check-in boundary/missing-input.
+- **Unit/integration** must give **unique expected behavior** for each of: maintenance ID adoption after pre-validation; **adoption eligibility (non-record rows get no id)**; duplicate-ID → no adoption/mutation; confirmed vs missing/unconfirmed stay grouping; row repurpose → new id; row reorder → no false yellow; explicit-refresh-only; **no automatic first baseline (refresh with no baseline STOPs and asks)**; **initial-baseline capture**; separate reset; accumulated manual+agent changes before refresh; **NTF-history and nights changes surfaced in yellow**; edit during reset; related-impact A/B/C; **related-impact detector scope (date-boundary within confirmed `stay_id`)**; dependency change after preview; position-only movement after preview; partial multi-record execution; uncertain/timeout; recovery requiring renewed confirmation; persisted confirmed-operation identity; idempotent history after restart/retry; per-record verified history; request-vs-hotel-confirmed truthfulness; **match resolution (1 continue / 0 handoff-no-create / >1 select)**; zero-match handoff; payment literal-value; missing late-checkout time; Payment Tracker residual warning; early-check-in boundary/missing-input; **PG durable-state boundary (business writes only to `01. Rooming List`)**.
 - **Live Sheets verification:** ID persistence across real reorder; yellow refresh/reset against a real baseline store; targeted-write isolation; schema fail-fast.
 - **Myungha UAT:** Kakao/email truthful-minimum content + tone/style; overall operational acceptance.
 
@@ -416,7 +452,7 @@ Architecture safeguards are **not** presented as domain facts.
 
 ## 29. Status & open items
 
-**Checkpoint status:** the prior "architecture checkpoint locked" claim is **withdrawn**; this is a **DRAFT — checkpoint remediation** addressing the Astra Medium *NOT READY TO IMPLEMENT* findings. The following were **resolved** in v3 and are **no longer open**: automatic stay grouping (→ suggest-with-confirmation, §5), yellow refresh timing (→ explicit on-demand, §8), rejected dependent-suggestion behavior (→ A/B/C disposition, §6), row-repurpose identity (→ new id, §3), reset atomicity/safety (§9), revalidation dependency scope (§10), concurrency/atomicity expectations (§11, §14), confirmed-operation identity (§15).
+**Checkpoint status:** the prior "architecture checkpoint locked" claim remains **withdrawn**; this is a **DRAFT — checkpoint remediation** addressing the Astra Medium *NOT READY TO IMPLEMENT* findings. **The formal checkpoint is not yet passed** — v3.1 is submitted for re-review. Resolved and **no longer open**: automatic stay grouping (→ suggest-with-confirmation, §5), yellow refresh timing (→ explicit on-demand, §8), rejected dependent-suggestion behavior (→ A/B/C disposition, §6), row-repurpose identity (→ new id, §3), reset atomicity/safety (§9), revalidation dependency scope (§10), concurrency/atomicity expectations (§11, §14), confirmed-operation identity (§15). **Additionally resolved in v3.1:** ID-adoption eligibility (§2), no automatic first baseline (§8), the architecture-governed yellow-comparison set incl. `NTF Request History` (§7), the v1 related-impact detector scope (§6), match resolution semantics (§23), and the PG-owned durable-state boundary (§0).
 
 **Remaining unresolved — Product Owner (domain) inputs**
 1. **[M — deferred, non-blocking]** Payment vocabulary semantics (`NTF` vs `Paramount`/`Personal`/`Production`/`Self Pay`). v1 applies literal confirmed values only; taxonomy normalization is deferred, so this does not block the checkpoint.
@@ -424,9 +460,20 @@ Architecture safeguards are **not** presented as domain facts.
 3. **[M — UAT-owned]** Final Kakao/email operational tone/style — owned by Myungha UAT (§19); truthful-minimum content is already specified, so this is not an architecture blocker.
 
 **Remaining unresolved — architecture**
-- **None blocking.** Residual items are **[impl]** decisions explicitly delegated to implementation (ID / baseline / `operation_ref` storage mechanisms and identifier formats, §9/§15), and the finalization of the exact **yellow-comparison field list** (§7B) from the business-field set — a scoping detail, not an architecture conflict.
+- **None blocking.** The yellow-comparison set is now **architecture-governed** (§7), not deferred. Residual items are purely **[impl]** decisions explicitly delegated to implementation — the **storage mechanisms and identifier formats** for `rooming_record_id` / baseline / `operation_ref` (§9, §15) — which are not architecture blockers.
 
 ---
+
+## Change log — v3 → v3.1 (final checkpoint clarifications, 2026-09-16)
+- **§2** ID-adoption **eligibility**: only eligible data rows (`NAME` = traveler/operational placeholder) get an id; non-record rows do not.
+- **§8** **No automatic first baseline**: a refresh with no active baseline STOPs and asks; documented initial-baseline capture workflow; no historical meaning inferred from pre-existing yellow.
+- **§7** Yellow-comparison set is **architecture-governed** and now **includes `NTF Request History`** and PG-owned `Total # of Nights` (removed the prior NTF exclusion); still excludes `rooming_record_id`/`stay_id`/`Row Number`/system-location fields.
+- **§6** Related-impact **detector scope** for v1 fixed to date-boundary overlap/gap within a confirmed `stay_id`; other implications surfaced, not automated.
+- **One-liner & §23** Confirmation wording made precise: **no BUSINESS write before confirmation**, authorized ID adoption excepted (pre-validation contract).
+- **§23** Path-A/B **match resolution**: 1 → continue · 0 → STOP/handoff (never create row/stay) · >1 → human selects among existing candidates.
+- **§0** **PG-owned durable-state boundary**: `01. Rooming List` is the only business-sheet write target; PG may persist its own baseline + execution/idempotency state (ownership = architecture, storage = impl).
+- **§26–27** ACs (AC-1b, AC-32–38) and test obligations updated; **§29** open items pruned (yellow-set no longer deferred).
+- **Status** kept **DRAFT — checkpoint remediation**; formal checkpoint **not yet passed**.
 
 ## Change log — v2 → v3 (checkpoint remediation, 2026-09-16)
 - **Status:** withdrew "architecture checkpoint locked"; now "DRAFT — checkpoint remediation" (Astra Medium: NOT READY TO IMPLEMENT).
