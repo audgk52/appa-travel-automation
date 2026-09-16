@@ -158,6 +158,7 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
         except Exception as exc:  # noqa: BLE001 — surface as uncertain, no blind retry
             result.per_record[rid] = {"applied": [], "effects": [EffectResult("business_write", "uncertain", str(exc))]}
             result.overall = "uncertain"
+            state.mark_record_uncertain(op, rid, {"reason": "business_write_raised"})
             continue
         if not ok:
             result.per_record[rid] = {"applied": [], "effects": [EffectResult("business_write", "failed", "record not found")]}
@@ -174,16 +175,46 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
         if status != "verified":
             result.per_record[rid] = {"applied": [], "effects": effects}
             result.overall = "uncertain" if status == "uncertain" else "incomplete"
+            if status == "uncertain":
+                state.mark_record_uncertain(op, rid, {"reason": "verification_uncertain"})
             continue
 
-        # 3. NTF history append for VERIFIED effects only (§17), idempotent.
+        # 3. NTF history append for VERIFIED effects only (§17) — the write must be
+        # VERIFIED (return value + re-read) before it is claimed, and it is idempotent
+        # by content so a retry/restart never duplicates it (audit B7).
         line = history_entry(request_date, business)
+        ntf_ok = True
         if line:
-            cur = after[rid].get(fields.NTF_HISTORY)
-            store.apply_writes(rid, {fields.NTF_HISTORY: append_history(cur, line)})
-            effects.append(EffectResult("ntf_append", "verified", line))
+            cur = after[rid].get(fields.NTF_HISTORY) or ""
+            if line in cur:
+                # Already present (history written before a crash lost the state):
+                # do not duplicate; treat as verified (§15/§17 idempotent).
+                effects.append(EffectResult("ntf_append", "already_done", line))
+            else:
+                try:
+                    wrote = store.apply_writes(rid, {fields.NTF_HISTORY: append_history(cur, line)})
+                    write_detail = ""
+                except Exception as exc:  # noqa: BLE001
+                    wrote, write_detail = False, f"history write raised: {exc}"
+                post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
+                landed = bool(post and line in (post.get(fields.NTF_HISTORY) or ""))
+                if wrote and landed:
+                    effects.append(EffectResult("ntf_append", "verified", line))
+                else:
+                    ntf_ok = False
+                    effects.append(EffectResult(
+                        "ntf_append", "failed",
+                        write_detail or "history write not verified on re-read"))
         else:
             effects.append(EffectResult("ntf_append", "skipped"))
+
+        if not ntf_ok:
+            # Business landed but its REQUIRED history did not verify: never claim the
+            # record done or the op complete; surface + durably persist as uncertain.
+            result.per_record[rid] = {"applied": [], "effects": effects}
+            result.overall = "uncertain"
+            state.mark_record_uncertain(op, rid, {"reason": "ntf_unverified"})
+            continue
 
         result.per_record[rid] = {"applied": business, "effects": effects}
         state.mark_record_done(op, rid, {"line": line})

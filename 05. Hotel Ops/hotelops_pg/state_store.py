@@ -64,7 +64,8 @@ class StateStore:
         self._flush()
 
     # --- idempotency (§15) ---------------------------------------------------
-    # executed_ops[op_ref] = {"records": {record_id: summary}, "complete": bool}
+    # executed_ops[op_ref] = {"records": {record_id: {"status": "done"|"uncertain",
+    #                                                  "summary": {...}}}, "complete": bool}
     def _op(self, operation_ref):
         return self._data["executed_ops"].setdefault(operation_ref, {"records": {}, "complete": False})
 
@@ -73,13 +74,27 @@ class StateStore:
         op = self._data["executed_ops"].get(operation_ref)
         return bool(op and op.get("complete"))
 
-    def is_record_done(self, operation_ref: str, record_id: str) -> bool:
-        """True iff this record's verified effect was already applied for this op (§15)."""
+    def record_status(self, operation_ref: str, record_id: str):
+        """"done" | "uncertain" | None for a record under this op (audit B7)."""
         op = self._data["executed_ops"].get(operation_ref)
-        return bool(op and record_id in op.get("records", {}))
+        rec = op.get("records", {}).get(record_id) if op else None
+        return rec.get("status") if rec else None
+
+    def is_record_done(self, operation_ref: str, record_id: str) -> bool:
+        """True iff this record's VERIFIED effect was already applied for this op (§15).
+
+        An 'uncertain' record is NOT done: a later operation must not assume success.
+        """
+        return self.record_status(operation_ref, record_id) == "done"
 
     def mark_record_done(self, operation_ref: str, record_id: str, summary=None):
-        self._op(operation_ref)["records"][record_id] = summary or {}
+        self._op(operation_ref)["records"][record_id] = {"status": "done", "summary": summary or {}}
+        self._flush()
+
+    def mark_record_uncertain(self, operation_ref: str, record_id: str, summary=None):
+        """Durably record that a record's effect is uncertain (audit B7): future
+        operations touching it must not assume the prior operation succeeded."""
+        self._op(operation_ref)["records"][record_id] = {"status": "uncertain", "summary": summary or {}}
         self._flush()
 
     def mark_complete(self, operation_ref: str):
