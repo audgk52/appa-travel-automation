@@ -121,6 +121,22 @@ def propose(records, edits: dict) -> RoomingChange:
 
     # §6.1 detector scope: date-boundary overlap/gap within a CONFIRMED stay only.
     change.detected_related_impacts = _detect_related_impacts(by_id, records, change)
+
+    # §21 residual risk: a date/payment change may misalign the positionally-coupled
+    # Payment Tracker (IMPORTRANGE). PG WARNS only — it never validates/repairs it.
+    for rid in change.target_record_ids:
+        if any(d.field in (fields.CHECK_IN, fields.CHECK_OUT, fields.PAYMENT)
+               for d in change.field_deltas[rid]):
+            change.policy_flags.append({
+                "kind": "payment_tracker_residual",
+                "record_id": rid,
+                "needs_confirmation": False,
+                "message": (
+                    "date/payment change may misalign the positionally-coupled "
+                    "'02. Rooming List - Payment Trac' IMPORTRANGE; PG warns only and "
+                    "performs no Payment Tracker validation or repair (§21)."
+                ),
+            })
     return change
 
 

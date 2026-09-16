@@ -54,3 +54,24 @@ def make_store():
         backend = InMemoryBackend(build_grid(rows, **kw))
         return RoomingSheetStore(backend), backend
     return _make
+
+
+def rr(record_id, name="Traveler A", stay_id="", row_index=0, eligible=True,
+       check_in="", check_out="", nights="", **vals):
+    """Build a :class:`RoomingRecord` directly (for baseline/revalidation tests).
+
+    ``check_in``/``check_out``/``nights`` are convenience params mapped to their
+    managed headers (like :func:`record`); ``vals`` are further managed values
+    keyed by ``fields`` constants. Unset business headers default to "". ``NAME``
+    defaults to an eligible placeholder so the record participates in yellow capture.
+    """
+    from hotelops_pg.records import RoomingRecord
+
+    values = {h: "" for h in fields.REQUIRED_BUSINESS_HEADERS}
+    values[fields.NAME] = name
+    values[fields.CHECK_IN] = check_in
+    values[fields.CHECK_OUT] = check_out
+    values[fields.NIGHTS] = nights
+    values.update(vals)
+    return RoomingRecord(row_index=row_index, record_id=record_id, stay_id=stay_id,
+                         values=values, eligible=eligible)
