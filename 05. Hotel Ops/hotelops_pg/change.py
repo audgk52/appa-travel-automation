@@ -54,6 +54,7 @@ class RoomingChange:
     requires_grouping_disposition: bool = False          # R1 gate (§6.1)
     grouping_disposition: str = ""                       # "A"|"B"|"C"
     limited_check_authorized: bool = False               # R1-B (§6.1)
+    authorized_decisions: dict = field(default_factory=dict)  # resolved §19/§16 decisions (§6/B6)
     confirmed_scope: dict = field(default_factory=dict)  # what the human approved
 
     def changed_records(self):
@@ -201,6 +202,10 @@ def compute_operation_ref(change: RoomingChange) -> str:
         ),
         "grouping_disposition": change.grouping_disposition,
         "limited_check": change.limited_check_authorized,
+        # Authorization-bearing human decisions (payer/early-check-in/hotel-confirm,
+        # §19/§16) bind the identity; a changed decision is a new authorization (B6).
+        # Display-only warnings (payment_tracker_residual) are deliberately NOT here.
+        "decisions": {k: change.authorized_decisions[k] for k in sorted(change.authorized_decisions)},
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return "op-" + hashlib.sha256(blob).hexdigest()[:24]

@@ -103,7 +103,21 @@ class RoomingSheetStore:
         return None
 
     def apply_writes(self, record_id, updates: dict) -> bool:
-        """Targeted cell writes for one record, located by id (§3/§7). Returns success."""
+        """Targeted cell writes for one record, located by id (§3/§7). Returns success.
+
+        Write-safety boundary (audit B1): a write to a managed field outside
+        :data:`fields.PG_PERSISTABLE` (e.g. NAME) is refused with
+        :class:`fields.ForbiddenFieldWrite` — human-owned columns stay impossible for
+        PG to write even if a malformed change reaches here. Non-managed/unknown keys
+        are simply ignored (no such column exists to write).
+        """
+        managed = set(fields.REQUIRED_BUSINESS_HEADERS) | set(fields.SYSTEM_HEADERS)
+        forbidden = [f for f in updates if f in managed and f not in fields.PG_PERSISTABLE]
+        if forbidden:
+            raise fields.ForbiddenFieldWrite(
+                f"PG may never write managed field(s) {forbidden!r} (PRD §7); "
+                f"writable set is {fields.PG_PERSISTABLE!r}."
+            )
         grid = self.backend.read_grid()
         headers = self._resolve(grid)
         row_index = self._locate(grid, headers, record_id)

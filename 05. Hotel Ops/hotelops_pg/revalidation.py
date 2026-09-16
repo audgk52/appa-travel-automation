@@ -38,6 +38,18 @@ def revalidate(change, fresh_records) -> RevalidationResult:
         if change.positions.get(rid) is not None and rec.row_index != change.positions[rid]:
             moved = True
 
+        # Identity/continuity fact (§3, audit B3): the row must still hold the SAME
+        # traveler the proposal was built for. A repurposed row (NAME changed) is a
+        # different operational record; stale authorization must not write onto it.
+        snap = change.snapshots.get(rid, {})
+        if fields.NAME in snap and rec.get(fields.NAME) != snap[fields.NAME]:
+            return RevalidationResult(
+                False,
+                f"{rid!r} traveler changed ({snap[fields.NAME]!r}→now "
+                f"{rec.get(fields.NAME)!r}); row repurposed — re-preview/confirm",
+                "material",
+            )
+
         # The base each delta was computed from must be unchanged (else a newer
         # human edit is present → material). current == old (base) or already == new
         # (idempotent) is fine; anything else invalidates (§10, R2 §11).
@@ -51,15 +63,23 @@ def revalidate(change, fresh_records) -> RevalidationResult:
                     "material",
                 )
 
-        # Relevant stay membership must be unchanged where the change relied on it.
-        if change.stay_id and rec.stay_id and rec.stay_id != change.stay_id:
+        # Relevant stay membership must be unchanged where the change relied on it —
+        # including REMOVAL of prior membership (audit B5): if the proposal relied on
+        # a confirmed grouping, the record must still carry that exact stay_id.
+        if change.stay_id and rec.stay_id != change.stay_id:
             return RevalidationResult(
-                False, f"{rid!r} stay_id changed ({change.stay_id!r}→{rec.stay_id!r})", "material"
+                False,
+                f"{rid!r} stay membership changed ({change.stay_id!r}→"
+                f"{rec.stay_id or '∅'!r})",
+                "material",
             )
 
-    # Related records whose state justified a suggestion must still hold that state.
+    # Related records whose state justified a suggestion must still hold that state —
+    # under BOTH disposition A (dependent applied) and B (inconsistency approved as an
+    # intentional exception). If the sibling moved under us, the approved scope/
+    # exception no longer holds → re-preview (audit B5). C cancelled the proposal.
     for impact in change.detected_related_impacts:
-        if impact.disposition != "A":
+        if impact.disposition not in ("A", "B"):
             continue
         sib = by_id.get(impact.target_record_id)
         if sib is None:

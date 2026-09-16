@@ -21,6 +21,9 @@ class PartialStore:
     def __init__(self, inner, fail_id, mode="false"):
         self.inner, self.fail_id, self.mode = inner, fail_id, mode
 
+    def read_validated(self):
+        return self.inner.read_validated()
+
     def snapshot_records(self):
         return self.inner.snapshot_records()
 

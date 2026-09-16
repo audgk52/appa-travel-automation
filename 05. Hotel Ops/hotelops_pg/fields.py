@@ -62,6 +62,14 @@ DERIVED = (NIGHTS,)
 # excludes system/physical-location metadata (Row Number, ids).
 YELLOW_COMPARISON = PG_WRITABLE + VISIBLE_MANUAL + DERIVED + (NTF_HISTORY,)
 
+# The complete set of managed fields PG may EVER write to a cell, across all write
+# classes: business writes (§7A), the derived nights recompute (§16), the appended
+# NTF history (§17), and system-maintenance id/stay adoption (§2/§5). Any managed
+# field outside this set — NAME, TITLE, Rate, In Room?, Reservation No., Airport
+# Arrival, Row Number — is human-owned and must be IMPOSSIBLE for PG to write, even
+# if a malformed/mutated RoomingChange reaches the store (audit B1).
+PG_PERSISTABLE = PG_WRITABLE + DERIVED + (NTF_HISTORY, ROOMING_RECORD_ID, STAY_ID)
+
 # Excluded from yellow comparison (§7): physical-location + system metadata.
 YELLOW_EXCLUDED = (ROW_NUMBER, ROOMING_RECORD_ID, STAY_ID)
 
@@ -74,6 +82,15 @@ class SchemaError(ValueError):
 
     Raised before any write so a corrupted/edited managed header is a detected,
     fail-fast condition — never silently repaired (which would misalign data).
+    """
+
+
+class ForbiddenFieldWrite(ValueError):
+    """Attempt to write a managed field PG may never write (PRD §7; audit B1).
+
+    The hard write-safety boundary: NAME/TITLE/Rate/In Room?/Reservation No./
+    Airport Arrival/Row Number are human-owned. A write to one of these is refused
+    at the store even if a mutated RoomingChange carried it past proposal checks.
     """
 
 
@@ -102,7 +119,11 @@ def resolve_headers(header_row) -> dict:
             continue
         seen.setdefault(name, []).append(idx)
 
-    duplicates = [h for h in REQUIRED_BUSINESS_HEADERS if len(seen.get(h, [])) > 1]
+    # Duplicate required business OR system-identity headers are both fatal: an
+    # ambiguous rooming_record_id / stay_id column would silently misresolve identity
+    # (audit B2). Never tolerate either — resolve identity unambiguously or fail fast.
+    duplicates = [h for h in (REQUIRED_BUSINESS_HEADERS + SYSTEM_HEADERS)
+                  if len(seen.get(h, [])) > 1]
     if duplicates:
         raise SchemaError(
             "Duplicate required Rooming List header(s) "

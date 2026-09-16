@@ -19,9 +19,25 @@ state with renewed confirmation (§14).
 from dataclasses import dataclass, field
 
 from hotelops_pg import fields
+from hotelops_pg.adoption import DuplicateRecordIdError
+from hotelops_pg.change import compute_operation_ref
 from hotelops_pg.drafts import email_draft, kakao_draft
 from hotelops_pg.history import append_history, history_entry
 from hotelops_pg.revalidation import revalidate
+
+
+def _forbidden_business_fields(change):
+    """Business deltas that PG may not write (audit B1). NIGHTS is the derived
+    recompute and NTF history is appended internally — both are allowed; anything
+    else must be in the PG business-writable set."""
+    bad = []
+    for rid in change.target_record_ids:
+        for d in change.field_deltas.get(rid, []):
+            if d.field in (fields.NTF_HISTORY, fields.NIGHTS):
+                continue
+            if not fields.is_pg_writable(d.field):
+                bad.append((rid, d.field))
+    return bad
 
 
 @dataclass
@@ -62,6 +78,27 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     if not op:
         raise ValueError("change is not confirmed (no operation_ref); call change.confirm() first")
 
+    # (B1) Confirmed-proposal integrity: execute ONLY the exact authorized proposal.
+    # If scope / deltas / dispositions / decisions were mutated after confirmation,
+    # the recomputed ref no longer matches — the old authorization is void (§15).
+    if compute_operation_ref(change) != op:
+        return ExecutionResult(op, "authorization_invalidated",
+                               effects=[EffectResult("authorization", "failed",
+                                                     "confirmed proposal was mutated after "
+                                                     "confirmation; operation_ref no longer "
+                                                     "matches its contents (§15)")],
+                               detail="stale/mutated proposal rejected before any write (B1)")
+
+    # (B1) Hard writable-field boundary: a business delta on a human-owned field
+    # (e.g. NAME) is refused before any write, even if it slipped past propose().
+    forbidden = _forbidden_business_fields(change)
+    if forbidden:
+        return ExecutionResult(op, "forbidden_field",
+                               effects=[EffectResult("write_safety", "failed",
+                                                     f"forbidden business-field write(s) {forbidden!r} "
+                                                     f"(PRD §7); writable set {fields.PG_WRITABLE!r}")],
+                               detail="forbidden-field write rejected before any write (B1)")
+
     # Idempotency short-circuit (§15): whole op already verified complete.
     if state.is_executed(op):
         return ExecutionResult(op, "noop_already_done",
@@ -69,8 +106,17 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      "operation already verified complete")],
                                detail="idempotent no-op (§15)")
 
+    # (B2) Integrity gate before ANY business execution (§2/§4): schema → unique
+    # required/system headers → duplicate rooming_record_id → permitted adoption.
+    # A weaker read path must never be used to reach the write stage.
+    try:
+        fresh = store.read_validated().records
+    except (fields.SchemaError, DuplicateRecordIdError) as exc:
+        return ExecutionResult(op, "integrity_failed",
+                               effects=[EffectResult("integrity", "failed", str(exc))],
+                               detail="integrity gate halted execution before any write (§2/§4, B2)")
+
     # Dependency-aware revalidation (§10) — R2: stop rather than overwrite observed newer state.
-    fresh = store.snapshot_records()
     rv = revalidate(change, fresh)
     if not rv.ok:
         return ExecutionResult(op, "revalidation_failed",
