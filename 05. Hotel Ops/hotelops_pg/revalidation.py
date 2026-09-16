@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from hotelops_pg import fields
 from hotelops_pg.change import confirm as _confirm  # noqa: F401  (re-export convenience)
 
+# The explicit material identity/continuity facts a proposal depends on to be sure it
+# still targets the SAME operational booking record (audit B3). Deliberately NOT the
+# whole comparable row — unrelated manual values (Rate, In Room?, …) are not blockers.
+IDENTITY_FIELDS = (fields.NAME, fields.RESERVATION_NO)
+
 
 @dataclass
 class RevalidationResult:
@@ -38,17 +43,25 @@ def revalidate(change, fresh_records) -> RevalidationResult:
         if change.positions.get(rid) is not None and rec.row_index != change.positions[rid]:
             moved = True
 
-        # Identity/continuity fact (§3, audit B3): the row must still hold the SAME
-        # traveler the proposal was built for. A repurposed row (NAME changed) is a
-        # different operational record; stale authorization must not write onto it.
-        snap = change.snapshots.get(rid, {})
-        if fields.NAME in snap and rec.get(fields.NAME) != snap[fields.NAME]:
+        # Continued existence as an eligible operational record (§3, audit B3).
+        if not rec.eligible:
             return RevalidationResult(
-                False,
-                f"{rid!r} traveler changed ({snap[fields.NAME]!r}→now "
-                f"{rec.get(fields.NAME)!r}); row repurposed — re-preview/confirm",
-                "material",
+                False, f"{rid!r} is no longer an eligible operational record (ended)", "material"
             )
+
+        # Identity/continuity facts (§3, audit B3): the row must still hold the same
+        # traveler AND booking (Reservation No.) the proposal was built for. A change
+        # to either means the operational record may differ; stale authorization must
+        # not write onto it. Unrelated manual fields (Rate, In Room?, …) are ignored.
+        snap = change.snapshots.get(rid, {})
+        for f in IDENTITY_FIELDS:
+            if f in snap and rec.get(f) != snap[f]:
+                return RevalidationResult(
+                    False,
+                    f"{rid!r} identity fact {f!r} changed ({snap[f]!r}→now {rec.get(f)!r}); "
+                    "record may differ — re-preview/confirm",
+                    "material",
+                )
 
         # The base each delta was computed from must be unchanged (else a newer
         # human edit is present → material). current == old (base) or already == new
@@ -85,6 +98,27 @@ def revalidate(change, fresh_records) -> RevalidationResult:
         if sib is None:
             return RevalidationResult(
                 False, f"related record {impact.target_record_id!r} was deleted", "deleted"
+            )
+        # The related record's material dependency facts (existence/eligibility,
+        # traveler NAME, stay membership) must still hold — not just its boundary
+        # value — under BOTH disposition A and B (audit B5).
+        if not sib.eligible:
+            return RevalidationResult(
+                False, f"related record {impact.target_record_id!r} became ineligible", "material"
+            )
+        if impact.target_name and sib.get(fields.NAME) != impact.target_name:
+            return RevalidationResult(
+                False,
+                f"related record {impact.target_record_id!r} traveler changed "
+                f"({impact.target_name!r}→now {sib.get(fields.NAME)!r})",
+                "material",
+            )
+        if sib.stay_id != impact.target_stay_id:
+            return RevalidationResult(
+                False,
+                f"related record {impact.target_record_id!r} stay membership changed "
+                f"({impact.target_stay_id or '∅'!r}→{sib.stay_id or '∅'!r})",
+                "material",
             )
         cur = sib.get(impact.suggested.field)
         if cur not in (str(impact.suggested.old), str(impact.suggested.new)):

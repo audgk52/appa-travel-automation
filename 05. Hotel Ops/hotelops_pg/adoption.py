@@ -58,10 +58,13 @@ def plan_adoption(grid) -> AdoptionResult:
     headers = fields.resolve_headers(grid[0]) if grid else fields.resolve_headers([])
     records = read_records(grid, headers)
 
-    # Step 2: duplicate detection across eligible rows that already carry an id.
+    # Step 2: duplicate detection across the ENTIRE identity namespace — any row that
+    # physically carries a nonblank rooming_record_id, eligible or not (audit B2). A
+    # corrupted/ineligible row sharing an id would otherwise let _locate first-match
+    # the wrong physical row.
     seen = {}
     for rec in records:
-        if rec.eligible and rec.record_id:
+        if rec.record_id:
             seen.setdefault(rec.record_id, []).append(rec.row_index)
     duplicates = {rid for rid, rows in seen.items() if len(rows) > 1}
     if duplicates:

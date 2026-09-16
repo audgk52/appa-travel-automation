@@ -57,11 +57,12 @@ def make_store():
 
 
 def rr(record_id, name="Traveler A", stay_id="", row_index=0, eligible=True,
-       check_in="", check_out="", nights="", **vals):
+       check_in="", check_out="", nights="", reservation_no="R1", **vals):
     """Build a :class:`RoomingRecord` directly (for baseline/revalidation tests).
 
-    ``check_in``/``check_out``/``nights`` are convenience params mapped to their
-    managed headers (like :func:`record`); ``vals`` are further managed values
+    ``check_in``/``check_out``/``nights``/``reservation_no`` are convenience params
+    mapped to their managed headers (mirroring :func:`record`'s defaults so a fresh
+    "unchanged" row keeps its booking identity); ``vals`` are further managed values
     keyed by ``fields`` constants. Unset business headers default to "". ``NAME``
     defaults to an eligible placeholder so the record participates in yellow capture.
     """
@@ -72,6 +73,7 @@ def rr(record_id, name="Traveler A", stay_id="", row_index=0, eligible=True,
     values[fields.CHECK_IN] = check_in
     values[fields.CHECK_OUT] = check_out
     values[fields.NIGHTS] = nights
+    values[fields.RESERVATION_NO] = reservation_no
     values.update(vals)
     return RoomingRecord(row_index=row_index, record_id=record_id, stay_id=stay_id,
                          values=values, eligible=eligible)

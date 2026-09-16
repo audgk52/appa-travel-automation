@@ -15,7 +15,7 @@ Dispatch's FakeSheetsService); :func:`build_sheets_service` + :class:`GoogleBack
 wrap real Sheets via a lazy import.
 """
 from hotelops_pg import fields
-from hotelops_pg.adoption import plan_adoption
+from hotelops_pg.adoption import DuplicateRecordIdError, plan_adoption
 from hotelops_pg.records import read_records
 
 # Fields written with Sheets USER_ENTERED so date/number semantics are preserved
@@ -100,11 +100,10 @@ class RoomingSheetStore:
 
     # --- writes --------------------------------------------------------------
     def _locate(self, grid, headers, record_id):
+        """All grid-row indexes carrying ``record_id`` (audit B2: never first-match)."""
         id_col = headers[fields.ROOMING_RECORD_ID]
-        for i, row in enumerate(grid[1:]):
-            if (row[id_col] if id_col < len(row) else "") == record_id:
-                return i + 1  # grid row index (header is row 0)
-        return None
+        return [i + 1 for i, row in enumerate(grid[1:])
+                if (row[id_col] if id_col < len(row) else "") == record_id]
 
     def apply_writes(self, record_id, updates: dict) -> bool:
         """Targeted cell writes for one record, located by id (§3/§7). Returns success.
@@ -124,11 +123,14 @@ class RoomingSheetStore:
             )
         grid = self.backend.read_grid()
         headers = self._resolve(grid)
-        row_index = self._locate(grid, headers, record_id)
-        if row_index is None:
+        matches = self._locate(grid, headers, record_id)
+        if len(matches) > 1:
+            # Corrupt identity namespace — never silently pick one of several (B2).
+            raise DuplicateRecordIdError({record_id})
+        if not matches:
             return False
         col_updates = {headers[f]: v for f, v in updates.items() if f in headers}
-        self.backend.write_cells(row_index, col_updates)
+        self.backend.write_cells(matches[0], col_updates)
         return True
 
 

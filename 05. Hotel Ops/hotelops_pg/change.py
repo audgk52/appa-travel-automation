@@ -66,6 +66,8 @@ class RelatedImpact:
     suggested: FieldDelta     # dependent change proposed on the target record
     description: str
     disposition: str = ""     # "A" apply / "B" intentional-exception / "C" cancel (§6)
+    target_name: str = ""     # sibling continuity facts at detection (audit B5)
+    target_stay_id: str = ""
 
 
 @dataclass
@@ -200,6 +202,8 @@ def _boundary_impacts(rec, siblings, boundary, old, new) -> list:
             source_record_id=rec.record_id,
             target_record_id=sib.record_id,
             suggested=FieldDelta(boundary, sib.get(boundary), new),
+            target_name=sib.get(fields.NAME),
+            target_stay_id=sib.stay_id,
             description=(
                 f"{rec.get(fields.NAME)} {('check-out' if boundary == fields.CHECK_IN else 'check-in')} "
                 f"boundary moved {old} → {new}; sibling {sib.get(fields.NAME)} "
