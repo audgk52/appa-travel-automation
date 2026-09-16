@@ -1,7 +1,21 @@
 # --- Sensitive production data (PII) — NEVER commit/push, keep local only ---
 Reference Files/
-05. Hotel Ops/
 APPA_Notes_Compiled.md
+
+# --- 05. Hotel Ops — folder holds PII rooming data; default-deny, then allow code only ---
+05. Hotel Ops/*
+!05. Hotel Ops/.gitignore
+!05. Hotel Ops/PRD_HotelOps_PG_RoomingList.md
+!05. Hotel Ops/conftest.py
+!05. Hotel Ops/hotelops_pg/
+!05. Hotel Ops/tests/
+# re-ignore any PII data / runtime state that lands inside the code dirs
+05. Hotel Ops/**/*.xlsx
+05. Hotel Ops/**/*.csv
+05. Hotel Ops/**/*.tsv
+05. Hotel Ops/**/*.pdf
+05. Hotel Ops/**/*.json
+
 *.xlsx
 *.pdf
 # real Travel Memos / passports / itineraries if ever placed elsewhere
