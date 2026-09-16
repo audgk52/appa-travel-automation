@@ -56,6 +56,14 @@ def make_store():
     return _make
 
 
+@pytest.fixture
+def durable_state(tmp_path):
+    """A path-backed (durable) StateStore for operational-flow tests (B8)."""
+    from hotelops_pg.state_store import StateStore
+
+    return StateStore(tmp_path / "state.json")
+
+
 def rr(record_id, name="Traveler A", stay_id="", row_index=0, eligible=True,
        check_in="", check_out="", nights="", reservation_no="R1", **vals):
     """Build a :class:`RoomingRecord` directly (for baseline/revalidation tests).

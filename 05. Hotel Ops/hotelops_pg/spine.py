@@ -38,6 +38,23 @@ class QuickOpsParseError(ValueError):
     """
 
 
+class NonDurableStateError(RuntimeError):
+    """An operational flow (commit / yellow reset) was handed non-durable state (B8).
+
+    In-memory state is allowed in unit tests, but a flow whose contract requires
+    restart persistence must fail fast BEFORE any business mutation rather than
+    silently offer persistence-based guarantees it cannot keep.
+    """
+
+
+def _require_durable(state, flow):
+    if not getattr(state, "durable", False):
+        raise NonDurableStateError(
+            f"operational {flow} requires a durable (path-backed) state store; in-memory "
+            "state is for unit tests only (§0/§9/§15, B8)."
+        )
+
+
 # Payment vocabulary is PRD-enumerated (§20). Recognizing a trailing payment token
 # disambiguates "<Name> <Payment> <op>" WITHOUT inferring equivalence between terms.
 _KNOWN_PAYMENTS = {"production", "paramount", "ntf", "personal", "self pay", "selfpay"}
@@ -213,6 +230,7 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
     dependency-aware revalidation. Raises the same Cancelled / GroupingNotYetEstablished
     / UnresolvedDecision signals as confirm() so a gate cannot be silently skipped.
     """
+    _require_durable(state, "commit")                    # B8: fail before any mutation
     if preview.change is None:
         raise ValueError(f"preview status {preview.status!r} has no committable change; "
                          "resolve it first (target selection / grouping / handoff).")
@@ -225,3 +243,25 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
     )
     return execute(confirmed, store, state, request_date=request_date,
                    hotel_confirmed=hotel_confirmed)
+
+
+def yellow_refresh(store, state):
+    """Operational yellow refresh — a §4 integrity entry point (B9-C).
+
+    Runs the validated read (schema → unique headers → duplicate-id → adoption; a
+    duplicate id STOPs) and diffs the fresh, id-resolved records against the active
+    baseline. Retains R3 semantics: accurate as of this read, no real-time guarantee.
+    """
+    from hotelops_pg.baseline import refresh
+    return refresh(lambda: store.read_validated().records, state)
+
+
+def yellow_reset(store, state, persist=None, render=None):
+    """Operational yellow reset — requires DURABLE state (B8) and a validated read (B9-C).
+
+    Fails before claiming activation if handed non-durable state. The read runs the full
+    integrity/adoption gate so formatting never uses stale rows or a corrupt namespace.
+    """
+    _require_durable(state, "yellow reset")
+    from hotelops_pg.baseline import reset
+    return reset(lambda: store.read_validated().records, state, persist=persist, render=render)
