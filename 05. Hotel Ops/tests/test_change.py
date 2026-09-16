@@ -89,16 +89,17 @@ def test_r1_disposition_b_requires_limited_check_authorization(make_store):
     assert confirmed.operation_ref
 
 
-def test_r1_disposition_a_proceeds(make_store):
-    # AC-39a: grouping established upstream; A proceeds to a confirmed proposal.
-    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1",
+def test_r1_disposition_a_is_not_a_terminal_confirmation(make_store):
+    # AC-39a / B4: 'A' is NOT a flag-toggle — it must force real grouping
+    # establishment + re-propose, so confirm() refuses it as terminal. The full
+    # blank-stay → establish → re-propose transition is covered in test_r1_grouping.
+    from hotelops_pg.change import GroupingNotYetEstablished
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="",
                                   check_in="2026-06-10", check_out="2026-06-12")])
-    recs = _recs(store)
-    change = propose(recs, {"rl-a": {fields.CHECK_OUT: "2026-06-14"}})
-    change.requires_grouping_disposition = True       # simulate the unestablished gate
-    confirmed = confirm(change, grouping_disposition="A")
-    assert confirmed.grouping_disposition == "A"
-    assert confirmed.operation_ref
+    change = propose(_recs(store), {"rl-a": {fields.CHECK_OUT: "2026-06-14"}})
+    assert change.requires_grouping_disposition is True
+    with pytest.raises(GroupingNotYetEstablished):
+        confirm(change, grouping_disposition="A")
 
 
 # --- related-impact detection + A/B/C disposition (§6) ---------------------------

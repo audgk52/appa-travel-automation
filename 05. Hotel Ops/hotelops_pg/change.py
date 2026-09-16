@@ -24,6 +24,33 @@ class NonWritableFieldError(ValueError):
     """Attempt to business-write a field outside the PG-writable set (PRD §7)."""
 
 
+class GroupingNotYetEstablished(Exception):
+    """R1 disposition A is not a terminal confirmation (PRD §6.1-A; audit B4).
+
+    'A' means: establish + persist the stay grouping (Myungha-confirmed, possibly a
+    single-record stay), THEN rebuild the proposal and rerun same-stay detection. The
+    caller must do that and confirm the rebuilt proposal — not toggle a flag.
+    """
+
+
+class UnresolvedDecision(Exception):
+    """A material human decision (payer/early-check-in/hotel-confirm) is unresolved
+    (PRD §6/§16/§19; audit B6). No executable confirmation until it is resolved."""
+
+
+def require_decision(change, key, kind="policy_decision", detail=""):
+    """Attach an authorization-bearing human decision to ``change`` (§16/§19).
+
+    Distinct from a display-only warning: this carries ``needs_confirmation=True`` and
+    a ``key`` that :func:`confirm` must see resolved before producing an executable
+    proposal, and whose resolved value binds ``operation_ref`` (B6).
+    """
+    change.policy_flags.append(
+        {"kind": kind, "key": key, "needs_confirmation": True, "detail": detail}
+    )
+    return change
+
+
 @dataclass(frozen=True)
 class FieldDelta:
     field: str
@@ -212,15 +239,19 @@ def compute_operation_ref(change: RoomingChange) -> str:
 
 
 def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=None,
-            limited_check_authorized=False) -> RoomingChange:
+            limited_check_authorized=False, decisions=None) -> RoomingChange:
     """Apply human disposition and stamp the binding ``operation_ref`` (§6/§6.1/§15).
 
     * ``grouping_disposition`` is required (A/B/C) iff the R1 gate is set (§6.1).
       "C" cancels; "B" requires ``limited_check_authorized`` and records it into the
-      confirmed proposal; "A" presumes grouping was established upstream.
+      confirmed proposal; **"A" is NOT terminal** — it raises
+      :class:`GroupingNotYetEstablished` so the caller establishes + persists grouping
+      and rebuilds the proposal (§6.1-A, B4).
     * ``impact_dispositions`` maps a detected-impact index → "A"/"B"/"C" (§6). Every
       detected impact needs an explicit disposition; a bare rejection may not
       silently authorize an inconsistency.
+    * ``decisions`` resolves authorization-bearing policy flags (§16/§19, B6); every
+      ``needs_confirmation`` flag must be resolved or confirmation is refused.
     """
     impact_dispositions = impact_dispositions or {}
 
@@ -229,10 +260,16 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
             raise ValueError("date change on unestablished grouping requires disposition A/B/C (§6.1)")
         if grouping_disposition == "C":
             raise Cancelled("grouping disposition C — proposal cancelled (§6.1)")
-        if grouping_disposition == "B" and not limited_check_authorized:
+        if grouping_disposition == "A":
+            raise GroupingNotYetEstablished(
+                "R1 disposition A: establish + persist the stay grouping and REBUILD the "
+                "proposal (rerunning same-stay detection) before confirming — A is not a "
+                "terminal confirmation (§6.1-A)."
+            )
+        if not limited_check_authorized:   # "B"
             raise ValueError("disposition B requires explicit limited-check authorization (§6.1-B)")
-        change.grouping_disposition = grouping_disposition
-        change.limited_check_authorized = bool(limited_check_authorized and grouping_disposition == "B")
+        change.grouping_disposition = "B"
+        change.limited_check_authorized = True
 
     for i, impact in enumerate(change.detected_related_impacts):
         disp = impact_dispositions.get(i)
@@ -253,6 +290,19 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
             change.field_deltas[impact.target_record_id].append(impact.suggested)
             if impact.target_record_id not in record_ids:
                 record_ids.append(impact.target_record_id)
+
+    # (B6) Material human decisions must gate confirmation: every authorization-bearing
+    # flag (needs_confirmation) must be resolved; the resolved values bind the proposal
+    # and its operation_ref. Display-only warnings (needs_confirmation=False) are ignored.
+    decisions = decisions or {}
+    pending = [f for f in change.policy_flags if f.get("needs_confirmation")]
+    missing = [f["key"] for f in pending if not decisions.get(f["key"])]
+    if missing:
+        raise UnresolvedDecision(
+            f"unresolved material human decision(s) {missing!r} must be resolved before "
+            "an executable confirmation (§16/§19)."
+        )
+    change.authorized_decisions = {f["key"]: decisions[f["key"]] for f in pending}
 
     change.confirmed_scope = {
         "record_ids": record_ids,

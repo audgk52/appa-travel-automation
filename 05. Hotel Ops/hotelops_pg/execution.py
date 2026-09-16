@@ -99,6 +99,16 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      f"(PRD §7); writable set {fields.PG_WRITABLE!r}")],
                                detail="forbidden-field write rejected before any write (B1)")
 
+    # (B6) A material human decision left unresolved must never reach a business write.
+    unresolved = [f["key"] for f in change.policy_flags
+                  if f.get("needs_confirmation") and not change.authorized_decisions.get(f["key"])]
+    if unresolved:
+        return ExecutionResult(op, "unresolved_decision",
+                               effects=[EffectResult("authorization", "failed",
+                                                     f"unresolved material decision(s) {unresolved!r} "
+                                                     "(§16/§19)")],
+                               detail="unresolved authorization-bearing decision rejected before any write (B6)")
+
     # Idempotency short-circuit (§15): whole op already verified complete.
     if state.is_executed(op):
         return ExecutionResult(op, "noop_already_done",

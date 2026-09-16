@@ -18,6 +18,7 @@ import os
 import unicodedata
 
 ID_PREFIX = "rl-"
+STAY_PREFIX = "stay-"
 
 # Rows whose NAME normalizes to one of these are structural, never operational.
 _NON_RECORD_TOKENS = frozenset({
@@ -62,3 +63,14 @@ def new_record_id() -> str:
 def looks_like_record_id(value) -> bool:
     """True iff ``value`` is a non-empty ``rooming_record_id`` (has our prefix)."""
     return isinstance(value, str) and value.startswith(ID_PREFIX) and len(value) > len(ID_PREFIX)
+
+
+def new_stay_id() -> str:
+    """Mint a fresh, spreadsheet-safe ``stay_id`` for a human-confirmed grouping (§5).
+
+    Grouping is only ever established after Myungha confirms (§5/BR-5); this just
+    provides the persisted local identifier. Format is implementation-owned.
+    """
+    digest = os.urandom(10)
+    b32 = base64.b32hexencode(digest).decode("ascii").rstrip("=").lower()
+    return STAY_PREFIX + b32
