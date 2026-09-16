@@ -164,14 +164,20 @@ def test_impact_requires_explicit_disposition(make_store):
 
 # --- operation_ref binds ONE EXACT proposal (§15, AC-21) ------------------------
 
-def test_operation_ref_stable_and_disposition_sensitive(make_store):
+def test_operation_ref_is_instance_unique_and_content_sensitive(make_store):
+    from hotelops_pg.change import proposal_digest
     store, _ = _overlap_store(make_store)
     a = confirm(propose(_recs(store), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}}),
                 impact_dispositions={0: "A"})
     b = confirm(propose(_recs(store), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}}),
                 impact_dispositions={0: "A"})
+    # B7-A: two separate human confirmations of identical content are DISTINCT
+    # authorization instances (different operation_ref) but share the content digest.
+    assert a.operation_ref != b.operation_ref
+    assert proposal_digest(a) == proposal_digest(b)
+    # A confirmed ref is stable for the same object (recompute matches — B1 relies on this).
+    assert compute_operation_ref(a) == a.operation_ref
+    # Content is disposition-sensitive.
     c = propose(_recs(store), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}})
-    c.detected_related_impacts[0].disposition = "B"   # a different disposition
-    # Same scope+deltas+disposition → same ref; different disposition → different ref.
-    assert a.operation_ref == b.operation_ref
-    assert compute_operation_ref(c) != a.operation_ref
+    c.detected_related_impacts[0].disposition = "B"
+    assert proposal_digest(c) != proposal_digest(a)

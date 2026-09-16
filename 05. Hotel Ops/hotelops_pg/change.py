@@ -13,6 +13,7 @@ B proceed with disclosed limited-check authorization; C cancel (§6.1).
 """
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
 
 from hotelops_pg import fields
@@ -84,6 +85,7 @@ class RoomingChange:
     grouping_disposition: str = ""                       # "A"|"B"|"C"
     limited_check_authorized: bool = False               # R1-B (§6.1)
     authorized_decisions: dict = field(default_factory=dict)  # resolved §19/§16 decisions (§6/B6)
+    confirmation_id: str = ""                            # unique per human confirmation instance (B7-A)
     confirmed_scope: dict = field(default_factory=dict)  # what the human approved
 
     def changed_records(self):
@@ -213,13 +215,11 @@ def _boundary_impacts(rec, siblings, boundary, old, new) -> list:
     return out
 
 
-def compute_operation_ref(change: RoomingChange) -> str:
-    """Deterministic identity of ONE EXACT confirmed proposal version (§15).
-
-    Binds target ids, per-record field deltas, related-impact dispositions, the
-    grouping disposition, and the limited-check flag. Any change to scope, deltas,
-    or disposition yields a NEW ref — the old approval is no longer authorization.
-    Format is implementation-owned.
+def proposal_digest(change: RoomingChange) -> str:
+    """Content digest of ONE EXACT proposal VERSION (§15): target ids, per-record field
+    deltas, related-impact dispositions, grouping disposition, limited-check flag, and
+    resolved authorization decisions. Any change to scope/deltas/disposition/decision
+    yields a new digest. Display-only warnings (payment_tracker_residual) are excluded.
     """
     payload = {
         "targets": sorted(change.confirmed_scope.get("record_ids", change.target_record_ids)),
@@ -233,13 +233,22 @@ def compute_operation_ref(change: RoomingChange) -> str:
         ),
         "grouping_disposition": change.grouping_disposition,
         "limited_check": change.limited_check_authorized,
-        # Authorization-bearing human decisions (payer/early-check-in/hotel-confirm,
-        # §19/§16) bind the identity; a changed decision is a new authorization (B6).
-        # Display-only warnings (payment_tracker_residual) are deliberately NOT here.
         "decisions": {k: change.authorized_decisions[k] for k in sorted(change.authorized_decisions)},
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return "op-" + hashlib.sha256(blob).hexdigest()[:24]
+    return hashlib.sha256(blob).hexdigest()[:24]
+
+
+def compute_operation_ref(change: RoomingChange) -> str:
+    """Identity of ONE EXACT CONFIRMED proposal INSTANCE (§15; audit B7-A).
+
+    = proposal content digest + the unique confirmation-instance id. A RETRY of the
+    same confirmed object keeps the same ref (same ``confirmation_id``); a NEW human
+    confirmation of identical content mints a new ``confirmation_id`` → a NEW ref, so
+    a historically-completed operation never suppresses a freshly authorized one.
+    Format is implementation-owned.
+    """
+    return "op-" + proposal_digest(change) + "-" + (change.confirmation_id or "0")
 
 
 def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=None,
@@ -315,6 +324,10 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
         ],
     }
     change.target_record_ids = record_ids
+    # Each human confirmation is a distinct authorization instance (B7-A): mint a fresh
+    # confirmation id so re-confirming identical content later is NOT mistaken for a
+    # retry of a historically-completed operation.
+    change.confirmation_id = uuid.uuid4().hex
     change.operation_ref = compute_operation_ref(change)
     return change
 

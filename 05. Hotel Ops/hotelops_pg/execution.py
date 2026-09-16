@@ -116,9 +116,19 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      "operation already verified complete")],
                                detail="idempotent no-op (§15)")
 
+    # (B7-C) Record-global uncertainty: a NEW operation must not run over a record left
+    # uncertain by a DIFFERENT prior operation — reconcile/recover first, no stale replay.
+    blocked = [rid for rid in change.target_record_ids
+               if state.is_record_uncertain(rid) and state.uncertainty_op(rid) != op]
+    if blocked:
+        return ExecutionResult(op, "blocked_uncertain",
+                               effects=[EffectResult("uncertainty", "failed",
+                                                     f"record(s) {blocked!r} have unresolved uncertainty "
+                                                     f"from a prior operation; reconcile before new work")],
+                               detail="blocked by prior unresolved record uncertainty (§14, B7-C)")
+
     # (B2) Integrity gate before ANY business execution (§2/§4): schema → unique
     # required/system headers → duplicate rooming_record_id → permitted adoption.
-    # A weaker read path must never be used to reach the write stage.
     try:
         fresh = store.read_validated().records
     except (fields.SchemaError, DuplicateRecordIdError) as exc:
@@ -135,8 +145,6 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
 
     result = ExecutionResult(op, "complete")
     result.effects.append(EffectResult("revalidation", "verified", rv.reason))
-
-    fresh_by_id = {r.record_id: r for r in fresh}
     verified_records = []
 
     for rid in change.target_record_ids:
@@ -144,15 +152,25 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
         business = [d for d in deltas if d.field != fields.NTF_HISTORY]
         effects = []
 
-        # Per-record idempotency (§15): skip a record already applied for this op.
+        # Per-record idempotency (§15): skip a record already verified done for this op.
         if state.is_record_done(op, rid):
             result.per_record[rid] = {"applied": business,
                                       "effects": [EffectResult("record", "already_done")]}
             verified_records.append(rid)
             continue
 
-        # 1. targeted business writes (+ derived nights) (§7/§16).
+        # (B7-D) Durably persist pre-write recovery intent BEFORE mutating the sheet.
+        # If durable state is unavailable, fail closed: do NOT mutate the business sheet.
         updates = {d.field: d.new for d in business}
+        try:
+            state.begin_record(op, rid, updates)
+        except Exception as exc:  # noqa: BLE001 — durable pre-write state unavailable
+            result.per_record[rid] = {"applied": [],
+                                      "effects": [EffectResult("recovery_state", "failed", str(exc))]}
+            result.overall = "uncertain"
+            continue
+
+        # 1. targeted business writes (+ derived nights) (§7/§16).
         try:
             ok = store.apply_writes(rid, updates)
         except Exception as exc:  # noqa: BLE001 — surface as uncertain, no blind retry
@@ -179,45 +197,65 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                 state.mark_record_uncertain(op, rid, {"reason": "verification_uncertain"})
             continue
 
-        # 3. NTF history append for VERIFIED effects only (§17) — the write must be
-        # VERIFIED (return value + re-read) before it is claimed, and it is idempotent
-        # by content so a retry/restart never duplicates it (audit B7).
+        # 3. NTF history append for VERIFIED effects only (§17). Idempotency is by
+        # OPERATION/EFFECT identity via the durable journal — NOT by text (B7-B), so
+        # two distinct operations with identical text each get their own entry, while a
+        # retry/restart of the SAME operation reconciles against the persisted intent.
         line = history_entry(request_date, business)
         ntf_ok = True
         if line:
             cur = after[rid].get(fields.NTF_HISTORY) or ""
-            if line in cur:
-                # Already present (history written before a crash lost the state):
-                # do not duplicate; treat as verified (§15/§17 idempotent).
+            jn = state.journal(op, rid)
+            intended_prev = jn.get("ntf_intended")
+            if intended_prev is not None and cur == intended_prev:
+                # This op's history already landed on a prior attempt → do not duplicate.
                 effects.append(EffectResult("ntf_append", "already_done", line))
+            elif intended_prev is not None and cur not in (jn.get("ntf_prior", ""), intended_prev):
+                ntf_ok = False
+                effects.append(EffectResult("ntf_append", "uncertain",
+                                            "history cell changed under us since pre-write intent"))
             else:
+                intended = append_history(cur, line)
                 try:
-                    wrote = store.apply_writes(rid, {fields.NTF_HISTORY: append_history(cur, line)})
-                    write_detail = ""
-                except Exception as exc:  # noqa: BLE001
-                    wrote, write_detail = False, f"history write raised: {exc}"
-                post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
-                landed = bool(post and line in (post.get(fields.NTF_HISTORY) or ""))
-                if wrote and landed:
-                    effects.append(EffectResult("ntf_append", "verified", line))
-                else:
+                    state.record_history_intent(op, rid, cur, intended)   # durable BEFORE write
+                except Exception as exc:  # noqa: BLE001 — cannot persist intent → fail closed
                     ntf_ok = False
-                    effects.append(EffectResult(
-                        "ntf_append", "failed",
-                        write_detail or "history write not verified on re-read"))
+                    effects.append(EffectResult("ntf_append", "uncertain", f"cannot persist history intent: {exc}"))
+                else:
+                    try:
+                        wrote = store.apply_writes(rid, {fields.NTF_HISTORY: intended})
+                        write_detail = ""
+                    except Exception as exc:  # noqa: BLE001
+                        wrote, write_detail = False, f"history write raised: {exc}"
+                    post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
+                    landed = bool(post and (post.get(fields.NTF_HISTORY) or "") == intended)
+                    if wrote and landed:
+                        effects.append(EffectResult("ntf_append", "verified", line))
+                    else:
+                        ntf_ok = False
+                        effects.append(EffectResult("ntf_append", "failed",
+                                                    write_detail or "history write not verified on re-read"))
         else:
             effects.append(EffectResult("ntf_append", "skipped"))
 
         if not ntf_ok:
-            # Business landed but its REQUIRED history did not verify: never claim the
-            # record done or the op complete; surface + durably persist as uncertain.
             result.per_record[rid] = {"applied": [], "effects": effects}
             result.overall = "uncertain"
             state.mark_record_uncertain(op, rid, {"reason": "ntf_unverified"})
             continue
 
+        # (B7-D) Business + history verified; durably record completion. A failure HERE
+        # means the sheet mutated but completion is not durable → uncertain (the durable
+        # pre-write intent from begin_record enables restart reconciliation), never complete.
+        try:
+            state.complete_record(op, rid, {"line": line})
+        except Exception as exc:  # noqa: BLE001
+            result.per_record[rid] = {"applied": business,
+                                      "effects": effects + [EffectResult("durable_complete", "uncertain", str(exc))]}
+            result.overall = "uncertain"
+            continue
+
         result.per_record[rid] = {"applied": business, "effects": effects}
-        state.mark_record_done(op, rid, {"line": line})
         verified_records.append(rid)
 
     # Overall status + drafts from VERIFIED effects only (§18/§19).

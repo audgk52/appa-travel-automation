@@ -23,10 +23,19 @@ class StateStore:
         self._data = {
             "baseline": None,               # {"values": {record_id: {field: value}}}
             "baseline_authority": AUTHORITY_ACTIVE,
-            "executed_ops": {},             # operation_ref -> summary
+            "executed_ops": {},             # operation_ref -> {"records": {...}, "complete": bool}
+            "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
         }
         if self.path and self.path.exists():
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
+        self._data.setdefault("uncertain_records", {})
+
+    @property
+    def durable(self) -> bool:
+        """True iff this state is backed by durable storage (B8). In-memory state is
+        allowed in unit tests but rejected by operational flows that require restart
+        persistence."""
+        return self.path is not None
 
     # --- persistence ---------------------------------------------------------
     def _flush(self):
@@ -85,11 +94,17 @@ class StateStore:
         self._data["baseline_authority"] = AUTHORITY_UNCERTAIN
         self._flush()
 
-    # --- idempotency (§15) ---------------------------------------------------
-    # executed_ops[op_ref] = {"records": {record_id: {"status": "done"|"uncertain",
-    #                                                  "summary": {...}}}, "complete": bool}
+    # --- idempotency + durable effect journal (§15; audit B7) ----------------
+    # executed_ops[op]["records"][rid] = {
+    #   "status": "pending"|"done"|"uncertain",
+    #   "business_intended": {field: value},        # durable pre-write intent (B7-D)
+    #   "ntf_prior": str, "ntf_intended": str,      # NTF reconciliation state (B7-B)
+    #   "summary"/"reason": ...}
     def _op(self, operation_ref):
         return self._data["executed_ops"].setdefault(operation_ref, {"records": {}, "complete": False})
+
+    def _rec(self, operation_ref, record_id):
+        return self._op(operation_ref)["records"].setdefault(record_id, {"status": ""})
 
     def is_executed(self, operation_ref: str) -> bool:
         """True iff the whole confirmed operation was verified complete (§15)."""
@@ -97,26 +112,68 @@ class StateStore:
         return bool(op and op.get("complete"))
 
     def record_status(self, operation_ref: str, record_id: str):
-        """"done" | "uncertain" | None for a record under this op (audit B7)."""
+        """"pending" | "done" | "uncertain" | None for a record under this op."""
         op = self._data["executed_ops"].get(operation_ref)
         rec = op.get("records", {}).get(record_id) if op else None
         return rec.get("status") if rec else None
 
-    def is_record_done(self, operation_ref: str, record_id: str) -> bool:
-        """True iff this record's VERIFIED effect was already applied for this op (§15).
+    def journal(self, operation_ref: str, record_id: str) -> dict:
+        """The durable per-record effect journal (empty dict if none)."""
+        op = self._data["executed_ops"].get(operation_ref)
+        return dict(op.get("records", {}).get(record_id, {})) if op else {}
 
-        An 'uncertain' record is NOT done: a later operation must not assume success.
-        """
+    def is_record_done(self, operation_ref: str, record_id: str) -> bool:
+        """True iff this record's VERIFIED effect was already applied for this op (§15)."""
         return self.record_status(operation_ref, record_id) == "done"
 
-    def mark_record_done(self, operation_ref: str, record_id: str, summary=None):
-        self._op(operation_ref)["records"][record_id] = {"status": "done", "summary": summary or {}}
+    def begin_record(self, operation_ref: str, record_id: str, business_intended: dict):
+        """Durably persist pre-write intent BEFORE the business sheet is mutated (B7-D).
+
+        If this raises (durable state unavailable), the caller must NOT mutate the sheet.
+        """
+        rec = self._rec(operation_ref, record_id)
+        rec["status"] = "pending"
+        rec["business_intended"] = dict(business_intended)
+        self._flush()
+
+    def record_history_intent(self, operation_ref: str, record_id: str, prior: str, intended: str):
+        """Durably persist the intended NTF cell content before writing it (B7-B/-D)."""
+        rec = self._rec(operation_ref, record_id)
+        rec["ntf_prior"] = prior
+        rec["ntf_intended"] = intended
+        self._flush()
+
+    def complete_record(self, operation_ref: str, record_id: str, summary=None):
+        rec = self._rec(operation_ref, record_id)
+        rec["status"] = "done"
+        rec["summary"] = summary or {}
+        self._data["uncertain_records"].pop(record_id, None)   # resolved for this record
         self._flush()
 
     def mark_record_uncertain(self, operation_ref: str, record_id: str, summary=None):
-        """Durably record that a record's effect is uncertain (audit B7): future
-        operations touching it must not assume the prior operation succeeded."""
-        self._op(operation_ref)["records"][record_id] = {"status": "uncertain", "summary": summary or {}}
+        """Durably record a record's effect as uncertain — both under the op and in the
+        record-GLOBAL uncertainty index, so a LATER operation targeting the same record
+        cannot assume prior success (audit B7-C)."""
+        rec = self._rec(operation_ref, record_id)
+        rec["status"] = "uncertain"
+        rec["reason"] = summary or {}
+        self._data["uncertain_records"][record_id] = {"op": operation_ref, "reason": summary or {}}
+        self._flush()
+
+    # --- record-global uncertainty (B7-C) ------------------------------------
+    def is_record_uncertain(self, record_id: str) -> bool:
+        return record_id in self._data["uncertain_records"]
+
+    def uncertainty_op(self, record_id: str):
+        entry = self._data["uncertain_records"].get(record_id)
+        return entry.get("op") if entry else None
+
+    def clear_uncertainty(self, record_id: str):
+        """Explicit safe path to clear a record's uncertainty after reconciliation.
+
+        Never call this merely because current values equal a prior intended value.
+        """
+        self._data["uncertain_records"].pop(record_id, None)
         self._flush()
 
     def mark_complete(self, operation_ref: str):
