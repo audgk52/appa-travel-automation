@@ -28,6 +28,7 @@ from hotelops_pg.change import (
 )
 from hotelops_pg.execution import execute
 from hotelops_pg.matching import resolve_target
+from hotelops_pg.policy_decisions import evaluate as _evaluate_decisions
 
 
 class QuickOpsParseError(ValueError):
@@ -158,6 +159,9 @@ def preview_quick_ops(store, instruction) -> Preview:
         return Preview("needs_target_selection", candidates=match.candidates,
                        detail=f"multiple records match {op.name!r}; human selects (§23)")
     change = propose(records, {match.record_id: {op.field: op.new_value}})
+    # Path B carries no arrival context and its payment is human-supplied, so only
+    # context-genuine decisions (currently none for Quick Ops) are surfaced (B6/B11-C).
+    change.policy_flags.extend(_evaluate_decisions(change, path="B"))
     return _preview_from_change(change)
 
 
@@ -171,6 +175,10 @@ def preview_path_a(store, itinerary_fact) -> Preview:
     fact = dict(itinerary_fact)
     name = fact.pop("traveler", None)
     payment = fact.pop("payment", None)
+    # Arrival is CONTEXT for the early-check-in decision, not a rooming edit. Flight/
+    # airport arrival is never treated as hotel arrival (§16).
+    hotel_arrival = fact.pop("hotel_arrival", None)
+    flight_arrival = fact.pop("flight_arrival", None)
     if not name:
         raise ValueError("itinerary fact requires a 'traveler'")
     edits = {k: v for k, v in fact.items() if k in fields.PG_WRITABLE}
@@ -189,6 +197,9 @@ def preview_path_a(store, itinerary_fact) -> Preview:
         return Preview("needs_target_selection", candidates=match.candidates,
                        detail=f"multiple records match {name!r}; human selects (§23)")
     change = propose(records, {match.record_id: edits})
+    arrival = hotel_arrival or flight_arrival
+    change.policy_flags.extend(_evaluate_decisions(
+        change, arrival=arrival, arrival_kind="hotel" if hotel_arrival else "flight", path="A"))
     return _preview_from_change(change)
 
 
