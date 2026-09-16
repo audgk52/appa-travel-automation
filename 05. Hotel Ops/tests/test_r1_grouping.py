@@ -28,8 +28,9 @@ def test_r1_a_full_transition_from_blank_stay_id(make_store):
         confirm(first, grouping_disposition="A")
 
     # 2. human confirms the two segments as one stay → persisted.
-    stay = establish_grouping(store, ["rl-prod", "rl-pers"])
-    assert stay.startswith(STAY_PREFIX)
+    grouped = establish_grouping(store, ["rl-prod", "rl-pers"])
+    assert grouped.established and grouped.stay_id.startswith(STAY_PREFIX)
+    stay = grouped.stay_id
     persisted = {r.record_id: r.stay_id for r in store.snapshot_records()}
     assert persisted["rl-prod"] == stay and persisted["rl-pers"] == stay
 
