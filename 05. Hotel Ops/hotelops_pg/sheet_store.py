@@ -18,6 +18,10 @@ from hotelops_pg import fields
 from hotelops_pg.adoption import plan_adoption
 from hotelops_pg.records import read_records
 
+# Fields written with Sheets USER_ENTERED so date/number semantics are preserved
+# (audit B10); all other managed fields are written RAW to keep text literal.
+_USER_ENTERED_FIELDS = (fields.CHECK_IN, fields.CHECK_OUT, fields.NIGHTS)
+
 
 class InMemoryBackend:
     """A list-of-rows grid (row 0 = header). Targeted, neighbour-preserving writes."""
@@ -158,11 +162,19 @@ class GoogleBackend:
         return [list(r) for r in (resp.get("values") or [])]
 
     def write_cells(self, row_index, updates: dict):
+        # Type-aware writes (audit B10): booked dates and the derived nights are
+        # written USER_ENTERED so Sheets keeps real date / numeric semantics; every
+        # other field is written RAW so text stays literal text (a Remark or room
+        # number is never reinterpreted as a formula/number). PG only writes its own
+        # targeted business cells, so neighbouring formulas/human fields are untouched.
+        header = self.read_grid()[0] if self.read_grid() else []
         for col_index, value in updates.items():
+            field_name = header[col_index] if col_index < len(header) else ""
+            option = "USER_ENTERED" if field_name in _USER_ENTERED_FIELDS else "RAW"
             a1 = f"{self.tab}!{self._a1_col(col_index)}{row_index + 1}"
             self._values().update(
                 spreadsheetId=self.spreadsheet_id, range=a1,
-                valueInputOption="RAW", body={"values": [[str(value)]]},
+                valueInputOption=option, body={"values": [[str(value)]]},
             ).execute()
 
     def append_header_columns(self, names):

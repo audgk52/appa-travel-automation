@@ -37,12 +37,22 @@ _TWELVE = time(12, 0)
 _REF = date(2000, 1, 1)  # neutral base date for midnight-rollover math
 
 
-def parse_date(value):
-    """Parse a booked date to :class:`datetime.date` (ISO or M/D[/YYYY])."""
+class AmbiguousYearError(ValueError):
+    """A yearless date range is ambiguous / may cross a year boundary (audit S2).
+
+    PG refuses to SILENTLY infer a year policy (e.g. 12/31 → 01/02) because the rule
+    (relative-rollover vs require-year) is a pending Product Owner decision. Provide
+    explicit year-bearing dates until that decision is made.
+    """
+
+
+def _parse_with_meta(value):
+    """Return (date, yearless_inferred). ``yearless_inferred`` marks an ``M/D`` input
+    whose year we filled in — that fill-in is only safe within one calendar year."""
     if isinstance(value, datetime):
-        return value.date()
+        return value.date(), False
     if isinstance(value, date):
-        return value
+        return value, False
     s = str(value).strip()
     if not s:
         raise ValueError("empty date")
@@ -50,18 +60,34 @@ def parse_date(value):
         try:
             d = datetime.strptime(s, fmt).date()
             if fmt == "%m/%d":
-                d = d.replace(year=date.today().year)
-            return d
+                return d.replace(year=date.today().year), True
+            return d, False
         except ValueError:
             continue
     raise ValueError(f"unrecognized date: {value!r}")
 
 
+def parse_date(value):
+    """Parse a booked date to :class:`datetime.date` (ISO or M/D[/YYYY])."""
+    return _parse_with_meta(value)[0]
+
+
 def total_nights(check_in, check_out) -> int:
-    """Whole booked nights (≥1). Rejects checkout ≤ checkin (§16/AC on invalid dates)."""
-    ci, co = parse_date(check_in), parse_date(check_out)
+    """Whole booked nights (≥1). Rejects checkout ≤ checkin (§16/AC on invalid dates).
+
+    A non-positive span computed from a YEARLESS input is treated as ambiguous
+    (possible year rollover) and raises :class:`AmbiguousYearError` rather than
+    guessing a year — never a silent wrong/negative night count (audit S2).
+    """
+    ci, ci_yearless = _parse_with_meta(check_in)
+    co, co_yearless = _parse_with_meta(check_out)
     nights = (co - ci).days
     if nights < 1:
+        if ci_yearless or co_yearless:
+            raise AmbiguousYearError(
+                f"yearless date range {check_in!r}→{check_out!r} is ambiguous (may cross a "
+                "year boundary, e.g. 12/31→01/02); supply explicit year-bearing dates (S2)."
+            )
         raise ValueError(f"check-out {co} must be at least one night after check-in {ci}")
     return nights
 
