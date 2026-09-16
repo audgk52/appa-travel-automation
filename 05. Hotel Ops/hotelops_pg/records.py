@@ -31,6 +31,21 @@ class RoomingRecord:
         return {h: self.values.get(h, "") for h in fields.YELLOW_COMPARISON}
 
 
+def is_eligible_record(values) -> bool:
+    """Adoptable operational record test (PRD §2; PO-1 Option B, structural rule).
+
+    A row qualifies only if its ``NAME`` is a nonblank traveler/operational
+    placeholder AND at least one OTHER managed operational value is present. A row
+    with a populated ``NAME`` but every other managed field blank is treated as a
+    structural / heading row (e.g. ``MAIN CAST``, ``ROOMING LIST``) and is NOT
+    eligible. No heading-name denylist and no further special-casing (per PO-1).
+    """
+    if not is_eligible_name(values.get(fields.NAME)):
+        return False
+    return any(str(values.get(h, "")).strip()
+               for h in fields.REQUIRED_BUSINESS_HEADERS if h != fields.NAME)
+
+
 def _cell(row, idx) -> str:
     return str(row[idx]) if idx is not None and idx < len(row) else ""
 
@@ -52,6 +67,6 @@ def read_records(grid, headers: dict) -> list:
             record_id=rid.strip(),
             stay_id=sid.strip(),
             values=values,
-            eligible=is_eligible_name(values.get(fields.NAME)),
+            eligible=is_eligible_record(values),
         ))
     return out
