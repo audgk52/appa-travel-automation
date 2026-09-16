@@ -116,7 +116,9 @@ def reset(read, state, persist=None, render=None) -> ResetResult:
     except Exception as exc:  # noqa: BLE001 — any persist failure is pre-activation
         return ResetResult("failed_before_activation", "previous",
                            detail=f"persist failed before activation: {exc}")
-    # Verify the new baseline is durably active (re-read authority/values).
+    # Verify DURABLE activation by reloading from storage (not merely inspecting the
+    # already-mutated in-memory copy) — proves the new baseline is really persisted (B8).
+    state.reload()
     if not state.has_baseline or state.get_baseline() != candidate:
         state.mark_uncertain()
         return ResetResult("uncertain", "indeterminate",

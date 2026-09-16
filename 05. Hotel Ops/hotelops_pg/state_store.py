@@ -10,6 +10,7 @@ Ownership/persistence semantics are architecture; the storage mechanism (here a
 JSON file, or pure in-memory when ``path`` is None) is implementation-owned (§9/§15).
 """
 import json
+import os
 from pathlib import Path
 
 AUTHORITY_ACTIVE = "active"
@@ -29,9 +30,17 @@ class StateStore:
 
     # --- persistence ---------------------------------------------------------
     def _flush(self):
-        if self.path:
-            self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+        """Durably persist via atomic temp-write + replace (crash-safe, R3/B8).
+
+        A failed write (e.g. unwritable directory) raises BEFORE the live file is
+        touched, so callers can roll back in-memory state and the on-disk copy is
+        never left half-written.
+        """
+        if not self.path:
+            return
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self.path)
 
     def reload(self):
         """Re-read from disk (used to prove idempotency survives a restart)."""
@@ -53,10 +62,23 @@ class StateStore:
         return dict(b["values"]) if b else {}
 
     def persist_baseline(self, values: dict):
-        """Persist + ACTIVATE a new baseline (steps 2–4 of §9). Verified by re-read."""
+        """Persist + ACTIVATE a new baseline (steps 2–4 of §9), durable-first (B8).
+
+        The new baseline becomes authoritative only if it is durably written. If the
+        durable write fails, the previous baseline/authority is ROLLED BACK in memory
+        so an in-memory mutation can never make a new baseline active before it is
+        durable — the caller sees the failure and treats it as pre-activation (R3-A).
+        """
+        prev_baseline = self._data["baseline"]
+        prev_authority = self._data["baseline_authority"]
         self._data["baseline"] = {"values": {rid: dict(v) for rid, v in values.items()}}
         self._data["baseline_authority"] = AUTHORITY_ACTIVE
-        self._flush()
+        try:
+            self._flush()
+        except Exception:
+            self._data["baseline"] = prev_baseline           # not durable → not authoritative
+            self._data["baseline_authority"] = prev_authority
+            raise
 
     def mark_uncertain(self):
         """R3-C: authority indeterminate → block further yellow ops until re-verified."""
