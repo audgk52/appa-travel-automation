@@ -25,10 +25,12 @@ class StateStore:
             "baseline_authority": AUTHORITY_ACTIVE,
             "executed_ops": {},             # operation_ref -> {"records": {...}, "complete": bool}
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
+            "grouping_uncertain": {},       # record_id -> {"stay_id":..., "reason":...} (B4)
         }
         if self.path and self.path.exists():
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
+        self._data.setdefault("grouping_uncertain", {})
 
     @property
     def durable(self) -> bool:
@@ -36,6 +38,25 @@ class StateStore:
         allowed in unit tests but rejected by operational flows that require restart
         persistence."""
         return self.path is not None
+
+    def persistence_ready(self) -> bool:
+        """True iff the configured durable target is actually usable RIGHT NOW (B8).
+
+        ``durable`` only says a path is configured; a path whose parent is missing or
+        unwritable would still report durable until the first flush fails mid-write.
+        This validates/creates the parent directory (PG owns its runtime-state path,
+        §0) and checks it is writable — a safe, NON-destructive readiness probe (no
+        trial write to the live state file). Lets the operational flow detect an
+        unusable persistence target BEFORE human confirmation / business mutation.
+        """
+        if not self.path:
+            return False
+        parent = self.path.parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        return os.access(parent, os.W_OK)
 
     # --- persistence ---------------------------------------------------------
     def _flush(self):
@@ -160,7 +181,11 @@ class StateStore:
         self._data["uncertain_records"][record_id] = {"op": operation_ref, "reason": summary or {}}
         self._flush()
 
-    # --- record-global uncertainty (B7-C) ------------------------------------
+    # --- record-global unresolved state (B7-C) -------------------------------
+    # ANY durable journal entry left "pending" or "uncertain" by a prior operation is
+    # record-global unresolved state — not just the ones mirrored in uncertain_records.
+    _UNRESOLVED_STATUSES = ("pending", "uncertain")
+
     def is_record_uncertain(self, record_id: str) -> bool:
         return record_id in self._data["uncertain_records"]
 
@@ -168,12 +193,57 @@ class StateStore:
         entry = self._data["uncertain_records"].get(record_id)
         return entry.get("op") if entry else None
 
-    def clear_uncertainty(self, record_id: str):
-        """Explicit safe path to clear a record's uncertainty after reconciliation.
+    def blocking_op(self, record_id: str, current_op=None):
+        """operation_ref of a DIFFERENT operation that left ``record_id`` in an
+        unresolved (pending/uncertain) durable journal state, else None (audit B7-C).
 
-        Never call this merely because current values equal a prior intended value.
+        Derived from the AUTHORITATIVE journal (not only the uncertain_records index),
+        so a `pending` record — business/NTF landed but completion never persisted —
+        also blocks unrelated new work, and the block survives reload. A retry of the
+        SAME operation (``current_op``) is not self-blocked; it recovers via execute.
+        """
+        for op_ref, op in self._data["executed_ops"].items():
+            if op_ref == current_op:
+                continue
+            rec = op.get("records", {}).get(record_id)
+            if rec and rec.get("status") in self._UNRESOLVED_STATUSES:
+                return op_ref
+        return None
+
+    def clear_uncertainty(self, record_id: str):
+        """Explicit safe path to clear a record's unresolved state after reconciliation.
+
+        Resolves BOTH the uncertain_records index AND any unresolved (pending/uncertain)
+        journal entries for this record, so the journal-derived record-global block
+        (B7-C) is genuinely lifted. Never call this merely because current values equal a
+        prior intended value.
         """
         self._data["uncertain_records"].pop(record_id, None)
+        for op in self._data["executed_ops"].values():
+            rec = op.get("records", {}).get(record_id)
+            if rec and rec.get("status") in self._UNRESOLVED_STATUSES:
+                rec["status"] = "resolved"
+        self._flush()
+
+    # --- durable grouping uncertainty (B4) -----------------------------------
+    # A partial/uncertain grouping operation leaves each intended member here, so a
+    # later operational read cannot treat a leftover stay_id as authoritative
+    # established grouping. Survives reload; cleared only by explicit reconciliation.
+    def mark_grouping_uncertain(self, record_ids, stay_id, reason=None):
+        for rid in record_ids:
+            self._data["grouping_uncertain"][rid] = {"stay_id": stay_id, "reason": reason or {}}
+        self._flush()
+
+    def is_grouping_uncertain(self, record_id: str) -> bool:
+        return record_id in self._data["grouping_uncertain"]
+
+    def grouping_uncertainty(self, record_id: str):
+        return self._data["grouping_uncertain"].get(record_id)
+
+    def resolve_grouping(self, record_ids):
+        """Clear grouping uncertainty for members after explicit reconciliation (B4)."""
+        for rid in record_ids:
+            self._data["grouping_uncertain"].pop(rid, None)
         self._flush()
 
     def mark_complete(self, operation_ref: str):

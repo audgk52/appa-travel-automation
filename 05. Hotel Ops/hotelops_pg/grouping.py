@@ -34,13 +34,20 @@ class GroupingResult:
         return self.status == "established"
 
 
-def establish_grouping(store, member_record_ids, stay_id=None) -> GroupingResult:
+def establish_grouping(store, member_record_ids, stay_id=None, state=None) -> GroupingResult:
     """Persist a Myungha-confirmed grouping over ``member_record_ids`` (§5).
 
     Pre-validates every member (exists exactly once via the validated read + eligible)
     before any write; on any invalid member raises :class:`GroupingMemberError` with
     zero writes. A write failure partway through returns a partial/uncertain result —
     the caller must NOT proceed as if grouping were established.
+
+    When a durable ``state`` is supplied (the operational path, B4), the affected
+    members are DURABLY marked grouping-uncertain BEFORE any write, so a crash mid-write
+    still leaves recoverable evidence and a leftover stay_id can never masquerade as
+    established grouping. The mark is cleared ONLY when every write lands AND a fresh
+    read verifies each member actually carries ``stay_id`` — otherwise the uncertainty
+    persists (no blind rollback) until explicit reconciliation.
     """
     if not member_record_ids:
         raise ValueError("a grouping needs at least one confirmed member record (§5)")
@@ -64,6 +71,13 @@ def establish_grouping(store, member_record_ids, stay_id=None) -> GroupingResult
         )
 
     stay_id = stay_id or new_stay_id()
+
+    # (B4) Pessimistically persist grouping uncertainty for EVERY intended member before
+    # the first write. If the process dies mid-write, the durable mark already blocks any
+    # later read from trusting a leftover stay_id.
+    if state is not None:
+        state.mark_grouping_uncertain(members, stay_id, {"phase": "establishing"})
+
     written = []
     for rid in members:
         try:
@@ -78,4 +92,16 @@ def establish_grouping(store, member_record_ids, stay_id=None) -> GroupingResult
                                   detail=f"{rid!r} not found during write; grouping NOT established")
         written.append(rid)
 
+    # (B4) Verify against a fresh read that every member actually carries the stay_id
+    # (a store may return ok yet not persist). Only then is the grouping established and
+    # the durable uncertainty resolved.
+    fresh = {r.record_id: r for r in store.snapshot_records() if r.record_id}
+    unverified = [rid for rid in members if (fresh.get(rid).stay_id if fresh.get(rid) else "") != stay_id]
+    if unverified:
+        return GroupingResult("uncertain", stay_id, members, written,
+                              detail=f"members {unverified!r} did not verify as grouped on re-read; "
+                                     "grouping NOT established — reconcile before executing")
+
+    if state is not None:
+        state.resolve_grouping(members)                  # explicit, verified resolution
     return GroupingResult("established", stay_id, members, written)

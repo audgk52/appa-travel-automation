@@ -29,9 +29,29 @@ class RevalidationResult:
     moved_only: bool = False
 
 
-def revalidate(change, fresh_records) -> RevalidationResult:
-    """Re-resolve a confirmed change against a fresh read (§10)."""
+def _op_intended(state, op, rid, field, new) -> bool:
+    """True iff durable journal evidence shows THIS operation already intended to write
+    ``field``=``new`` on ``rid`` (audit B5). Only such same-operation evidence lets a
+    retry/recovery accept an observed SUGGESTED-NEW value; an ordinary pre-write with no
+    evidence must treat an observed NEW as an indistinguishable external edit."""
+    if not state or not op:
+        return False
+    intended = state.journal(op, rid).get("business_intended") or {}
+    return field in intended and str(intended[field]) == str(new)
+
+
+def revalidate(change, fresh_records, state=None) -> RevalidationResult:
+    """Re-resolve a confirmed change against a fresh read (§10).
+
+    ``state`` (optional) supplies the durable per-record effect journal. During an
+    ordinary pre-write revalidation (no journal evidence this operation attempted a
+    given effect) the observed value must equal the captured OLD/base; observing the
+    SUGGESTED NEW value is treated as a material (possibly external) change and
+    invalidates (audit B5). Only a retry/recovery with same-operation durable evidence
+    may accept the observed NEW.
+    """
     by_id = {r.record_id: r for r in fresh_records if r.record_id}
+    op = change.operation_ref
     moved = False
 
     for rid in change.target_record_ids:
@@ -65,7 +85,11 @@ def revalidate(change, fresh_records) -> RevalidationResult:
 
         # The base each delta was computed from must be unchanged (else a newer
         # human edit is present → material). current == old (base) or already == new
-        # (idempotent) is fine; anything else invalidates (§10, R2 §11).
+        # (idempotent) is fine; anything else invalidates (§10, R2 §11). For the PRIMARY
+        # TARGET this tolerance of an already-NEW value is DELIBERATE (AC-22): idempotency
+        # is keyed by operation_ref, so a human pre-applying the target value must not
+        # stop PG acting+recording. The B5 strictness applies to the RELATED sibling
+        # boundary below (never written under B; retry-only under A), not here.
         for d in change.field_deltas.get(rid, []):
             cur = rec.get(d.field)
             if cur not in (str(d.old), str(d.new)):
@@ -120,8 +144,17 @@ def revalidate(change, fresh_records) -> RevalidationResult:
                 f"({impact.target_stay_id or '∅'!r}→{sib.stay_id or '∅'!r})",
                 "material",
             )
+        # The related boundary must still equal the captured OLD. Equality with the
+        # SUGGESTED NEW does NOT prove this operation applied it — under disposition B
+        # the sibling is never written, and under A only a same-operation retry (durable
+        # evidence) may accept the observed NEW; otherwise it is an external edit that
+        # invalidates the approved scope/exception (audit B5).
         cur = sib.get(impact.suggested.field)
-        if cur not in (str(impact.suggested.old), str(impact.suggested.new)):
+        if cur != str(impact.suggested.old) and not (
+            cur == str(impact.suggested.new)
+            and _op_intended(state, op, impact.target_record_id,
+                             impact.suggested.field, impact.suggested.new)
+        ):
             return RevalidationResult(
                 False,
                 f"related record {impact.target_record_id!r}.{impact.suggested.field} "

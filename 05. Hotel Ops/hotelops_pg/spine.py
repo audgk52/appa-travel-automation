@@ -53,6 +53,14 @@ def _require_durable(state, flow):
             f"operational {flow} requires a durable (path-backed) state store; in-memory "
             "state is for unit tests only (§0/§9/§15, B8)."
         )
+    # B8: a configured path is not enough — the target must be usable NOW, or the flow
+    # would only discover it mid-write. Detect it before any confirmation / mutation.
+    if hasattr(state, "persistence_ready") and not state.persistence_ready():
+        raise NonDurableStateError(
+            f"operational {flow} has a configured durable path that is not currently "
+            "usable (missing/unwritable parent); refusing before confirmation or any "
+            "business mutation (§0/§9/§15, B8)."
+        )
 
 
 # Payment vocabulary is PRD-enumerated (§20). Recognizing a trailing payment token
@@ -135,10 +143,15 @@ class Preview:
     detail: str = ""
 
     # status ∈ {ready, no_match, needs_target_selection, needs_grouping,
-    #           needs_disposition, needs_decision, integrity_failed, parse_error}
+    #           needs_reconciliation, needs_disposition, needs_decision,
+    #           integrity_failed, parse_error}
 
 
 def _preview_from_change(change):
+    if change.requires_grouping_reconciliation:
+        return Preview("needs_reconciliation", change=change,
+                       detail="member(s) have unresolved grouping uncertainty from a partial "
+                              "grouping op; reconcile before proceeding (§5/§6.1, B4)")
     if change.requires_grouping_disposition:
         return Preview("needs_grouping", change=change,
                        detail="date change on unestablished grouping needs R1 disposition A/B/C (§6.1)")
@@ -162,8 +175,12 @@ def _validated(store):
         return None, Preview("integrity_failed", detail=str(exc))
 
 
-def preview_quick_ops(store, instruction) -> Preview:
-    """Path B — parse a Quick Ops instruction into a gated Preview (§23)."""
+def preview_quick_ops(store, instruction, state=None) -> Preview:
+    """Path B — parse a Quick Ops instruction into a gated Preview (§23).
+
+    ``state`` (optional) supplies durable grouping uncertainty so a target left
+    grouping-uncertain by a partial grouping op surfaces ``needs_reconciliation`` (B4).
+    """
     op = parse_quick_ops(instruction)             # raises on unsupported/ambiguous
     records, err = _validated(store)
     if err:
@@ -175,19 +192,20 @@ def preview_quick_ops(store, instruction) -> Preview:
     if match.status == "many":
         return Preview("needs_target_selection", candidates=match.candidates,
                        detail=f"multiple records match {op.name!r}; human selects (§23)")
-    change = propose(records, {match.record_id: {op.field: op.new_value}})
+    change = propose(records, {match.record_id: {op.field: op.new_value}}, state=state)
     # Path B carries no arrival context and its payment is human-supplied, so only
     # context-genuine decisions (currently none for Quick Ops) are surfaced (B6/B11-C).
     change.policy_flags.extend(_evaluate_decisions(change, path="B"))
     return _preview_from_change(change)
 
 
-def preview_path_a(store, itinerary_fact) -> Preview:
+def preview_path_a(store, itinerary_fact, state=None) -> Preview:
     """Path A — narrow structured itinerary reconciliation (§23).
 
     ``itinerary_fact`` = {"traveler", optional "payment", and one of the writable
     fields → value}. A non-trivial or zero match is surfaced (propose/ask); PG never
-    invents a booking decision and never creates a row/stay.
+    invents a booking decision and never creates a row/stay. ``state`` (optional)
+    supplies durable grouping uncertainty for the ``needs_reconciliation`` gate (B4).
     """
     fact = dict(itinerary_fact)
     name = fact.pop("traveler", None)
@@ -213,11 +231,47 @@ def preview_path_a(store, itinerary_fact) -> Preview:
     if match.status == "many":
         return Preview("needs_target_selection", candidates=match.candidates,
                        detail=f"multiple records match {name!r}; human selects (§23)")
-    change = propose(records, {match.record_id: edits})
+    change = propose(records, {match.record_id: edits}, state=state)
     arrival = hotel_arrival or flight_arrival
     change.policy_flags.extend(_evaluate_decisions(
         change, arrival=arrival, arrival_kind="hotel" if hotel_arrival else "flight", path="A"))
     return _preview_from_change(change)
+
+
+def confirm_preview(preview, *, grouping_disposition="", impact_dispositions=None,
+                    limited_check_authorized=False, decisions=None):
+    """Produce ONE confirmed operation artifact from a gated Preview (§23; audit B7-A).
+
+    This is the EXPLICIT human-authorization step, separate from execution: it enforces
+    the R1 / impact / decision gates and stamps a stable confirmation identity +
+    ``operation_ref``. It is idempotent on an already-confirmed change (an operational
+    retry keeps the SAME artifact — it does not re-authorize); a genuinely new human
+    confirmation must start from a fresh preview. Raises the same Cancelled /
+    GroupingNotYetEstablished / UnresolvedDecision signals as :func:`confirm`.
+    """
+    if preview.change is None:
+        raise ValueError(f"preview status {preview.status!r} has no committable change; "
+                         "resolve it first (target selection / grouping / handoff).")
+    return confirm(
+        preview.change,
+        grouping_disposition=grouping_disposition,
+        impact_dispositions=impact_dispositions,
+        limited_check_authorized=limited_check_authorized,
+        decisions=decisions,
+    )
+
+
+def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_confirmed=False):
+    """Execute (or safely retry/recover) ONE already-confirmed operation artifact (B7-A).
+
+    Requires durable state (B8). Re-runnable by contract: a retry of the SAME confirmed
+    artifact reconciles against the durable journal via ``execute`` and never
+    re-authorizes, re-applies, or duplicates history (§15). This is the operational
+    EXECUTE step, deliberately distinct from :func:`confirm_preview`.
+    """
+    _require_durable(state, "commit")                    # B8: fail before any mutation
+    return execute(confirmed, store, state, request_date=request_date,
+                   hotel_confirmed=hotel_confirmed)
 
 
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,
@@ -225,24 +279,21 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
            hotel_confirmed=False):
     """Confirm → revalidate → execute → verify → NTF → drafts (§23).
 
-    Only a ``ready``/gated Preview with a built change can be committed; confirm()
-    enforces the R1 / impact / decision gates, and execute() re-runs the integrity +
-    dependency-aware revalidation. Raises the same Cancelled / GroupingNotYetEstablished
-    / UnresolvedDecision signals as confirm() so a gate cannot be silently skipped.
+    Convenience over :func:`confirm_preview` + :func:`execute_confirmed`. Committing the
+    SAME preview twice is idempotent (B7-A): the second call re-confirms the already-
+    confirmed artifact (a no-op that keeps its identity) and execution short-circuits as
+    an idempotent no-op — it does NOT mint a second authorization or duplicate history.
     """
-    _require_durable(state, "commit")                    # B8: fail before any mutation
-    if preview.change is None:
-        raise ValueError(f"preview status {preview.status!r} has no committable change; "
-                         "resolve it first (target selection / grouping / handoff).")
-    confirmed = confirm(
-        preview.change,
+    _require_durable(state, "commit")                    # B8: fail before any confirmation
+    confirmed = confirm_preview(
+        preview,
         grouping_disposition=grouping_disposition,
         impact_dispositions=impact_dispositions,
         limited_check_authorized=limited_check_authorized,
         decisions=decisions,
     )
-    return execute(confirmed, store, state, request_date=request_date,
-                   hotel_confirmed=hotel_confirmed)
+    return execute_confirmed(store, state, confirmed, request_date=request_date,
+                             hotel_confirmed=hotel_confirmed)
 
 
 def yellow_refresh(store, state):

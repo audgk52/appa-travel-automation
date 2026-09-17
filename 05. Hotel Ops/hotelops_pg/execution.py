@@ -72,6 +72,22 @@ def _verify_record(fresh_by_id, rid, business_deltas):
     return "verified", "intended write landed (does not prove no intervening edit was lost)"
 
 
+def _mark_uncertain_safe(state, op, rid, reason, effects):
+    """Record a per-record effect as uncertain, catching a persistence failure (B7-D).
+
+    A failure to persist the uncertainty transition must NOT escape as a raw exception.
+    The pre-write ``begin_record`` intent is already durable, so the record stays
+    ``pending`` in the journal and B7-C keeps it blocked to unrelated operations after
+    restart — fail closed, preserving that evidence.
+    """
+    try:
+        state.mark_record_uncertain(op, rid, {"reason": reason})
+    except Exception as exc:  # noqa: BLE001 — cannot persist uncertainty → fail closed
+        effects.append(EffectResult("recovery_state", "failed",
+                                    f"could not persist uncertainty; durable pending "
+                                    f"evidence preserved (stays blocked): {exc}"))
+
+
 def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     """Execute a confirmed ``change`` against ``store``; persist idempotency in ``state``."""
     op = change.operation_ref
@@ -116,16 +132,18 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      "operation already verified complete")],
                                detail="idempotent no-op (§15)")
 
-    # (B7-C) Record-global uncertainty: a NEW operation must not run over a record left
-    # uncertain by a DIFFERENT prior operation — reconcile/recover first, no stale replay.
-    blocked = [rid for rid in change.target_record_ids
-               if state.is_record_uncertain(rid) and state.uncertainty_op(rid) != op]
+    # (B7-C) Record-global unresolved state: a NEW operation must not run over a record
+    # left PENDING or UNCERTAIN by a DIFFERENT prior operation — reconcile/recover first,
+    # no stale replay. Derived from the authoritative durable journal so a `pending`
+    # record (business/NTF landed, completion never persisted) also blocks and the block
+    # survives reload; a retry of the SAME operation is not self-blocked.
+    blocked = [rid for rid in change.target_record_ids if state.blocking_op(rid, op)]
     if blocked:
         return ExecutionResult(op, "blocked_uncertain",
                                effects=[EffectResult("uncertainty", "failed",
-                                                     f"record(s) {blocked!r} have unresolved uncertainty "
-                                                     f"from a prior operation; reconcile before new work")],
-                               detail="blocked by prior unresolved record uncertainty (§14, B7-C)")
+                                                     f"record(s) {blocked!r} have unresolved (pending/uncertain) "
+                                                     f"state from a prior operation; reconcile before new work")],
+                               detail="blocked by prior unresolved record state (§14, B7-C)")
 
     # (B2) Integrity gate before ANY business execution (§2/§4): schema → unique
     # required/system headers → duplicate rooming_record_id → permitted adoption.
@@ -136,8 +154,10 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                effects=[EffectResult("integrity", "failed", str(exc))],
                                detail="integrity gate halted execution before any write (§2/§4, B2)")
 
-    # Dependency-aware revalidation (§10) — R2: stop rather than overwrite observed newer state.
-    rv = revalidate(change, fresh)
+    # Dependency-aware revalidation (§10) — R2: stop rather than overwrite observed newer
+    # state. ``state`` supplies the durable journal so a same-operation retry/recovery
+    # may accept an already-landed NEW value, while an ordinary pre-write may not (B5).
+    rv = revalidate(change, fresh, state)
     if not rv.ok:
         return ExecutionResult(op, "revalidation_failed",
                                effects=[EffectResult("revalidation", "failed", rv.reason)],
@@ -146,6 +166,7 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     result = ExecutionResult(op, "complete")
     result.effects.append(EffectResult("revalidation", "verified", rv.reason))
     verified_records = []
+    fresh_by_id = {r.record_id: r for r in fresh if r.record_id}   # observed pre-write state
 
     for rid in change.target_record_ids:
         deltas = change.field_deltas.get(rid, [])
@@ -170,31 +191,48 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
             result.overall = "uncertain"
             continue
 
+        # (B7-D) Reconcile the pending intent against the freshly OBSERVED state before
+        # (re)writing. revalidation has ensured each target field's observed value is the
+        # captured OLD (write needed) or the intended NEW (a prior attempt of THIS op
+        # already landed it — must NOT be reissued); a third value would have failed
+        # revalidation. Only write the fields not already at their intended value.
+        observed = fresh_by_id.get(rid)
+        pending_writes = {f: v for f, v in updates.items()
+                          if not observed or observed.get(f) != str(v)}
+
         # 1. targeted business writes (+ derived nights) (§7/§16).
-        try:
-            ok = store.apply_writes(rid, updates)
-        except Exception as exc:  # noqa: BLE001 — surface as uncertain, no blind retry
-            result.per_record[rid] = {"applied": [], "effects": [EffectResult("business_write", "uncertain", str(exc))]}
-            result.overall = "uncertain"
-            state.mark_record_uncertain(op, rid, {"reason": "business_write_raised"})
-            continue
-        if not ok:
-            result.per_record[rid] = {"applied": [], "effects": [EffectResult("business_write", "failed", "record not found")]}
-            result.overall = "incomplete"
-            continue
+        if pending_writes:
+            try:
+                ok = store.apply_writes(rid, pending_writes)
+            except Exception as exc:  # noqa: BLE001 — surface as uncertain, no blind retry
+                effects.append(EffectResult("business_write", "uncertain", str(exc)))
+                result.overall = "uncertain"
+                _mark_uncertain_safe(state, op, rid, "business_write_raised", effects)
+                result.per_record[rid] = {"applied": [], "effects": effects}
+                continue
+            if not ok:
+                result.per_record[rid] = {"applied": [], "effects": [EffectResult("business_write", "failed", "record not found")]}
+                result.overall = "incomplete"
+                continue
+            business_status = "verified"
+        else:
+            # Everything already at its intended value (same-op recovery of a landed write).
+            business_status = "already_done"
         has_nights = any(d.field == fields.NIGHTS for d in business)
-        effects.append(EffectResult("business_write", "verified"))
-        effects.append(EffectResult("nights_recalc", "verified" if has_nights else "skipped"))
+        effects.append(EffectResult("business_write", business_status))
+        effects.append(EffectResult("nights_recalc",
+                                    ("verified" if business_status == "verified" else "already_done")
+                                    if has_nights else "skipped"))
 
         # 2. post-write verification (§11/§18) before any history is written (§17).
         after = {r.record_id: r for r in store.snapshot_records()}
         status, detail = _verify_record(after, rid, business)
         effects.append(EffectResult("verification", status, detail))
         if status != "verified":
-            result.per_record[rid] = {"applied": [], "effects": effects}
             result.overall = "uncertain" if status == "uncertain" else "incomplete"
             if status == "uncertain":
-                state.mark_record_uncertain(op, rid, {"reason": "verification_uncertain"})
+                _mark_uncertain_safe(state, op, rid, "verification_uncertain", effects)
+            result.per_record[rid] = {"applied": [], "effects": effects}
             continue
 
         # 3. NTF history append for VERIFIED effects only (§17). Idempotency is by
@@ -239,9 +277,9 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
             effects.append(EffectResult("ntf_append", "skipped"))
 
         if not ntf_ok:
-            result.per_record[rid] = {"applied": [], "effects": effects}
             result.overall = "uncertain"
-            state.mark_record_uncertain(op, rid, {"reason": "ntf_unverified"})
+            _mark_uncertain_safe(state, op, rid, "ntf_unverified", effects)
+            result.per_record[rid] = {"applied": [], "effects": effects}
             continue
 
         # (B7-D) Business + history verified; durably record completion. A failure HERE

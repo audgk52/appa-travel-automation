@@ -39,6 +39,13 @@ class UnresolvedDecision(Exception):
     (PRD §6/§16/§19; audit B6). No executable confirmation until it is resolved."""
 
 
+class GroupingReconciliationRequired(Exception):
+    """A target record carries DURABLE grouping uncertainty from a partial/uncertain
+    grouping operation (audit B4). Its leftover stay_id must NOT be treated as
+    established grouping — proposal construction / confirmation STOP until an explicit
+    reconciliation clears the uncertainty."""
+
+
 def require_decision(change, key, kind="policy_decision", detail=""):
     """Attach an authorization-bearing human decision to ``change`` (§16/§19).
 
@@ -82,6 +89,8 @@ class RoomingChange:
     policy_flags: list = field(default_factory=list)     # §16/§19 needs_confirmation items
     detected_related_impacts: list = field(default_factory=list)
     requires_grouping_disposition: bool = False          # R1 gate (§6.1)
+    requires_grouping_reconciliation: bool = False       # B4: member has durable grouping uncertainty
+    reconciliation_members: list = field(default_factory=list)  # affected uncertain members (B4)
     grouping_disposition: str = ""                       # "A"|"B"|"C"
     limited_check_authorized: bool = False               # R1-B (§6.1)
     authorized_decisions: dict = field(default_factory=dict)  # resolved §19/§16 decisions (§6/B6)
@@ -100,12 +109,23 @@ def _has_date_change(deltas):
     return any(d.field in fields.DATE_FIELDS for d in deltas)
 
 
-def propose(records, edits: dict) -> RoomingChange:
+def _established(rec, state) -> bool:
+    """True iff the record's grouping is established AND not under durable grouping
+    uncertainty (B4): a leftover stay_id from a partial grouping op does not count."""
+    return is_established(rec) and not (state is not None and state.is_grouping_uncertain(rec.record_id))
+
+
+def propose(records, edits: dict, state=None) -> RoomingChange:
     """Build an (unconfirmed) :class:`RoomingChange` from per-record field edits.
 
     ``edits`` maps ``record_id`` → ``{business_field: new_value}``. Only PG-writable
     fields (§7) are accepted; nights are recomputed as a derived effect (§16);
     related impacts and the R1 gate are detected but never auto-applied (§6/§6.1).
+
+    ``state`` (optional) supplies durable grouping uncertainty (B4): a target member left
+    grouping-uncertain by a partial/uncertain grouping op is NOT treated as established,
+    and the proposal is flagged ``requires_grouping_reconciliation`` so downstream
+    preview/confirmation STOP until the grouping is reconciled.
     """
     by_id = _record_map(records)
     change = RoomingChange()
@@ -145,14 +165,21 @@ def propose(records, edits: dict) -> RoomingChange:
 
     change.stay_id = next(iter(stay_ids)) if len(stay_ids) == 1 else ""
 
-    # §6.1 R1 gate: a DATE change on a record with unestablished grouping.
+    # (B4) A target member left grouping-uncertain by a partial grouping op must STOP
+    # here: its leftover stay_id is not authoritative until reconciled.
+    change.reconciliation_members = [rid for rid in change.target_record_ids
+                                     if state is not None and state.is_grouping_uncertain(rid)]
+    change.requires_grouping_reconciliation = bool(change.reconciliation_members)
+
+    # §6.1 R1 gate: a DATE change on a record with unestablished grouping (a leftover
+    # stay_id under grouping uncertainty does NOT satisfy establishment, B4).
     for rid in change.target_record_ids:
         rec = by_id[rid]
-        if _has_date_change(change.field_deltas[rid]) and not is_established(rec):
+        if _has_date_change(change.field_deltas[rid]) and not _established(rec, state):
             change.requires_grouping_disposition = True
 
     # §6.1 detector scope: date-boundary overlap/gap within a CONFIRMED stay only.
-    change.detected_related_impacts = _detect_related_impacts(by_id, records, change)
+    change.detected_related_impacts = _detect_related_impacts(by_id, records, change, state)
 
     # §21 residual risk: a date/payment change may misalign the positionally-coupled
     # Payment Tracker (IMPORTRANGE). PG WARNS only — it never validates/repairs it.
@@ -172,13 +199,13 @@ def propose(records, edits: dict) -> RoomingChange:
     return change
 
 
-def _detect_related_impacts(by_id, records, change) -> list:
+def _detect_related_impacts(by_id, records, change, state=None) -> list:
     """Date-boundary overlap/gap between a changed record and its confirmed-stay siblings."""
     impacts = []
     for rid in change.target_record_ids:
         rec = by_id[rid]
-        if not is_established(rec):
-            continue  # unestablished grouping is handled by the R1 gate, not detection
+        if not _established(rec, state):
+            continue  # unestablished / grouping-uncertain: R1 gate / reconciliation, not detection
         siblings = [s for s in members(records, rec.stay_id) if s.record_id != rid]
         for d in change.field_deltas[rid]:
             if d.field == fields.CHECK_OUT:
@@ -266,8 +293,32 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
     * ``decisions`` resolves authorization-bearing policy flags (§16/§19, B6); every
       ``needs_confirmation`` flag must be resolved or confirmation is refused.
     """
-    impact_dispositions = impact_dispositions or {}
+    # (B7-A) An already-confirmed artifact is IMMUTABLE: re-confirming the SAME object
+    # (an operational retry / recovery) keeps its exact identity and never mints a new
+    # human authorization. A genuinely new authorization must start from a fresh
+    # propose()/preview object (operation_ref == "").
+    if change.operation_ref and change.confirmation_id:
+        return change
 
+    # (B4) A proposal built over a member with durable grouping uncertainty cannot be
+    # confirmed: reconcile the grouping first (its leftover stay_id is not authoritative).
+    if change.requires_grouping_reconciliation:
+        raise GroupingReconciliationRequired(
+            f"member(s) {change.reconciliation_members!r} have unresolved grouping "
+            "uncertainty from a partial grouping operation; reconcile the grouping before "
+            "confirming (§5/§6.1, B4)."
+        )
+
+    impact_dispositions = impact_dispositions or {}
+    decisions = decisions or {}
+
+    # ── Validate EVERY gate BEFORE mutating the proposal (confirmation is all-or-
+    # nothing at the proposal-object level). A gate that raises must leave the source
+    # proposal semantically unchanged, so a retry never accumulates duplicate dependent
+    # deltas / scope growth (SHOULD FIX). Only after all gates pass do we fold in the
+    # dependent deltas and stamp identity.
+
+    grouping_ok = False
     if change.requires_grouping_disposition:
         if grouping_disposition not in ("A", "B", "C"):
             raise ValueError("date change on unestablished grouping requires disposition A/B/C (§6.1)")
@@ -281,9 +332,10 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
             )
         if not limited_check_authorized:   # "B"
             raise ValueError("disposition B requires explicit limited-check authorization (§6.1-B)")
-        change.grouping_disposition = "B"
-        change.limited_check_authorized = True
+        grouping_ok = True
 
+    # Validate impact dispositions WITHOUT mutating the impacts yet.
+    validated_impacts = []
     for i, impact in enumerate(change.detected_related_impacts):
         disp = impact_dispositions.get(i)
         if disp not in ("A", "B", "C"):
@@ -293,21 +345,11 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
             )
         if disp == "C":
             raise Cancelled(f"related-impact #{i} disposition C — proposal cancelled (§6)")
-        impact.disposition = disp
+        validated_impacts.append((impact, disp))
 
-    record_ids = list(change.target_record_ids)
-    # Disposition A on an impact folds the dependent delta into the executed scope.
-    for impact in change.detected_related_impacts:
-        if impact.disposition == "A":
-            change.field_deltas.setdefault(impact.target_record_id, [])
-            change.field_deltas[impact.target_record_id].append(impact.suggested)
-            if impact.target_record_id not in record_ids:
-                record_ids.append(impact.target_record_id)
-
-    # (B6) Material human decisions must gate confirmation: every authorization-bearing
-    # flag (needs_confirmation) must be resolved; the resolved values bind the proposal
-    # and its operation_ref. Display-only warnings (needs_confirmation=False) are ignored.
-    decisions = decisions or {}
+    # (B6) Material human decisions gate: every authorization-bearing flag must be
+    # resolved. Validate BEFORE any mutation so an unresolved decision cannot leave a
+    # half-folded proposal behind.
     pending = [f for f in change.policy_flags if f.get("needs_confirmation")]
     missing = [f["key"] for f in pending if not decisions.get(f["key"])]
     if missing:
@@ -315,6 +357,22 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
             f"unresolved material human decision(s) {missing!r} must be resolved before "
             "an executable confirmation (§16/§19)."
         )
+
+    # ── All gates passed — now mutate the proposal exactly once. ──
+    if grouping_ok:
+        change.grouping_disposition = "B"
+        change.limited_check_authorized = True
+
+    record_ids = list(change.target_record_ids)
+    for impact, disp in validated_impacts:
+        impact.disposition = disp
+        # Disposition A on an impact folds the dependent delta into the executed scope.
+        if disp == "A":
+            change.field_deltas.setdefault(impact.target_record_id, [])
+            change.field_deltas[impact.target_record_id].append(impact.suggested)
+            if impact.target_record_id not in record_ids:
+                record_ids.append(impact.target_record_id)
+
     change.authorized_decisions = {f["key"]: decisions[f["key"]] for f in pending}
 
     change.confirmed_scope = {
