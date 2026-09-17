@@ -111,16 +111,18 @@ def test_verification_does_not_claim_no_edit_was_lost(make_store):
 
 
 def test_equal_values_do_not_prove_pg_acted(make_store):
-    # AC-22: idempotency is keyed by operation_ref, not by equal sheet values —
-    # a human pre-applying the same value does not stop PG from acting+recording.
+    # AC-22 (Round 3.1 correction): equivalent current values alone do NOT prove PG
+    # acted. A human pre-applying the target value — with no PRE-EXISTING same-operation
+    # execution evidence — must NOT be attributed to PG: revalidation invalidates and no
+    # NTF/applied-effect is recorded (PG never claims an effect it cannot prove it made).
     store, backend = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     change = confirm(propose(store.snapshot_records(), {"rl-a": {fields.REMARK: "VIP"}}))
     grid = backend.read_grid()
     headers = fields.resolve_headers(grid[0])
     backend.grid[1][headers[fields.REMARK]] = "VIP"          # human already set the target
     res = execute(change, store, StateStore())
-    assert res.overall == "complete"
-    assert "* MMDD" in _ntf(store, "rl-a")                   # PG still recorded its verified effect
+    assert res.overall == "revalidation_failed"             # not attributed to PG
+    assert not _ntf(store, "rl-a")                          # no PG history recorded
 
 
 def test_restart_safe_idempotency_no_double_history(make_store, tmp_path):

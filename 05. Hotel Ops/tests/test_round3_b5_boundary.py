@@ -69,15 +69,22 @@ def test_retry_with_same_op_evidence_accepts_observed_new(make_store):
     assert res.ok is True
 
 
-def test_primary_target_tolerates_already_new_value(make_store):
-    # SCOPE GUARD (audit B5 vs AC-22): the B5 strictness is the RELATED sibling boundary,
-    # NOT the primary target. Idempotency is keyed by operation_ref (AC-22), so a primary
-    # target already at NEW must NOT be invalidated — PG proceeds and records.
+def test_primary_target_external_new_without_evidence_invalidates(make_store):
+    # Round 3.1 correction of AC-22: equivalent current values alone do NOT prove PG
+    # acted. A PRIMARY target observed already at NEW with no PRE-EXISTING same-operation
+    # execution evidence must invalidate/re-preview — PG must not attribute it to itself.
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1",
                                   **{fields.REMARK: ""})])
     change = confirm(propose(store.snapshot_records(), {"rl-a": {fields.REMARK: "VIP"}}))
     fresh = [rr("rl-a", name="James", stay_id="STAY-1", **{fields.REMARK: "VIP"})]  # already NEW
-    assert revalidate(change, fresh).ok is True             # target tolerated (AC-22)
+    assert revalidate(change, fresh).ok is False                    # no evidence → invalidate
+    assert revalidate(change, fresh).kind == "material"
+
+    # With PRE-EXISTING durable same-operation evidence (a genuine prior attempt), the
+    # retry/recovery may reconcile against the observed NEW.
+    state = StateStore()
+    state.begin_record(change.operation_ref, "rl-a", {fields.REMARK: "VIP"})
+    assert revalidate(change, fresh, state).ok is True
 
 
 def test_position_only_move_still_allowed(make_store):

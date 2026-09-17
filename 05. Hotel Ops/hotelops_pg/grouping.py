@@ -72,11 +72,23 @@ def establish_grouping(store, member_record_ids, stay_id=None, state=None) -> Gr
 
     stay_id = stay_id or new_stay_id()
 
-    # (B4) Pessimistically persist grouping uncertainty for EVERY intended member before
-    # the first write. If the process dies mid-write, the durable mark already blocks any
-    # later read from trusting a leftover stay_id.
+    # (B4) If reconciling EXISTING grouping uncertainty, the requested members must fully
+    # cover the COMPLETE confirmed grouping scope recorded for any uncertain member — a
+    # subset must not silently redefine that scope or clear unresolved uncertainty.
     if state is not None:
-        state.mark_grouping_uncertain(members, stay_id, {"phase": "establishing"})
+        required = set()
+        for rid in members:
+            required.update(state.grouping_scope(rid))
+        if required and not required.issubset(set(members)):
+            raise GroupingMemberError(
+                f"incomplete grouping reconciliation: the confirmed grouping scope "
+                f"{sorted(required)!r} is not fully covered by {members!r}; a subset cannot "
+                "clear grouping uncertainty (§5, B4)."
+            )
+        # Pessimistically persist grouping uncertainty for EVERY intended member (recording
+        # the complete scope) before the first write. If the process dies mid-write, the
+        # durable mark already blocks any later read from trusting a leftover stay_id.
+        state.mark_grouping_uncertain(members, stay_id, {"phase": "establishing"}, group=members)
 
     written = []
     for rid in members:

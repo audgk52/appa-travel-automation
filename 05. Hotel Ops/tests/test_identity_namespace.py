@@ -146,12 +146,16 @@ def test_related_sibling_stay_change_invalidates(make_store, disp):
 
 @pytest.mark.parametrize("disp", ["A", "B"])
 def test_related_sibling_position_only_move_still_ok(make_store, disp):
+    # Pre-write, values still at their captured OLD/base (record()-default nights "2");
+    # only the physical rows moved → re-resolve by id and continue (AC-17). Under the
+    # Round 3.1 B5 correction the primary must be at OLD here (an already-NEW value with
+    # no execution evidence would invalidate).
     change = _overlap_confirmed(make_store, disp)
     fresh = [
         rr("rl-prod", name="James", stay_id="STAY-1", row_index=8,
-           check_in="2026-06-10", check_out="2026-06-21", nights="11"),
+           check_in="2026-06-10", check_out="2026-06-19", nights="2"),
         rr("rl-pers", name="James", stay_id="STAY-1", row_index=9,
            check_in="2026-06-19", check_out="2026-06-21"),
     ]
     res = revalidate(change, fresh)
-    assert res.ok is True
+    assert res.ok is True and res.moved_only is True

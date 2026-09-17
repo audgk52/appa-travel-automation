@@ -278,6 +278,66 @@ def compute_operation_ref(change: RoomingChange) -> str:
     return "op-" + proposal_digest(change) + "-" + (change.confirmation_id or "0")
 
 
+def to_payload(change: RoomingChange) -> dict:
+    """Serialize a CONFIRMED proposal for durable persistence + faithful reconstruction
+    across a process restart (audit B7-A). Captures exactly the authorization-relevant
+    content, so a reconstructed artifact re-hashes to the same ``operation_ref`` and the
+    confirmed-proposal integrity check (B1) rejects any tampered/arbitrary scope."""
+    def _fd(d):
+        return [d.field, d.old, d.new]
+    return {
+        "operation_ref": change.operation_ref,
+        "confirmation_id": change.confirmation_id,
+        "stay_id": change.stay_id,
+        "target_record_ids": list(change.target_record_ids),
+        "snapshots": {rid: dict(v) for rid, v in change.snapshots.items()},
+        "positions": dict(change.positions),
+        "field_deltas": {rid: [_fd(d) for d in ds] for rid, ds in change.field_deltas.items()},
+        "policy_flags": [dict(f) for f in change.policy_flags],
+        "impacts": [{
+            "kind": i.kind, "source_record_id": i.source_record_id,
+            "target_record_id": i.target_record_id, "suggested": _fd(i.suggested),
+            "description": i.description, "disposition": i.disposition,
+            "target_name": i.target_name, "target_stay_id": i.target_stay_id,
+        } for i in change.detected_related_impacts],
+        "requires_grouping_disposition": change.requires_grouping_disposition,
+        "grouping_disposition": change.grouping_disposition,
+        "limited_check_authorized": change.limited_check_authorized,
+        "authorized_decisions": dict(change.authorized_decisions),
+        "confirmed_scope": {k: (list(v) if isinstance(v, list) else v)
+                            for k, v in change.confirmed_scope.items()},
+    }
+
+
+def from_payload(payload: dict) -> RoomingChange:
+    """Reconstruct a confirmed :class:`RoomingChange` from :func:`to_payload` output
+    (audit B7-A). The result must be re-validated by execute() (B1) before any write."""
+    def _fd(t):
+        return FieldDelta(t[0], t[1], t[2])
+    change = RoomingChange(
+        operation_ref=payload["operation_ref"],
+        confirmation_id=payload["confirmation_id"],
+        stay_id=payload.get("stay_id", ""),
+        target_record_ids=list(payload["target_record_ids"]),
+        snapshots={rid: dict(v) for rid, v in payload["snapshots"].items()},
+        positions=dict(payload["positions"]),
+        field_deltas={rid: [_fd(t) for t in ds] for rid, ds in payload["field_deltas"].items()},
+        policy_flags=[dict(f) for f in payload["policy_flags"]],
+        requires_grouping_disposition=payload.get("requires_grouping_disposition", False),
+        grouping_disposition=payload.get("grouping_disposition", ""),
+        limited_check_authorized=payload.get("limited_check_authorized", False),
+        authorized_decisions=dict(payload["authorized_decisions"]),
+        confirmed_scope=dict(payload["confirmed_scope"]),
+    )
+    change.detected_related_impacts = [RelatedImpact(
+        kind=i["kind"], source_record_id=i["source_record_id"],
+        target_record_id=i["target_record_id"], suggested=_fd(i["suggested"]),
+        description=i["description"], disposition=i["disposition"],
+        target_name=i["target_name"], target_stay_id=i["target_stay_id"],
+    ) for i in payload["impacts"]]
+    return change
+
+
 def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=None,
             limited_check_authorized=False, decisions=None) -> RoomingChange:
     """Apply human disposition and stamp the binding ``operation_ref`` (§6/§6.1/§15).

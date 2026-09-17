@@ -24,6 +24,7 @@ from hotelops_pg.change import (
     GroupingNotYetEstablished,
     UnresolvedDecision,
     confirm,
+    from_payload,
     propose,
 )
 from hotelops_pg.execution import execute
@@ -270,6 +271,28 @@ def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_con
     EXECUTE step, deliberately distinct from :func:`confirm_preview`.
     """
     _require_durable(state, "commit")                    # B8: fail before any mutation
+    return execute(confirmed, store, state, request_date=request_date,
+                   hotel_confirmed=hotel_confirmed)
+
+
+def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed=False):
+    """Restart-safe recovery of an UNFINISHED confirmed operation (audit B7-A).
+
+    Reconstructs the EXACT confirmed artifact from durable state (staged at execution
+    start) and re-executes it via the normal path. ``execute`` re-checks that the
+    reconstructed content still hashes to ``operation_ref`` (confirmed-proposal
+    integrity, B1), so arbitrary reconstructed scope/deltas cannot run under the same
+    ref, and it reconciles already-landed effects rather than re-writing them (B7-D).
+    Requires durable state (B8).
+    """
+    _require_durable(state, "recover")
+    payload = state.load_operation(operation_ref)
+    if payload is None:
+        raise ValueError(
+            f"no persisted confirmed operation {operation_ref!r} to recover; nothing was "
+            "durably staged (§15, B7-A)."
+        )
+    confirmed = from_payload(payload)
     return execute(confirmed, store, state, request_date=request_date,
                    hotel_confirmed=hotel_confirmed)
 

@@ -11,7 +11,8 @@ import pytest
 from conftest import record
 from hotelops_pg import fields
 from hotelops_pg.change import GroupingReconciliationRequired, confirm, propose
-from hotelops_pg.grouping import establish_grouping
+from hotelops_pg.execution import execute
+from hotelops_pg.grouping import GroupingMemberError, establish_grouping
 from hotelops_pg.spine import preview_quick_ops
 from hotelops_pg.state_store import StateStore
 
@@ -123,3 +124,46 @@ def test_spine_preview_surfaces_reconciliation_required(make_store, tmp_path):
     prev = preview_quick_ops(inner, "James Production checkout 2026-06-19 -> 2026-06-21",
                              state=state)
     assert prev.status == "needs_reconciliation"
+
+
+# ── Round 3.1 amendment: non-bypassable across the operational path ──
+
+def test_execution_rechecks_grouping_uncertainty(make_store, tmp_path):
+    # A proposal confirmed WITHOUT state (so it carries no reconciliation flag) must not
+    # slip a grouping-uncertain member past execution: execute rechecks durable
+    # uncertainty and refuses, rather than trusting a stale/omitting preview.
+    inner, state, _ = _partial_grouping(make_store, tmp_path / "s.json")
+    change = confirm(propose(inner.snapshot_records(), {"rl-prod": {fields.REMARK: "X"}}))
+    assert change.requires_grouping_reconciliation is False    # state was omitted at build
+    res = execute(change, inner, state)
+    assert res.overall == "blocked_grouping_uncertain"
+    assert {r.record_id: r for r in inner.snapshot_records()}["rl-prod"].get(fields.REMARK) == ""
+
+
+def test_r1b_limited_check_does_not_erase_partial_grouping_uncertainty(make_store, tmp_path):
+    inner, state, _ = _partial_grouping(make_store, tmp_path / "s.json")
+    change = propose(inner.snapshot_records(), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}},
+                     state=state)
+    # Even an explicit R1-B limited-check authorization cannot bypass known partial-
+    # grouping uncertainty (it is distinct from unestablished-grouping R1 A/B/C).
+    with pytest.raises(GroupingReconciliationRequired):
+        confirm(change, grouping_disposition="B", limited_check_authorized=True)
+
+
+def test_subset_reconciliation_does_not_clear_uncertainty(make_store, tmp_path):
+    inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
+    stay = result.stay_id
+    # Reconciling with only a SUBSET of the confirmed grouping scope must NOT silently
+    # redefine the scope or clear the unresolved uncertainty.
+    healthy = FlakyGroupingStore(inner, fail_nth=None)
+    with pytest.raises(GroupingMemberError):
+        establish_grouping(healthy, ["rl-prod"], stay_id=stay, state=state)
+    assert state.is_grouping_uncertain("rl-prod")
+    assert state.is_grouping_uncertain("rl-pers")
+
+    # The COMPLETE confirmed scope reconciles and clears.
+    redo = establish_grouping(FlakyGroupingStore(inner, fail_nth=None),
+                              ["rl-prod", "rl-pers"], stay_id=stay, state=state)
+    assert redo.established
+    assert not state.is_grouping_uncertain("rl-prod")
+    assert not state.is_grouping_uncertain("rl-pers")

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from hotelops_pg import fields
 from hotelops_pg.adoption import DuplicateRecordIdError
-from hotelops_pg.change import compute_operation_ref
+from hotelops_pg.change import compute_operation_ref, to_payload
 from hotelops_pg.drafts import email_draft, kakao_draft
 from hotelops_pg.history import append_history, history_entry
 from hotelops_pg.revalidation import revalidate
@@ -145,6 +145,17 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      f"state from a prior operation; reconcile before new work")],
                                detail="blocked by prior unresolved record state (§14, B7-C)")
 
+    # (B4) Non-bypassable grouping safety: execution independently rechecks durable
+    # grouping uncertainty, so a proposal confirmed on a stale/omitting preview cannot
+    # slip a member whose confirmed grouping is unresolved past the write boundary.
+    g_blocked = [rid for rid in change.target_record_ids if state.is_grouping_uncertain(rid)]
+    if g_blocked:
+        return ExecutionResult(op, "blocked_grouping_uncertain",
+                               effects=[EffectResult("grouping", "failed",
+                                                     f"record(s) {g_blocked!r} have unresolved grouping "
+                                                     f"uncertainty; reconcile the confirmed grouping first")],
+                               detail="blocked by unresolved grouping uncertainty (§5/§6.1, B4)")
+
     # (B2) Integrity gate before ANY business execution (§2/§4): schema → unique
     # required/system headers → duplicate rooming_record_id → permitted adoption.
     try:
@@ -167,6 +178,11 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     result.effects.append(EffectResult("revalidation", "verified", rv.reason))
     verified_records = []
     fresh_by_id = {r.record_id: r for r in fresh if r.record_id}   # observed pre-write state
+
+    # (B7-A) Stage the confirmed artifact so a restart can reconstruct THIS exact
+    # operation. In-memory only here; the first begin_record flush persists it (no extra
+    # flush → durable idempotency ordering unchanged).
+    state.stage_operation(op, to_payload(change))
 
     for rid in change.target_record_ids:
         deltas = change.field_deltas.get(rid, [])
@@ -298,8 +314,22 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
 
     # Overall status + drafts from VERIFIED effects only (§18/§19).
     if result.overall == "complete" and len(verified_records) == len(change.target_record_ids):
-        state.mark_complete(op)
-        result.effects.append(EffectResult("verification", "verified", "all records verified"))
+        # (B7-D) Operation-level completion is authoritative ONLY when durably persisted.
+        # If the completion flush fails, do not claim complete on the in-memory flag and
+        # do not let a raw exception be the outcome after sheet mutation: mark_complete
+        # reverts the in-memory flag, and we report uncertain with truthful per-effect
+        # evidence. All per-record effects are already durable, so a same-process retry or
+        # a restart re-establishes completion via recovery (never re-writing the sheet).
+        try:
+            state.mark_complete(op)
+        except Exception as exc:  # noqa: BLE001 — durable completion authority not established
+            result.overall = "uncertain"
+            result.effects.append(EffectResult("durable_complete", "uncertain",
+                                               f"all records verified+durable but op-completion "
+                                               f"not persisted ({exc}); not authoritative — "
+                                               "retry/reload re-establishes durable completion"))
+        else:
+            result.effects.append(EffectResult("verification", "verified", "all records verified"))
     else:
         if result.overall == "complete":
             result.overall = "incomplete"

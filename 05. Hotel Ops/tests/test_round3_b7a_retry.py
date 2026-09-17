@@ -12,8 +12,27 @@ A genuinely NEW human confirmation of identical content is a different artifact.
 """
 from conftest import record
 from hotelops_pg import fields
-from hotelops_pg.spine import commit, confirm_preview, execute_confirmed, preview_quick_ops
+from hotelops_pg.spine import (
+    commit,
+    confirm_preview,
+    execute_confirmed,
+    preview_quick_ops,
+    recover,
+)
 from hotelops_pg.state_store import StateStore
+
+
+class FlakyStateStore(StateStore):
+    def __init__(self, path, fail_on):
+        self._calls = 0
+        self._fail_on = fail_on
+        super().__init__(path)
+
+    def _flush(self):
+        self._calls += 1
+        if self._calls == self._fail_on:
+            raise OSError("simulated durable-state write failure")
+        super()._flush()
 
 
 def _ntf(store, rid):
@@ -39,15 +58,47 @@ def test_commit_same_preview_twice_is_idempotent(make_store, tmp_path):
     assert _ntf(store, "rl-a").count("* MMDD") == 1
 
 
-def test_retry_confirmed_artifact_across_restart_keeps_ref(make_store, tmp_path):
+def test_restart_recovers_persisted_artifact_without_reusing_object(make_store, tmp_path):
+    # Round 3.1 B7-A restart contract: recovery must reconstruct the SAME confirmed
+    # operation from PERSISTED content — not by reusing the original in-memory artifact.
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     path = tmp_path / "s.json"
     confirmed = confirm_preview(_preview(store))
     op = confirmed.operation_ref
-    assert execute_confirmed(store, StateStore(path), confirmed).overall == "complete"
-    # Restart: a genuinely NEW StateStore instance from the persisted file.
-    assert execute_confirmed(store, StateStore(path), confirmed).operation_ref == op
-    assert execute_confirmed(store, StateStore(path), confirmed).overall == "noop_already_done"
+
+    # Partial execution: leave the op pending (completion flush fails).
+    execute_confirmed(store, FlakyStateStore(path, fail_on=3), confirmed)
+    del confirmed                                              # discard the live artifact
+
+    # Restart: fresh StateStore from disk; recover reconstructs the artifact from state.
+    recovered = recover(store, StateStore(path), op)
+    assert recovered.operation_ref == op
+    assert recovered.overall == "complete"
+    assert _ntf(store, "rl-a").count("* MMDD") == 1           # not duplicated
+
+
+def test_recovery_rejects_tampered_reconstructed_scope(make_store, tmp_path):
+    # An arbitrary reconstructed scope/delta under the same opaque ref must not execute:
+    # the content-addressed operation_ref + confirmed-proposal integrity check refuse it.
+    store, _ = make_store([
+        record(name="James", record_id="rl-a", stay_id="STAY-1"),
+        record(name="Yuna", record_id="rl-b", stay_id="STAY-1"),
+    ])
+    path = tmp_path / "s.json"
+    confirmed = confirm_preview(_preview(store))
+    op = confirmed.operation_ref
+    execute_confirmed(store, FlakyStateStore(path, fail_on=3), confirmed)
+
+    # Tamper the persisted artifact: inject an out-of-scope delta but keep operation_ref.
+    tampered = StateStore(path)
+    payload = tampered.load_operation(op)
+    payload["field_deltas"]["rl-b"] = [[fields.REMARK, "", "HACK"]]
+    payload["target_record_ids"].append("rl-b")
+    tampered.stage_operation(op, payload)
+
+    res = recover(store, tampered, op)
+    assert res.overall == "authorization_invalidated"
+    assert {r.record_id: r for r in store.snapshot_records()}["rl-b"].get(fields.REMARK) == ""
 
 
 def test_new_human_confirmation_of_identical_content_is_a_new_operation(make_store, tmp_path):

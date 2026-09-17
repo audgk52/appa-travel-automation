@@ -26,11 +26,13 @@ class StateStore:
             "executed_ops": {},             # operation_ref -> {"records": {...}, "complete": bool}
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
             "grouping_uncertain": {},       # record_id -> {"stay_id":..., "reason":...} (B4)
+            "operations": {},               # operation_ref -> confirmed-artifact payload (B7-A)
         }
         if self.path and self.path.exists():
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
         self._data.setdefault("grouping_uncertain", {})
+        self._data.setdefault("operations", {})
 
     @property
     def durable(self) -> bool:
@@ -165,11 +167,28 @@ class StateStore:
         self._flush()
 
     def complete_record(self, operation_ref: str, record_id: str, summary=None):
+        """Durably mark a record done. If the flush fails, REVERT the in-memory mutation
+        so durable authority is never claimed on memory alone: a same-process retry then
+        re-observes the record as unresolved and recovers (audit B7-D)."""
         rec = self._rec(operation_ref, record_id)
+        prev_status = rec.get("status")
+        had_summary = "summary" in rec
+        prev_summary = rec.get("summary")
+        prev_uncertain = self._data["uncertain_records"].get(record_id)
         rec["status"] = "done"
         rec["summary"] = summary or {}
         self._data["uncertain_records"].pop(record_id, None)   # resolved for this record
-        self._flush()
+        try:
+            self._flush()
+        except Exception:
+            rec["status"] = prev_status
+            if had_summary:
+                rec["summary"] = prev_summary
+            else:
+                rec.pop("summary", None)
+            if prev_uncertain is not None:
+                self._data["uncertain_records"][record_id] = prev_uncertain
+            raise
 
     def mark_record_uncertain(self, operation_ref: str, record_id: str, summary=None):
         """Durably record a record's effect as uncertain — both under the op and in the
@@ -229,9 +248,14 @@ class StateStore:
     # A partial/uncertain grouping operation leaves each intended member here, so a
     # later operational read cannot treat a leftover stay_id as authoritative
     # established grouping. Survives reload; cleared only by explicit reconciliation.
-    def mark_grouping_uncertain(self, record_ids, stay_id, reason=None):
+    def mark_grouping_uncertain(self, record_ids, stay_id, reason=None, group=None):
+        """Mark members grouping-uncertain, recording the COMPLETE confirmed grouping
+        scope (``group``, default = ``record_ids``) so a later reconciliation cannot
+        clear the block with only a subset (audit B4)."""
+        members = list(group if group is not None else record_ids)
         for rid in record_ids:
-            self._data["grouping_uncertain"][rid] = {"stay_id": stay_id, "reason": reason or {}}
+            self._data["grouping_uncertain"][rid] = {"stay_id": stay_id,
+                                                     "members": members, "reason": reason or {}}
         self._flush()
 
     def is_grouping_uncertain(self, record_id: str) -> bool:
@@ -240,6 +264,12 @@ class StateStore:
     def grouping_uncertainty(self, record_id: str):
         return self._data["grouping_uncertain"].get(record_id)
 
+    def grouping_scope(self, record_id: str):
+        """The COMPLETE confirmed member set recorded for this record's grouping
+        uncertainty (empty if none) — the scope a reconciliation must fully cover (B4)."""
+        entry = self._data["grouping_uncertain"].get(record_id)
+        return list(entry.get("members", [record_id])) if entry else []
+
     def resolve_grouping(self, record_ids):
         """Clear grouping uncertainty for members after explicit reconciliation (B4)."""
         for rid in record_ids:
@@ -247,8 +277,29 @@ class StateStore:
         self._flush()
 
     def mark_complete(self, operation_ref: str):
-        self._op(operation_ref)["complete"] = True
-        self._flush()
+        """Durably record operation-level completion. If the flush fails, REVERT the
+        in-memory flag so completion is authoritative ONLY when durably persisted — a
+        same-process retry and a restart both re-establish authority (audit B7-D)."""
+        op = self._op(operation_ref)
+        prev = op.get("complete", False)
+        op["complete"] = True
+        try:
+            self._flush()
+        except Exception:
+            op["complete"] = prev
+            raise
 
     def executed_summary(self, operation_ref: str):
         return self._data["executed_ops"].get(operation_ref)
+
+    # --- confirmed-operation artifact (B7-A restart contract) ----------------
+    def stage_operation(self, operation_ref: str, payload: dict):
+        """Stage the confirmed-operation artifact in memory (audit B7-A). Persisted on
+        the NEXT durable flush (e.g. the first begin_record), so idempotency flush
+        ordering/counts are unchanged; a restart can then reconstruct the EXACT
+        confirmed proposal instead of trusting an opaque operation_ref alone."""
+        self._data["operations"][operation_ref] = payload
+
+    def load_operation(self, operation_ref: str):
+        """The persisted confirmed-artifact payload for restart recovery, or None."""
+        return self._data.get("operations", {}).get(operation_ref)

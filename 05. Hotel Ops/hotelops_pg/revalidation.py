@@ -83,22 +83,25 @@ def revalidate(change, fresh_records, state=None) -> RevalidationResult:
                     "material",
                 )
 
-        # The base each delta was computed from must be unchanged (else a newer
-        # human edit is present → material). current == old (base) or already == new
-        # (idempotent) is fine; anything else invalidates (§10, R2 §11). For the PRIMARY
-        # TARGET this tolerance of an already-NEW value is DELIBERATE (AC-22): idempotency
-        # is keyed by operation_ref, so a human pre-applying the target value must not
-        # stop PG acting+recording. The B5 strictness applies to the RELATED sibling
-        # boundary below (never written under B; retry-only under A), not here.
+        # The base each delta was computed from must be unchanged. current == old (base)
+        # is eligible ordinary pre-write state. current == new is accepted ONLY as a
+        # same-operation retry/recovery backed by PRE-EXISTING durable journal evidence
+        # (audit B5, Round 3.1): equivalent current values alone do not prove PG acted, so
+        # an observed NEW without such evidence is an indistinguishable external edit and
+        # must invalidate/re-preview (never attributed to PG). A third value invalidates
+        # too. This applies to PRIMARY and dependent target deltas alike (§10, R2 §11).
         for d in change.field_deltas.get(rid, []):
             cur = rec.get(d.field)
-            if cur not in (str(d.old), str(d.new)):
-                return RevalidationResult(
-                    False,
-                    f"{rid!r}.{d.field} changed under us ({d.old!r}→now {cur!r}); "
-                    "invalidating proposal",
-                    "material",
-                )
+            if cur == str(d.old):
+                continue
+            if cur == str(d.new) and _op_intended(state, op, rid, d.field, d.new):
+                continue
+            return RevalidationResult(
+                False,
+                f"{rid!r}.{d.field} changed under us ({d.old!r}→now {cur!r}); "
+                "invalidating proposal",
+                "material",
+            )
 
         # Relevant stay membership must be unchanged where the change relied on it —
         # including REMOVAL of prior membership (audit B5): if the proposal relied on

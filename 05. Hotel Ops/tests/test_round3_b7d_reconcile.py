@@ -127,6 +127,33 @@ def test_uncertainty_persist_failure_does_not_escape_and_stays_blocked(make_stor
     assert execute(other, store, StateStore(path)).overall == "blocked_uncertain"
 
 
+def test_completion_persist_failure_is_not_authoritative(make_store, tmp_path):
+    # Round 3.1 B7-D: op-level completion is authoritative ONLY when durable authority is
+    # established. If the final completion flush fails, execution must not claim complete
+    # on the in-memory flag, must not raise raw, and must preserve truthful per-effect
+    # evidence. Same-instance retry and fresh reload both reconcile to the verified
+    # completion (records already durable) without duplicating effects.
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
+    path = tmp_path / "state.json"
+    change = _confirmed(store)
+
+    # Flushes: begin_record(1), history_intent(2), complete_record(3), mark_complete(4).
+    flaky = FlakyStateStore(path, fail_on=4)
+    res = execute(change, store, flaky)
+    assert res.overall == "uncertain"                          # not authoritative complete
+    assert flaky.is_executed(change.operation_ref) is False    # in-memory reverted (no bypass)
+    assert _ntf(store, "rl-a").count("* MMDD") == 1            # business + history truthful
+
+    # Same-instance retry must NOT bypass recovery via mutated memory → reconciles.
+    res2 = execute(change, store, flaky)
+    assert res2.overall == "complete"
+    assert _ntf(store, "rl-a").count("* MMDD") == 1
+
+    # A genuinely fresh reload respects the same durable authority and completes.
+    fresh = StateStore(path)
+    assert fresh.is_executed(change.operation_ref) is True
+
+
 def test_unlanded_business_is_recovered_on_restart(make_store, tmp_path):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     path = tmp_path / "state.json"
