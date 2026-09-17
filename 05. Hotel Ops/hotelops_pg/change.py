@@ -165,10 +165,15 @@ def propose(records, edits: dict, state=None) -> RoomingChange:
 
     change.stay_id = next(iter(stay_ids)) if len(stay_ids) == 1 else ""
 
-    # (B4) A target member left grouping-uncertain by a partial grouping op must STOP
-    # here: its leftover stay_id is not authoritative until reconciled.
-    change.reconciliation_members = [rid for rid in change.target_record_ids
-                                     if state is not None and state.is_grouping_uncertain(rid)]
+    # (B4, Round 3.1) Only a RELATIONSHIP-DEPENDENT operation on a grouping-uncertain
+    # member is gated for reconciliation: a date change depends on stay boundaries /
+    # sibling relationships. An independent non-date edit (e.g. a Remark) is NOT blocked
+    # merely because the record also has unresolved grouping uncertainty (AC-39d).
+    change.reconciliation_members = [
+        rid for rid in change.target_record_ids
+        if state is not None and state.is_grouping_uncertain(rid)
+        and _has_date_change(change.field_deltas[rid])
+    ]
     change.requires_grouping_reconciliation = bool(change.reconciliation_members)
 
     # §6.1 R1 gate: a DATE change on a record with unestablished grouping (a leftover

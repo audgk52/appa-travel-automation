@@ -17,6 +17,12 @@ AUTHORITY_ACTIVE = "active"
 AUTHORITY_UNCERTAIN = "uncertain"       # R3-C: which baseline is authoritative is unknown
 
 
+class GroupingScopeError(ValueError):
+    """Attempt to clear grouping uncertainty for only a SUBSET of a recorded confirmed
+    grouping scope (audit B4). The complete recorded human-confirmed scope must resolve
+    together — the state-transition primitive refuses an unchecked subset clear."""
+
+
 class StateStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else None
@@ -271,8 +277,24 @@ class StateStore:
         return list(entry.get("members", [record_id])) if entry else []
 
     def resolve_grouping(self, record_ids):
-        """Clear grouping uncertainty for members after explicit reconciliation (B4)."""
-        for rid in record_ids:
+        """Clear grouping uncertainty for a COMPLETE recorded scope only (audit B4).
+
+        The state-transition primitive itself refuses a subset clear: for every supplied
+        member it unions the complete recorded grouping scope and requires the caller to
+        cover it, so the low-level clear cannot bypass the reconciliation invariant. Fresh
+        Sheet verification that the members actually carry the intended stay_id remains
+        the caller's (grouping.py) responsibility before invoking this.
+        """
+        requested = set(record_ids)
+        required = set()
+        for rid in requested:
+            required.update(self.grouping_scope(rid))
+        if required and not required.issubset(requested):
+            raise GroupingScopeError(
+                f"cannot clear grouping uncertainty for a subset {sorted(requested)!r}; the "
+                f"complete recorded confirmed scope {sorted(required)!r} must resolve together (§5, B4)."
+            )
+        for rid in requested:
             self._data["grouping_uncertain"].pop(rid, None)
         self._flush()
 

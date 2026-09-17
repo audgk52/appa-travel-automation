@@ -147,8 +147,12 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
 
     # (B4) Non-bypassable grouping safety: execution independently rechecks durable
     # grouping uncertainty, so a proposal confirmed on a stale/omitting preview cannot
-    # slip a member whose confirmed grouping is unresolved past the write boundary.
-    g_blocked = [rid for rid in change.target_record_ids if state.is_grouping_uncertain(rid)]
+    # slip a RELATIONSHIP-DEPENDENT change past the write boundary. Only a date change
+    # (which depends on stay boundaries/relationships) is gated; an independent non-date
+    # edit on the same grouping-uncertain record is not blocked by B4 (AC-39d).
+    g_blocked = [rid for rid in change.target_record_ids
+                 if state.is_grouping_uncertain(rid)
+                 and any(d.field in fields.DATE_FIELDS for d in change.field_deltas.get(rid, []))]
     if g_blocked:
         return ExecutionResult(op, "blocked_grouping_uncertain",
                                effects=[EffectResult("grouping", "failed",

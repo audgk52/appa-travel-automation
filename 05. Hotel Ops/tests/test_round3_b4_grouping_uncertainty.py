@@ -14,7 +14,7 @@ from hotelops_pg.change import GroupingReconciliationRequired, confirm, propose
 from hotelops_pg.execution import execute
 from hotelops_pg.grouping import GroupingMemberError, establish_grouping
 from hotelops_pg.spine import preview_quick_ops
-from hotelops_pg.state_store import StateStore
+from hotelops_pg.state_store import GroupingScopeError, StateStore
 
 
 class FlakyGroupingStore:
@@ -128,16 +128,29 @@ def test_spine_preview_surfaces_reconciliation_required(make_store, tmp_path):
 
 # ── Round 3.1 amendment: non-bypassable across the operational path ──
 
-def test_execution_rechecks_grouping_uncertainty(make_store, tmp_path):
-    # A proposal confirmed WITHOUT state (so it carries no reconciliation flag) must not
-    # slip a grouping-uncertain member past execution: execute rechecks durable
-    # uncertainty and refuses, rather than trusting a stale/omitting preview.
+def test_execution_rechecks_grouping_uncertainty_for_date_change(make_store, tmp_path):
+    # A DATE change (relationship-dependent) confirmed WITHOUT state (so it carries no
+    # reconciliation flag) must not slip a grouping-uncertain member past execution:
+    # execute rechecks durable uncertainty and refuses a stale/omitting preview.
     inner, state, _ = _partial_grouping(make_store, tmp_path / "s.json")
-    change = confirm(propose(inner.snapshot_records(), {"rl-prod": {fields.REMARK: "X"}}))
+    change = confirm(propose(inner.snapshot_records(), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}}))
     assert change.requires_grouping_reconciliation is False    # state was omitted at build
     res = execute(change, inner, state)
     assert res.overall == "blocked_grouping_uncertain"
-    assert {r.record_id: r for r in inner.snapshot_records()}["rl-prod"].get(fields.REMARK) == ""
+    assert {r.record_id: r for r in inner.snapshot_records()}["rl-prod"].get(fields.CHECK_OUT) == "2026-06-19"
+
+
+def test_independent_non_date_change_is_not_blocked_by_b4(make_store, tmp_path):
+    # AC-39d / Astra: a relationship-INDEPENDENT non-date edit (a simple Remark) on a
+    # grouping-uncertain record must NOT be gated merely because the record has unresolved
+    # grouping uncertainty — neither at preview nor at the execution backstop.
+    inner, state, _ = _partial_grouping(make_store, tmp_path / "s.json")
+    change = confirm(propose(inner.snapshot_records(), {"rl-prod": {fields.REMARK: "note"}},
+                             state=state))
+    assert change.requires_grouping_reconciliation is False    # not relationship-dependent
+    res = execute(change, inner, state)
+    assert res.overall == "complete"
+    assert {r.record_id: r for r in inner.snapshot_records()}["rl-prod"].get(fields.REMARK) == "note"
 
 
 def test_r1b_limited_check_does_not_erase_partial_grouping_uncertainty(make_store, tmp_path):
@@ -167,3 +180,24 @@ def test_subset_reconciliation_does_not_clear_uncertainty(make_store, tmp_path):
     assert redo.established
     assert not state.is_grouping_uncertain("rl-prod")
     assert not state.is_grouping_uncertain("rl-pers")
+
+
+def test_direct_subset_clear_primitive_is_refused(make_store, tmp_path):
+    # The previous Codex bypass: calling the low-level clear directly on a SUBSET of one
+    # recorded grouping scope. The state-transition primitive itself must refuse it — the
+    # complete recorded human-confirmed scope stays unresolved together.
+    inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
+    with pytest.raises(GroupingScopeError):
+        state.resolve_grouping(["rl-prod"])                    # subset of scope {rl-prod, rl-pers}
+    assert state.is_grouping_uncertain("rl-prod")
+    assert state.is_grouping_uncertain("rl-pers")
+
+    # It also survives a reload (durable), and full verified reconciliation clears both.
+    reloaded = StateStore(tmp_path / "s.json")
+    with pytest.raises(GroupingScopeError):
+        reloaded.resolve_grouping(["rl-pers"])
+    redo = establish_grouping(FlakyGroupingStore(inner, fail_nth=None),
+                              ["rl-prod", "rl-pers"], stay_id=result.stay_id, state=reloaded)
+    assert redo.established
+    assert not reloaded.is_grouping_uncertain("rl-prod")
+    assert not reloaded.is_grouping_uncertain("rl-pers")
