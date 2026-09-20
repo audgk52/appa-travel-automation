@@ -83,6 +83,20 @@ def revalidate(change, fresh_records, state=None) -> RevalidationResult:
                     "material",
                 )
 
+        # (B11 §11) The NARROW human-supplied matching evidence the Path A target
+        # selection/continuity actually relied on (e.g. TITLE, Payment, planned dates)
+        # must also survive to pre-write: if any such evidence changed, the earlier
+        # selection may no longer hold — invalidate and re-preview. Only fields recorded
+        # as evidence are checked, so unrelated manual fields never become blockers.
+        for f in change.matching_evidence:
+            if f in snap and rec.get(f) != snap[f]:
+                return RevalidationResult(
+                    False,
+                    f"{rid!r} matching evidence {f!r} changed ({snap[f]!r}→now {rec.get(f)!r}); "
+                    "the selection this proposal relied on may no longer hold — re-preview/confirm",
+                    "material",
+                )
+
         # The base each delta was computed from must be unchanged. current == old (base)
         # is eligible ordinary pre-write state. current == new is accepted ONLY as a
         # same-operation retry/recovery backed by PRE-EXISTING durable journal evidence

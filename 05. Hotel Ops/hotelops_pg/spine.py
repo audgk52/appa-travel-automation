@@ -28,7 +28,7 @@ from hotelops_pg.change import (
     propose,
 )
 from hotelops_pg.execution import execute
-from hotelops_pg.matching import resolve_target
+from hotelops_pg.matching import _canon, is_placeholder_name, resolve_path_a, resolve_target
 from hotelops_pg.policy_decisions import evaluate as _evaluate_decisions
 
 
@@ -36,6 +36,17 @@ class QuickOpsParseError(ValueError):
     """A Quick Ops instruction does not match the narrow approved grammar (§23).
 
     PG does not guess an interpretation the PRD has not fixed — it stops and asks.
+    """
+
+
+class ConfirmationBypassError(RuntimeError):
+    """An UNRESOLVED pre-confirmation interrupt was handed to the authorization boundary
+    (audit B11). A preview that still needs matching context / target selection / continuity
+    confirmation / manual identity update / identity repair — or is a no-match / non-trivial
+    review / integrity failure — carries NO executable authorization, even if it happens to
+    hold a partial ``RoomingChange``. It must be resolved (resume from a fresh read) first;
+    it can never be confirmed or committed. Legitimate GATE resolution (R1 A/B/C, related-
+    impact A/B/C, material policy decisions) is unaffected — those flow through ``confirm``.
     """
 
 
@@ -174,9 +185,24 @@ class Preview:
     member_suggestions: list = field(default_factory=list)  # R1-A grouping evidence
     detail: str = ""
 
-    # status ∈ {ready, no_match, needs_target_selection, needs_grouping,
+    # status ∈ {ready, no_match, needs_review, needs_target_selection,
+    #           needs_matching_context, needs_continuity_confirmation,
+    #           needs_manual_identity_update, needs_identity_repair, needs_grouping,
     #           needs_reconciliation, needs_disposition, needs_decision,
     #           integrity_failed, parse_error}
+    #
+    # UNRESOLVED interrupts carry NO executable authorization (confirm_preview refuses
+    # them); the *gate* states (needs_grouping/disposition/decision/reconciliation) are
+    # resolved through confirm()'s disposition/decision params, not blocked here.
+
+
+# Pre-confirmation interrupts that must be resolved by a fresh-read resume — never by
+# confirming — regardless of whether a partial change object is attached (audit B11 §9).
+_UNRESOLVED_PREVIEW_STATUSES = frozenset({
+    "no_match", "needs_review", "needs_target_selection", "needs_matching_context",
+    "needs_continuity_confirmation", "needs_manual_identity_update",
+    "needs_identity_repair", "integrity_failed", "parse_error",
+})
 
 
 def _preview_from_change(change):
@@ -231,21 +257,64 @@ def preview_quick_ops(store, instruction, state=None) -> Preview:
     return _preview_from_change(change)
 
 
-def preview_path_a(store, itinerary_fact, state=None) -> Preview:
-    """Path A — narrow structured itinerary reconciliation (§23).
+def _find(records, record_id):
+    return next((r for r in records if r.record_id == record_id), None)
 
-    ``itinerary_fact`` = {"traveler", optional "payment", and one of the writable
-    fields → value}. A non-trivial or zero match is surfaced (propose/ask); PG never
-    invents a booking decision and never creates a row/stay. ``state`` (optional)
-    supplies durable grouping uncertainty for the ``needs_reconciliation`` gate (B4).
+
+def _evidence_fields(payment, context):
+    """The NARROW comparable fields a Path A match/continuity relied on beyond NAME (§11).
+
+    Only fields the human ACTUALLY supplied as evidence become dependencies, so unrelated
+    manual fields never turn into revalidation blockers. Captured by name; their observed
+    values live in ``change.snapshots`` (``comparable()``), which revalidation checks.
+    """
+    context = context or {}
+    used = []
+    if context.get("payment") is not None or payment is not None:
+        used.append(fields.PAYMENT)
+    if context.get("title"):
+        used.append(fields.TITLE)
+    if context.get("check_in"):
+        used.append(fields.CHECK_IN)
+    if context.get("check_out"):
+        used.append(fields.CHECK_OUT)
+    return used
+
+
+def _build_path_a_preview(records, rec, name, edits, payment, context, arrival_ctx, state):
+    """Build the proposal on a resolved EXISTING record, capturing matching evidence."""
+    evidence = _evidence_fields(payment, context)
+    change = propose(records, {rec.record_id: edits}, state=state, matching_evidence=evidence)
+    hotel_arrival, flight_arrival = arrival_ctx
+    arrival = hotel_arrival or flight_arrival
+    change.policy_flags.extend(_evaluate_decisions(
+        change, arrival=arrival, arrival_kind="hotel" if hotel_arrival else "flight", path="A"))
+    return _preview_from_change(change)
+
+
+def preview_path_a(store, itinerary_fact, state=None) -> Preview:
+    """Path A — narrow structured itinerary reconciliation against EXISTING records (§23, B11).
+
+    ``itinerary_fact`` = {"traveler", optional "payment", optional "context" (human matching
+    evidence: title/payment/planned dates), optional resume inputs "select_record_id" /
+    "confirm_continuity", and one or more PG-writable fields → value}. PG never invents a
+    booking decision and NEVER creates a row/stay: a zero safe match STOPs for manual
+    handoff (§20). This function is RE-ENTRANT — every call does a fresh validated read and
+    rebuilds; resume (see :func:`resume_path_a`) is just a re-invocation with the human's
+    answer, never "old preview + answer → execute". ``state`` (optional) supplies durable
+    grouping uncertainty for the ``needs_reconciliation`` gate (B4).
     """
     fact = dict(itinerary_fact)
     name = fact.pop("traveler", None)
     payment = fact.pop("payment", None)
+    context = fact.pop("context", None) or {}
+    select_record_id = fact.pop("select_record_id", None)
+    confirm_continuity = fact.pop("confirm_continuity", None)
     # Arrival is CONTEXT for the early-check-in decision, not a rooming edit. Flight/
     # airport arrival is never treated as hotel arrival (§16).
     hotel_arrival = fact.pop("hotel_arrival", None)
     flight_arrival = fact.pop("flight_arrival", None)
+    arrival_ctx = (hotel_arrival, flight_arrival)
     if not name:
         raise ValueError("itinerary fact requires a 'traveler'")
     edits = {k: v for k, v in fact.items() if k in fields.PG_WRITABLE}
@@ -253,21 +322,81 @@ def preview_path_a(store, itinerary_fact, state=None) -> Preview:
         return Preview("needs_review",
                        detail="non-trivial itinerary→rooming implication; propose/ask, "
                               "do not invent the booking decision (§20/§23)")
-    records, err = _validated(store)
+    records, err = _validated(store)      # fresh read every call (integrity/adoption gate)
     if err:
         return err
-    match = resolve_target(records, name, payment)
-    if match.status == "none":
-        return Preview("no_match",
-                       detail=f"no existing record matches {name!r}; never create a row/stay (§20)")
+
+    # ── Resume: human confirmed operational CONTINUITY of a specific existing record
+    # (PO-1). Re-resolve by rooming_record_id on the FRESH read — never by row/old preview.
+    binding_id = confirm_continuity or select_record_id
+    if binding_id:
+        rec = _find(records, binding_id)
+        if rec is None:
+            return Preview("no_match", detail=f"selected record {binding_id!r} is no longer "
+                           "present; re-resolve from a fresh read (§10)")
+        if not rec.eligible:
+            return Preview("no_match", detail=f"selected record {binding_id!r} is no longer an "
+                           "eligible operational record (ended); manual handoff (§3/§20)")
+        same_name = _canon(rec.get(fields.NAME)) == _canon(name)
+        if not same_name and not is_placeholder_name(rec.get(fields.NAME)):
+            # A nonblank-id row now holding a DIFFERENT real traveler = TRUE REPURPOSE.
+            # PG never auto-replaces an existing id or inherits its stay — STOP for
+            # identity-maintenance handoff (§3/§5, PRD amendment).
+            return Preview("needs_identity_repair", candidates=[rec.record_id],
+                           detail=f"row {rec.record_id!r} now holds a different operational "
+                           f"record ({rec.get(fields.NAME)!r}); identity-maintenance handoff — "
+                           "PG never auto-replaces an id or inherits its stay_id")
+        if select_record_id and not confirm_continuity and not same_name:
+            # Selection made, but a placeholder still needs explicit continuity confirmation.
+            return Preview("needs_continuity_confirmation", candidates=[rec.record_id],
+                           detail=f"confirm {rec.record_id!r} is the SAME operational record as "
+                           f"{name!r} before proceeding (§5/PO-1)")
+        if not same_name:
+            # SAME operational record confirmed, but NAME is still the placeholder: the
+            # human-owned identity must be updated in the Sheet first (PO-1). A bare
+            # acknowledgement is not enough — resume re-reads and re-checks.
+            return Preview("needs_manual_identity_update", candidates=[rec.record_id],
+                           detail=f"same record {rec.record_id!r} confirmed; update NAME (and "
+                           f"TITLE if needed) to {name!r} in the Sheet, then resume (PO-1)")
+        # NAME now matches the actual traveler → retain the existing id and build fresh.
+        return _build_path_a_preview(records, rec, name, edits, payment, context, arrival_ctx, state)
+
+    # ── Fresh resolution.
+    match = resolve_path_a(records, name, payment, context)
+    if match.status == "one":
+        return _build_path_a_preview(records, _find(records, match.record_id), name, edits,
+                                     payment, context, arrival_ctx, state)
     if match.status == "many":
         return Preview("needs_target_selection", candidates=match.candidates,
-                       detail=f"multiple records match {name!r}; human selects (§23)")
-    change = propose(records, {match.record_id: edits}, state=state)
-    arrival = hotel_arrival or flight_arrival
-    change.policy_flags.extend(_evaluate_decisions(
-        change, arrival=arrival, arrival_kind="hotel" if hotel_arrival else "flight", path="A"))
-    return _preview_from_change(change)
+                       detail=f"multiple existing records are plausible for {name!r}; human "
+                       "selects by rooming_record_id (§23)")
+    if match.status == "needs_context":
+        return Preview("needs_matching_context", candidates=match.candidates,
+                       detail=f"no exact name match for {name!r}, but existing placeholder(s) "
+                       "could match — supply position/title/payment/date context (§23)")
+    if match.status == "needs_continuity":
+        return Preview("needs_continuity_confirmation", candidates=[match.record_id],
+                       detail=f"placeholder {match.record_id!r} plausibly is {name!r}; confirm "
+                       "operational continuity before proceeding (§5/PO-1)")
+    return Preview("no_match",
+                   detail=f"no existing record safely matches {name!r}; never create a row/stay (§20)")
+
+
+def resume_path_a(store, itinerary_fact, *, select_record_id=None, confirm_continuity=None,
+                  state=None) -> Preview:
+    """Resume a Path A interrupt with the human's answer (§10, B11).
+
+    NOT "old preview + answer → execute": this re-invokes :func:`preview_path_a` (fresh
+    validated read → re-resolve the selected ``rooming_record_id`` → re-check evidence →
+    rebuild → a NEW preview needing a NEW confirmation). Deletion/eligibility-loss/duplicate
+    id/continuity ambiguity all STOP; a position-only move continues safely by id.
+    """
+    fact = dict(itinerary_fact)
+    if select_record_id is not None:
+        fact["select_record_id"] = select_record_id
+    if confirm_continuity is not None:
+        fact["confirm_continuity"] = confirm_continuity
+    return preview_path_a(store, fact, state=state)
 
 
 def confirm_preview(preview, *, grouping_disposition="", impact_dispositions=None,
@@ -280,7 +409,19 @@ def confirm_preview(preview, *, grouping_disposition="", impact_dispositions=Non
     retry keeps the SAME artifact — it does not re-authorize); a genuinely new human
     confirmation must start from a fresh preview. Raises the same Cancelled /
     GroupingNotYetEstablished / UnresolvedDecision signals as :func:`confirm`.
+
+    The authorization boundary (audit B11 §9): an UNRESOLVED matching/continuity/identity
+    interrupt is refused with :class:`ConfirmationBypassError` even if it carries a partial
+    change — it can only be resolved by a fresh-read resume, never confirmed. This does NOT
+    weaken legitimate gate resolution (R1 A/B/C, related-impact A/B/C, material decisions),
+    which flows through :func:`confirm` below.
     """
+    if preview.status in _UNRESOLVED_PREVIEW_STATUSES:
+        raise ConfirmationBypassError(
+            f"preview status {preview.status!r} is an unresolved pre-confirmation interrupt; "
+            "it carries no executable authorization and cannot be confirmed — resolve it via a "
+            "fresh-read resume first (§10/§23, B11)."
+        )
     if preview.change is None:
         raise ValueError(f"preview status {preview.status!r} has no committable change; "
                          "resolve it first (target selection / grouping / handoff).")

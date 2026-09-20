@@ -53,7 +53,9 @@ A read must **never** partially assign IDs and *then* discover a duplicate/schem
 
 - **Human row reorder / movement:** the ID stays with the **same record**.
 - **Normal field edits:** the ID stays the **same**.
-- **Row repurposed for a DIFFERENT traveler / stay:** the old operational record is considered **ended/deleted**; **assign a NEW `rooming_record_id`** to the new record.
+- **`rooming_record_id` identifies the lifecycle of ONE operational planning/booking record; physical row position AND NAME text alone are NOT identity.**
+- **Same operational continuity (retain the id):** a human-created placeholder that becomes an actual traveler on the **same** planned record — e.g. `TBD - DP / 6/10–6/15` → `John Smith / DP / 6/10–6/15`, human-confirmed as the SAME record — **keeps its existing `rooming_record_id`**. A NAME change **alone** does NOT imply repurpose.
+- **True repurpose (new id):** if the previous planned record ended/cancelled and the physical row is now reused for a **DIFFERENT** operational record, the old id must **NOT** carry forward and its old `stay_id` must **NOT** automatically transfer. PG in v1 **never auto-replaces an existing nonblank id** — it **STOPs for identity-maintenance manual handoff**; only after the identity is safely prepared may PG begin again from a **fresh validated read**.
 - **Continuity cannot be determined safely → STOP and ask the human.** Never guess.
 
 PG does **not** claim arbitrary spreadsheet restructuring is always safe. PG supports normal whole-record insert/delete/sort/restructure **only insofar as the identity-bearing record remains logically intact**. **Physical row number is never identity.**
@@ -484,6 +486,61 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 - **[impl]** ID/baseline/`operation_ref` **storage** mechanisms and identifier formats — delegated to implementation, not architecture blockers.
 
 Architecture safeguards are **not** presented as domain facts.
+
+## 30. Path A/B orchestration & operational-continuity identity [⌂] (G7/B11)
+
+Path A/B share the SAME downstream pipeline (RoomingChange → human gates → preview →
+explicit confirmation → dependency-aware revalidation → execution/recovery → verification
+→ NTF → drafts → ExecutionResult). Yellow stays separate/on-demand (§8) — a successful
+Path A/B execution never triggers refresh/reset. Path-specific behavior is confined to the
+pre-confirmation phase; there is ONE execution/idempotency path.
+
+1. **Human-created initial Rooming List prerequisite.** Before Path A/B operates, production/
+   travel staff have already manually prepared the provisional `01. Rooming List` with the
+   UPM (held rooms, expected crew list, confirmed names, human-created TBD/operational
+   placeholders, estimated dates, other provisional booking info). PG v1 does **not** create
+   the initial Rooming List, decide room holds, autonomously create missing traveler/stay
+   records, or assign/release TBD capacity. Path A reconciles later itinerary information
+   against **existing** records; a **zero safe match → STOP / manual handoff**, never a new
+   row/stay.
+2. **Operational-continuity identity (§3).** `rooming_record_id` identifies one operational
+   record's lifecycle; row position and NAME text alone are not identity. Same-record
+   continuity retains the id; true repurpose requires a new id via manual handoff (never
+   auto-replacement), and the old `stay_id` is **not** automatically inherited.
+3. **Placeholder → actual traveler = SAME id.** When a human confirms a placeholder is the
+   same operational record as an actual traveler, the existing `rooming_record_id` is
+   retained; NAME/TITLE stay human-owned (PG never business-writes them, §7).
+4. **Approved PO-1 manual NAME/TITLE update + fresh resume.** On same-record continuity PG
+   STOPs in a manual identity-update state; Myungha edits NAME (and TITLE where required)
+   directly in the Sheet. A plain "done" acknowledgement is **not** sufficient — PG performs
+   a **fresh validated read**, re-resolves the SAME `rooming_record_id`, verifies the required
+   Sheet state, and **rebuilds a NEW preview requiring a NEW confirmation**. An old
+   preview/authorization is never reused. TITLE already correct must not force a needless
+   edit — the gate verifies the required final state, not ceremonial edits.
+5. **True-repurpose identity-maintenance handoff.** A nonblank-id row now holding a different
+   operational record is not silently overwritten; PG STOPs for identity maintenance and only
+   resumes from a fresh validated read after the identity is safely prepared.
+6. **Old `stay_id` not automatically inherited** on repurpose (see 2/5).
+7. **Path A human-supplied matching context.** Itinerary data may lack production position/
+   title, so Path A accepts human matching evidence (position/title, payment segment, planned
+   dates, explicit candidate selection, other existing-record facts) to identify a plausible
+   existing candidate (e.g. itinerary `John Smith` + context `DP` may make `TBD - DP`
+   plausible). PG never infers a missing position/title as fact and never writes NAME/TITLE
+   from matching context. Evidence actually relied upon is protected through pre-write
+   revalidation (§10/§11); unrelated manual fields do not become blockers.
+8. **Matching-context vs no-match.** An exact-NAME miss is not automatically `no_match`: where
+   additional human evidence could plausibly identify an existing record, PG asks for matching
+   context; where multiple existing candidates remain, PG asks the human to select (bound to
+   `rooming_record_id`, never row); a plausible placeholder needs continuity confirmation.
+   `no_match` (manual handoff, create nothing) is used only when no safe existing record can
+   be identified after that resolution process.
+
+**Confirmation bypass is impossible:** an unresolved pre-confirmation interrupt (needs
+matching context / target selection / continuity confirmation / manual identity update /
+identity repair / no-match / non-trivial review) carries no executable authorization and is
+refused by the authorization boundary even if it holds a partial RoomingChange — it can only
+be resolved by a fresh-read resume. Legitimate gate resolution (R1 A/B/C, related-impact
+A/B/C, material policy decisions) is unaffected.
 
 ## 29. Status & open items
 
