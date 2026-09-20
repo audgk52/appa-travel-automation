@@ -96,12 +96,15 @@ class RoomingChange:
     authorized_decisions: dict = field(default_factory=dict)  # resolved §19/§16 decisions (§6/B6)
     confirmation_id: str = ""                            # unique per human confirmation instance (B7-A)
     confirmed_scope: dict = field(default_factory=dict)  # what the human approved
-    matching_evidence: dict = field(default_factory=dict)  # {comparable field -> EXPECTED value}
-    #   the Path A/B target selection/continuity actually relied on (§10/§11, B11). Stored as
-    #   explicit field→value expectations (not just names) so the confirmed/recovered artifact
-    #   cannot silently reinterpret its matching basis and a round-trip preserves it. NAME/
-    #   Reservation No. are already IDENTITY_FIELDS; this adds only the NARROW extra evidence
-    #   actually used (e.g. TITLE, Payment, planned dates); revalidation protects exactly these.
+    matching_evidence: dict = field(default_factory=dict)  # {record_id -> {comparable field ->
+    #   EXPECTED value}}. RECORD-SCOPED to the record whose Path A/B target selection/continuity
+    #   actually relied on that evidence (§10/§11, B11): a dependent record folded in later by a
+    #   related-impact disposition has its OWN (usually empty) entry and never inherits another
+    #   record's evidence. Stored as explicit field→value expectations (not just names) so the
+    #   confirmed/recovered artifact cannot silently reinterpret its matching basis and a
+    #   round-trip preserves it. NAME/Reservation No. are already IDENTITY_FIELDS; this adds only
+    #   the NARROW extra evidence actually used (e.g. TITLE, Payment, planned dates); revalidation
+    #   protects exactly these per record.
 
     def changed_records(self):
         return [rid for rid, d in self.field_deltas.items() if d]
