@@ -182,22 +182,71 @@ def test_subset_reconciliation_does_not_clear_uncertainty(make_store, tmp_path):
     assert not state.is_grouping_uncertain("rl-pers")
 
 
-def test_direct_subset_clear_primitive_is_refused(make_store, tmp_path):
-    # The previous Codex bypass: calling the low-level clear directly on a SUBSET of one
-    # recorded grouping scope. The state-transition primitive itself must refuse it — the
-    # complete recorded human-confirmed scope stays unresolved together.
+# ── Round 3.1 B4 final: no PUBLIC complete-scope clear bypass (enforced by API) ──
+
+def test_public_direct_clear_path_is_unavailable(make_store, tmp_path):
+    # (A) The previous bypass was a PUBLIC low-level clear that a caller could invoke with
+    # a complete record scope, clearing grouping uncertainty WITHOUT any fresh physical
+    # verification. That public primitive must not exist: reconciliation is available ONLY
+    # through grouping.py's verified path. StateStore exposes no public grouping-clear API.
+    inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
+    assert not hasattr(state, "resolve_grouping")              # public bypass removed
+    public_clearers = [n for n in dir(state)
+                       if not n.startswith("_") and "grouping" in n and
+                       ("clear" in n or "resolve" in n)]
+    assert public_clearers == []                               # no public clear surface
+
+    # After a genuinely fresh instance, both members remain grouping-uncertain and B still
+    # physically lacks the intended stay_id — nothing cleared it.
+    reloaded = StateStore(tmp_path / "s.json")
+    assert reloaded.is_grouping_uncertain("rl-prod")
+    assert reloaded.is_grouping_uncertain("rl-pers")
+    assert _stay(inner, "rl-pers") != result.stay_id           # B physically ungrouped
+
+
+def test_internal_transition_defensively_requires_scope_and_identity(make_store, tmp_path):
+    # Defense-in-depth on the INTERNAL transition (matched against durable recorded intent
+    # only — never physical Sheet values): it refuses a subset of the recorded scope and
+    # refuses a mismatched intended grouping identity, and it survives reload.
     inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
     with pytest.raises(GroupingScopeError):
-        state.resolve_grouping(["rl-prod"])                    # subset of scope {rl-prod, rl-pers}
+        state._resolve_grouping(["rl-prod"], result.stay_id)   # subset of {rl-prod, rl-pers}
+    with pytest.raises(GroupingScopeError):
+        state._resolve_grouping(["rl-prod", "rl-pers"], "not-the-confirmed-stay")  # bad identity
     assert state.is_grouping_uncertain("rl-prod")
     assert state.is_grouping_uncertain("rl-pers")
 
-    # It also survives a reload (durable), and full verified reconciliation clears both.
     reloaded = StateStore(tmp_path / "s.json")
     with pytest.raises(GroupingScopeError):
-        reloaded.resolve_grouping(["rl-pers"])
+        reloaded._resolve_grouping(["rl-pers"], result.stay_id)
+
+
+def test_supported_reconciliation_with_incomplete_physical_grouping_refuses(make_store, tmp_path):
+    # (B) Reconcile via the SUPPORTED grouping.py path while B is still physically wrong
+    # (its write fails again). Reconciliation must refuse: no established result, and the
+    # complete-scope grouping uncertainty stays durable across reload — no false resolve.
+    inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
+    redo = establish_grouping(FlakyGroupingStore(inner, fail_nth=2),   # B's write fails again
+                              ["rl-prod", "rl-pers"], stay_id=result.stay_id, state=state)
+    assert redo.established is False
+    assert _stay(inner, "rl-pers") != result.stay_id
+    reloaded = StateStore(tmp_path / "s.json")
+    assert reloaded.is_grouping_uncertain("rl-prod")
+    assert reloaded.is_grouping_uncertain("rl-pers")
+
+
+def test_supported_full_verified_reconciliation_clears_and_reload_confirms(make_store, tmp_path):
+    # (C) Once both members physically carry the intended stay_id, the supported path
+    # verifies the fresh read and clears the COMPLETE scope as one unit; a fresh reload
+    # confirms the uncertainty is gone and a DATE preview may proceed.
+    inner, state, result = _partial_grouping(make_store, tmp_path / "s.json")
     redo = establish_grouping(FlakyGroupingStore(inner, fail_nth=None),
-                              ["rl-prod", "rl-pers"], stay_id=result.stay_id, state=reloaded)
+                              ["rl-prod", "rl-pers"], stay_id=result.stay_id, state=state)
     assert redo.established
+    assert _stay(inner, "rl-pers") == result.stay_id
+    reloaded = StateStore(tmp_path / "s.json")
     assert not reloaded.is_grouping_uncertain("rl-prod")
     assert not reloaded.is_grouping_uncertain("rl-pers")
+    change = propose(inner.snapshot_records(), {"rl-prod": {fields.CHECK_OUT: "2026-06-21"}},
+                     state=reloaded)
+    assert change.requires_grouping_reconciliation is False

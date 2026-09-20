@@ -276,14 +276,24 @@ class StateStore:
         entry = self._data["grouping_uncertain"].get(record_id)
         return list(entry.get("members", [record_id])) if entry else []
 
-    def resolve_grouping(self, record_ids):
-        """Clear grouping uncertainty for a COMPLETE recorded scope only (audit B4).
+    def _resolve_grouping(self, record_ids, stay_id):
+        """INTERNAL verified-resolution transition (audit B4, R3.1 final). Deliberately
+        NOT public: there is no supported way for a caller to clear grouping uncertainty
+        by merely naming a complete record scope. The ONLY supported reconciliation path
+        is :func:`hotelops_pg.grouping.establish_grouping`, which fresh-reads the Rooming
+        List and verifies every member physically carries ``stay_id`` before invoking this.
 
-        The state-transition primitive itself refuses a subset clear: for every supplied
-        member it unions the complete recorded grouping scope and requires the caller to
-        cover it, so the low-level clear cannot bypass the reconciliation invariant. Fresh
-        Sheet verification that the members actually carry the intended stay_id remains
-        the caller's (grouping.py) responsibility before invoking this.
+        As defense-in-depth this transition still checks, against the DURABLE RECORDED
+        grouping intent only (StateStore never reads Google Sheets, §0):
+
+        * COMPLETE scope — for every supplied member it unions the recorded grouping scope
+          and requires the caller to cover it, so a subset can never clear the block;
+        * matching intended IDENTITY — every uncertain member must have been recorded under
+          the same intended ``stay_id`` being resolved, so a resolution cannot be committed
+          under a mismatched/stale grouping identity.
+
+        Physical verification that the rows actually carry ``stay_id`` is grouping.py's
+        exclusive responsibility and is NOT (and cannot be) re-done here.
         """
         requested = set(record_ids)
         required = set()
@@ -294,6 +304,15 @@ class StateStore:
                 f"cannot clear grouping uncertainty for a subset {sorted(requested)!r}; the "
                 f"complete recorded confirmed scope {sorted(required)!r} must resolve together (§5, B4)."
             )
+        for rid in requested:
+            entry = self._data["grouping_uncertain"].get(rid)
+            if entry is not None and entry.get("stay_id") != stay_id:
+                raise GroupingScopeError(
+                    f"cannot resolve grouping for {sorted(requested)!r} under stay_id {stay_id!r}: "
+                    f"the recorded intended grouping identity for {rid!r} is "
+                    f"{entry.get('stay_id')!r}; the verified grouping identity must match the "
+                    "recorded confirmed scope (§5, B4)."
+                )
         for rid in requested:
             self._data["grouping_uncertain"].pop(rid, None)
         self._flush()

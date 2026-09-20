@@ -115,5 +115,7 @@ def establish_grouping(store, member_record_ids, stay_id=None, state=None) -> Gr
                                      "grouping NOT established — reconcile before executing")
 
     if state is not None:
-        state.resolve_grouping(members)                  # explicit, verified resolution
+        # Only now — after the fresh read verified every member physically carries stay_id —
+        # invoke the INTERNAL verified transition, clearing the complete scope as one unit.
+        state._resolve_grouping(members, stay_id)        # explicit, verified resolution
     return GroupingResult("established", stay_id, members, written)
