@@ -6,9 +6,6 @@ matching / placeholder continuity / PO-1 manual identity update / true-repurpose
 lives BEFORE the shared confirmation boundary; nothing here creates a row or stay, and an
 unresolved interrupt can never be confirmed.
 """
-import hashlib
-import json
-
 import pytest
 
 from conftest import record
@@ -32,6 +29,7 @@ from hotelops_pg.spine import (
     execute_confirmed,
     preview_path_a,
     preview_quick_ops,
+    recover,
     resume_path_a,
     resume_quick_ops,
 )
@@ -566,19 +564,24 @@ def test_b1_primary_evidence_change_still_invalidates(make_store):
 
 # B2 — same-operation recovery accepts observed NEW for an evidence field that is also written.
 
-def test_b2_same_operation_recovery_accepts_observed_new(make_store, durable_state):
+def test_b2_restart_recover_from_payload_accepts_observed_new(make_store, durable_state):
+    # Exercises the REAL restart boundary: recover(operation_ref) reconstructs the confirmed
+    # artifact from the persisted payload (not the retained object) and still completes,
+    # accepting the observed NEW only via this operation's durable pre-write intent.
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
                                   **{fields.PAYMENT: "Production"})])
     confirmed = confirm_preview(preview_path_a(
         store, {"traveler": "James", "payment": "Production", fields.PAYMENT: "Personal"}),
         decisions={"payer": "approved"})                    # Payment change → payer decision
     op = confirmed.operation_ref
-    # Durable pre-write intent recorded, business write landed, then failure before
-    # completion (record left pending); a restart re-reads durable state.
-    durable_state.begin_record(op, "rl-a", {fields.PAYMENT: "Personal"})
+    # Stage the confirmed artifact durably + record same-op pre-write intent; the business
+    # write already landed; the operation was left unfinished (pending).
+    durable_state.stage_operation(op, to_payload(confirmed))
+    durable_state.begin_record(op, "rl-a", {fields.PAYMENT: "Personal"})   # flushes stage + intent
     store.apply_writes("rl-a", {fields.PAYMENT: "Personal"})
-    durable_state.reload()
-    res = execute_confirmed(store, durable_state, confirmed)     # recover SAME op
+
+    reloaded = StateStore(durable_state.path)               # a genuinely restarted state view
+    res = recover(store, reloaded, op)                      # reconstruct from persisted payload
     assert res.overall == "complete"
     assert store.snapshot_records()[0].get(fields.PAYMENT) == "Personal"
 
@@ -597,26 +600,14 @@ def test_b2_external_new_without_durable_intent_invalidates(make_store, durable_
 
 # B3 — legacy operation_ref compatibility (fixed fixture; independent oracle).
 
-def _legacy_operation_ref(payload):
-    """Replicates the PRE-G7 proposal_digest formula (no matching_evidence), independent
-    of the current implementation, so the fixture's expected ref is not self-generated."""
-    p = {
-        "targets": sorted(payload["confirmed_scope"].get("record_ids", payload["target_record_ids"])),
-        "deltas": {rid: sorted([(d[0], d[1], d[2]) for d in payload["field_deltas"].get(rid, [])])
-                   for rid in payload["target_record_ids"]},
-        "impacts": sorted((i["target_record_id"], i["suggested"][0], i["suggested"][2], i["disposition"])
-                          for i in payload["impacts"]),
-        "grouping_disposition": payload.get("grouping_disposition", ""),
-        "limited_check": payload.get("limited_check_authorized", False),
-        "decisions": {k: payload["authorized_decisions"][k] for k in sorted(payload["authorized_decisions"])},
-    }
-    blob = json.dumps(p, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return "op-" + hashlib.sha256(blob).hexdigest()[:24] + "-" + payload["confirmation_id"]
-
-
 # A hand-authored pre-G7 confirmed payload (NO matching_evidence key), shaped like the
-# closed-Foundation to_payload() at 33ba184.
+# closed-Foundation to_payload() at 33ba184. The operation_ref is the FROZEN historical
+# value: the actual pre-G7 (33ba184) digest of this exact proposal was bfbe5d991a3c4fced84c022a.
+# It is set literally (NOT computed by current code) so the regression compares the current
+# implementation against a fixed historical expectation.
+_LEGACY_OPERATION_REF = "op-bfbe5d991a3c4fced84c022a-legacyfixedconfirmation0001"
 _LEGACY_PAYLOAD = {
+    "operation_ref": _LEGACY_OPERATION_REF,
     "confirmation_id": "legacyfixedconfirmation0001",
     "stay_id": "S1",
     "target_record_ids": ["rl-a"],
@@ -632,13 +623,13 @@ _LEGACY_PAYLOAD = {
     "authorized_decisions": {},
     "confirmed_scope": {"record_ids": ["rl-a"], "intentional_exceptions": []},
 }
-_LEGACY_PAYLOAD["operation_ref"] = _legacy_operation_ref(_LEGACY_PAYLOAD)
 
 
-def test_b3_legacy_artifact_recomputes_original_operation_ref():
+def test_b3_legacy_artifact_recomputes_frozen_operation_ref():
     reconstructed = from_payload(_LEGACY_PAYLOAD)
     assert reconstructed.matching_evidence == {}                 # legacy: no evidence metadata
-    assert compute_operation_ref(reconstructed) == _LEGACY_PAYLOAD["operation_ref"]
+    # Current implementation must reproduce the FROZEN historical ref (not a runtime oracle).
+    assert compute_operation_ref(reconstructed) == _LEGACY_OPERATION_REF
 
 
 def test_b3_legacy_artifact_not_rejected_as_authorization_invalidated(make_store, durable_state):
@@ -646,6 +637,22 @@ def test_b3_legacy_artifact_not_rejected_as_authorization_invalidated(make_store
                                   **{fields.RESERVATION_NO: "R1"})])
     res = execute_confirmed(store, durable_state, from_payload(_LEGACY_PAYLOAD))
     assert res.overall != "authorization_invalidated"            # legacy ref still verifies
+    assert store.snapshot_records()[0].get(fields.REMARK) == "VIP"
+
+
+def test_b3_legacy_durable_recover_round_trip(make_store, durable_state):
+    # The original restart contract: persist a LEGACY confirmed artifact + pending intent,
+    # reload, and recover() by its frozen operation_ref — from_payload must tolerate the
+    # missing matching_evidence, the digest must recompute the frozen ref (no
+    # authorization_invalidated), and Foundation recovery proceeds normally.
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.RESERVATION_NO: "R1"})])
+    durable_state.stage_operation(_LEGACY_OPERATION_REF, dict(_LEGACY_PAYLOAD))
+    durable_state.begin_record(_LEGACY_OPERATION_REF, "rl-a", {fields.REMARK: "VIP"})  # flush
+
+    reloaded = StateStore(durable_state.path)
+    res = recover(store, reloaded, _LEGACY_OPERATION_REF)
+    assert res.overall != "authorization_invalidated"
     assert store.snapshot_records()[0].get(fields.REMARK) == "VIP"
 
 
@@ -687,6 +694,8 @@ def test_payment_conflict_resume_is_non_executable(make_store):
                                  "context": {"payment": "Personal"}, fields.REMARK: "VIP"},
                          confirm_continuity="rl-a")
     assert prev.status == "needs_review"
+    with pytest.raises(ConfirmationBypassError):             # cannot cross the auth boundary
+        confirm_preview(prev)
 
 
 def test_payment_equivalent_normalized_inputs_proceed(make_store):
