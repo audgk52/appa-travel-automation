@@ -17,6 +17,23 @@ from hotelops_pg.spine import (
 from hotelops_pg.state_store import StateStore
 
 
+class _FakeSheets:
+    """Captures batchUpdate bodies so a reset's render can be verified to have run."""
+
+    def __init__(self):
+        self.batch_bodies = []
+
+    def spreadsheets(self):
+        return self
+
+    def batchUpdate(self, spreadsheetId=None, body=None):
+        self.batch_bodies.append(body)
+        return self
+
+    def execute(self):
+        return {}
+
+
 def test_state_durable_property():
     assert StateStore().durable is False
     assert StateStore("/tmp/does-not-matter.json").durable is True
@@ -35,7 +52,7 @@ def test_operational_commit_rejects_non_durable_state(make_store):
 def test_operational_yellow_reset_rejects_non_durable_state(make_store):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     with pytest.raises(NonDurableStateError):
-        yellow_reset(store, StateStore())                    # fails before claiming activation
+        yellow_reset(store, StateStore(), service=_FakeSheets())  # fails before claiming activation
 
 
 def test_operational_commit_works_with_durable_state(make_store, durable_state):
@@ -46,5 +63,7 @@ def test_operational_commit_works_with_durable_state(make_store, durable_state):
 
 def test_operational_yellow_reset_works_with_durable_state(make_store, durable_state):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
-    res = yellow_reset(store, durable_state)
+    fake = _FakeSheets()
+    res = yellow_reset(store, durable_state, service=fake)
     assert res.status == "ok" and durable_state.has_baseline
+    assert fake.batch_bodies                                 # the render actually ran (no silent skip)

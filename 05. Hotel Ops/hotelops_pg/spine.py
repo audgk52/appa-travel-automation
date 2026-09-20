@@ -319,23 +319,74 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
                              hotel_confirmed=hotel_confirmed)
 
 
-def yellow_refresh(store, state):
-    """Operational yellow refresh — a §4 integrity entry point (B9-C).
+def yellow_refresh(store, state, service, sheet_id=0):
+    """Operational yellow refresh — validated observation → diff → RENDER, as ONE
+    composed flow (§8, B9-composition). A §4 integrity entry point (B9-C).
 
-    Runs the validated read (schema → unique headers → duplicate-id → adoption; a
-    duplicate id STOPs) and diffs the fresh, id-resolved records against the active
-    baseline. Retains R3 semantics: accurate as of this read, no real-time guarantee.
+    ``service`` (a Sheets service) is REQUIRED: an operational refresh must actually
+    deliver the formatting, so there is no diff-only call form that could silently report
+    a successful refresh without rendering. The observation is taken lazily INSIDE
+    ``baseline.refresh`` — so an UNCERTAIN authority (R3-C) or a NO-BASELINE state (§8,
+    AC-32) STOPs before any read/adoption and before any formatting request. The diff and
+    its render share ONE validated observation (values/ids/rows/columns coherent); a
+    duplicate ``rooming_record_id`` fails fast in that read, before rendering. A Sheets
+    ``batchUpdate`` failure propagates (refresh is not reported successful); the baseline
+    and its authority are never mutated by a refresh. Returns the ``RefreshResult``.
     """
     from hotelops_pg.baseline import refresh
-    return refresh(lambda: store.read_validated().records, state)
+    from hotelops_pg.yellow_sheets import apply_yellow
+
+    obs = {}
+
+    def observe():
+        records, headers = store.validated_observation()
+        obs["records"], obs["headers"] = records, headers
+        return records
+
+    result = refresh(observe, state)                 # UNCERTAIN / no-baseline STOP here
+    apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
+                 result, obs["records"], obs["headers"], sheet_id)
+    return result
 
 
-def yellow_reset(store, state, persist=None, render=None):
-    """Operational yellow reset — requires DURABLE state (B8) and a validated read (B9-C).
+def yellow_reset(store, state, service, persist=None, sheet_id=0):
+    """Operational yellow reset — DURABLE state (B8) + validated observation + real render.
 
-    Fails before claiming activation if handed non-durable state. The read runs the full
-    integrity/adoption gate so formatting never uses stale rows or a corrupt namespace.
+    Preserves the R3 §9 sequence: capture candidate → persist → verify/activate → NEW
+    baseline authoritative → FINAL comparison read → render from THAT snapshot. ``service``
+    is REQUIRED and is wired as the render step, so there is no ``render=None`` call form
+    that returns a successful reset without delivering the formatting. ``persist`` stays
+    injectable for durability tests; the real Sheets render is supplied by the operational
+    entry (distinct from any test-injected domain render).
+
+    Authority guard (R3-C, §9/AC-12c): while baseline authority is indeterminate, further
+    yellow refresh/reset are blocked and NO formatting request is issued. Failure semantics
+    flow from ``baseline.reset``: pre-activation persist failure → previous baseline stays
+    authoritative (``failed_before_activation``); a render (batchUpdate) failure AFTER
+    activation → new baseline retained, ``activated_render_incomplete`` (no rollback).
     """
     _require_durable(state, "yellow reset")
-    from hotelops_pg.baseline import reset
-    return reset(lambda: store.read_validated().records, state, persist=persist, render=render)
+    from hotelops_pg.baseline import AUTHORITY_UNCERTAIN, UncertainBaselineError, _diff, reset
+    from hotelops_pg.yellow_sheets import apply_yellow
+
+    if state.authority == AUTHORITY_UNCERTAIN:
+        raise UncertainBaselineError(
+            "baseline authority uncertain; yellow reset blocked until re-verified (R3-C, §9)"
+        )
+
+    obs = {}
+
+    def observe():
+        records, headers = store.validated_observation()
+        obs["records"], obs["headers"] = records, headers
+        return records
+
+    def render(final_records, baseline):
+        # ``final_records`` is baseline.reset's FINAL comparison read (obs is set by the
+        # same observe() call), so the diff and its paint use one coherent snapshot.
+        result = _diff(final_records, baseline)
+        apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
+                     result, obs["records"], obs["headers"], sheet_id)
+        return result
+
+    return reset(observe, state, persist=persist, render=render)

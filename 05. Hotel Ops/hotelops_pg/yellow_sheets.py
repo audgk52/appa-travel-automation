@@ -15,6 +15,7 @@ never recomputes it. It excludes metadata (``Row Number`` / ``rooming_record_id`
 explicit-only (called by the refresh/reset flows); PG never auto-renders (§8).
 """
 from hotelops_pg import fields
+from hotelops_pg.records import read_records
 
 # Domain-defined change-highlight color FFFFFF00 and the neutral clear color.
 YELLOW_RGB = {"red": 1.0, "green": 1.0, "blue": 0.0}
@@ -65,26 +66,41 @@ def build_yellow_requests(yellow_cells, id_to_row, field_to_col, sheet_id, data_
     return requests
 
 
-def render_yellow(store, refresh_result, sheet_id=0, service=None):
-    """Build (and optionally apply) yellow requests for the current sheet state.
+def apply_yellow(service, spreadsheet_id, refresh_result, records, field_to_col,
+                 sheet_id=0):
+    """Build clear+paint requests from a diff and the SAME observation it was computed
+    on, then (if ``service`` is given) apply them in ONE ``batchUpdate`` (§8/§9, B9).
 
-    Derives the id→row / field→col maps from the store's current grid, builds the
-    requests from ``refresh_result`` (never recomputing the diff), and — if a Sheets
-    ``service`` is supplied — applies them via a single ``batchUpdate``. Returns the
-    request list so callers/tests can inspect exactly what would be sent.
+    ``records`` and ``field_to_col`` come from a single coherent validated observation
+    (see :meth:`RoomingSheetStore.validated_observation`), so the diff's values, the
+    id→row mapping and the header→col mapping are mutually consistent — a record's yellow
+    is painted onto its CURRENT physical row/column and a deleted/unmapped id is never
+    smeared onto a replacement row. A Sheets ``batchUpdate`` failure PROPAGATES to the
+    caller (never silently swallowed). Returns the request list for inspection.
     """
-    grid = store.backend.read_grid()
-    headers = fields.resolve_headers(grid[0]) if grid else {}
-    records = store.snapshot_records()
     id_to_row = {r.record_id: r.row_index for r in records if r.record_id}
-    data_row_count = max(len(grid) - 1, 0)
-
+    data_row_count = len(records)
     requests = build_yellow_requests(
-        refresh_result.yellow, id_to_row, headers, sheet_id, data_row_count
+        refresh_result.yellow, id_to_row, field_to_col, sheet_id, data_row_count
     )
     if service is not None and requests:
         service.spreadsheets().batchUpdate(
-            spreadsheetId=getattr(store.backend, "spreadsheet_id", None),
-            body={"requests": requests},
+            spreadsheetId=spreadsheet_id, body={"requests": requests},
         ).execute()
     return requests
+
+
+def render_yellow(store, refresh_result, sheet_id=0, service=None):
+    """Convenience wrapper: read ONE coherent grid, then :func:`apply_yellow`.
+
+    Derives records + header map from a SINGLE grid read (never two mismatched reads),
+    builds the requests from ``refresh_result`` (never recomputing the diff), and — if a
+    Sheets ``service`` is supplied — applies them via one ``batchUpdate``. The operational
+    flow instead threads its own validated observation into :func:`apply_yellow`; this
+    wrapper stays for direct/unit use. Returns the request list.
+    """
+    grid = store.backend.read_grid()
+    headers = fields.resolve_headers(grid[0]) if grid else {}
+    records = read_records(grid, headers) if grid else []
+    return apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
+                        refresh_result, records, headers, sheet_id)

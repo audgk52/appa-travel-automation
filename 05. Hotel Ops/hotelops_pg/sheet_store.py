@@ -81,6 +81,22 @@ class RoomingSheetStore:
         headers = self._resolve(grid)
         return read_records(grid, headers)
 
+    def validated_observation(self):
+        """One coherent validated observation for a yellow diff AND its render (B9).
+
+        Runs the full validated-read gate (schema → duplicate-id STOP → eligible blank-id
+        adoption), then reads the grid ONCE and derives BOTH the header→col map and the
+        records from that single post-adoption grid. Returning them together lets the
+        operational yellow flow diff and render off ONE consistent view — values, ids,
+        physical rows and columns all mutually coherent — instead of re-reading at render
+        time. A duplicate/ambiguous ``rooming_record_id`` fails fast in ``read_validated``
+        here, BEFORE any rendering. Returns ``(records, headers)``.
+        """
+        self.read_validated()                          # schema + duplicate-id STOP + adoption
+        grid = self.backend.read_grid()                # single post-adoption grid
+        headers = self._resolve(grid)                  # header map from THIS grid
+        return read_records(grid, headers), headers
+
     def read_validated(self):
         """Validated read: schema → duplicate-id → eligible blank-id adoption (§2, §4).
 
