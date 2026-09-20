@@ -96,10 +96,12 @@ class RoomingChange:
     authorized_decisions: dict = field(default_factory=dict)  # resolved §19/§16 decisions (§6/B6)
     confirmation_id: str = ""                            # unique per human confirmation instance (B7-A)
     confirmed_scope: dict = field(default_factory=dict)  # what the human approved
-    matching_evidence: list = field(default_factory=list)  # comparable field names the Path A
-    #   target selection/continuity relied on (§10/§11, B11) — must survive to pre-write
-    #   revalidation. NAME/Reservation No. are already IDENTITY_FIELDS; this adds only the
-    #   NARROW extra evidence actually used (e.g. TITLE, Payment, planned dates).
+    matching_evidence: dict = field(default_factory=dict)  # {comparable field -> EXPECTED value}
+    #   the Path A/B target selection/continuity actually relied on (§10/§11, B11). Stored as
+    #   explicit field→value expectations (not just names) so the confirmed/recovered artifact
+    #   cannot silently reinterpret its matching basis and a round-trip preserves it. NAME/
+    #   Reservation No. are already IDENTITY_FIELDS; this adds only the NARROW extra evidence
+    #   actually used (e.g. TITLE, Payment, planned dates); revalidation protects exactly these.
 
     def changed_records(self):
         return [rid for rid, d in self.field_deltas.items() if d]
@@ -131,13 +133,13 @@ def propose(records, edits: dict, state=None, matching_evidence=None) -> Rooming
     and the proposal is flagged ``requires_grouping_reconciliation`` so downstream
     preview/confirmation STOP until the grouping is reconciled.
 
-    ``matching_evidence`` (optional, Path A/B11) records the NARROW set of comparable
-    field names the human-assisted target selection/continuity relied on beyond NAME/
-    Reservation No. (e.g. TITLE, Payment, planned dates); revalidation protects exactly
-    those through pre-write so a stale selection cannot execute if its evidence changed.
+    ``matching_evidence`` (optional, Path A/B11) maps the NARROW comparable fields the
+    human-assisted target selection/continuity relied on (beyond NAME/Reservation No.) to
+    their EXPECTED values (e.g. {TITLE: "DP", Payment: "Production"}); revalidation protects
+    exactly those through pre-write so a stale selection cannot execute if its evidence changed.
     """
     by_id = _record_map(records)
-    change = RoomingChange(matching_evidence=list(matching_evidence or []))
+    change = RoomingChange(matching_evidence=dict(matching_evidence or {}))
 
     stay_ids = set()
     for rid, edit in edits.items():
@@ -275,7 +277,8 @@ def proposal_digest(change: RoomingChange) -> str:
         "grouping_disposition": change.grouping_disposition,
         "limited_check": change.limited_check_authorized,
         "decisions": {k: change.authorized_decisions[k] for k in sorted(change.authorized_decisions)},
-        "matching_evidence": sorted(change.matching_evidence),
+        "matching_evidence": {k: change.matching_evidence[k]
+                              for k in sorted(change.matching_evidence)},
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:24]
@@ -321,7 +324,7 @@ def to_payload(change: RoomingChange) -> dict:
         "authorized_decisions": dict(change.authorized_decisions),
         "confirmed_scope": {k: (list(v) if isinstance(v, list) else v)
                             for k, v in change.confirmed_scope.items()},
-        "matching_evidence": list(change.matching_evidence),
+        "matching_evidence": dict(change.matching_evidence),
     }
 
 
@@ -344,7 +347,7 @@ def from_payload(payload: dict) -> RoomingChange:
         limited_check_authorized=payload.get("limited_check_authorized", False),
         authorized_decisions=dict(payload["authorized_decisions"]),
         confirmed_scope=dict(payload["confirmed_scope"]),
-        matching_evidence=list(payload.get("matching_evidence", [])),
+        matching_evidence=dict(payload.get("matching_evidence", {})),
     )
     change.detected_related_impacts = [RelatedImpact(
         kind=i["kind"], source_record_id=i["source_record_id"],

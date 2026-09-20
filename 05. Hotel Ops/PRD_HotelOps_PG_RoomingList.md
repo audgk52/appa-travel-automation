@@ -487,6 +487,20 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 
 Architecture safeguards are **not** presented as domain facts.
 
+## 29. Status & open items
+
+**Checkpoint status: ARCHITECTURE CHECKPOINT PASSED (Astra Medium final verdict — R1/R2/R3 CLOSED, no remaining architecture blockers).** Implementation is now authorized against this contract without inventing material product behavior. **Live Google Sheets verification and Myungha UAT remain separate gates and are NOT yet passed.** Resolved earlier and **no longer open**: automatic stay grouping (§5), yellow refresh timing (§8), rejected dependent-suggestion behavior (§6), row-repurpose identity (§3), reset safety (§9), revalidation dependency scope (§10), concurrency/atomicity expectations (§11, §14), confirmed-operation identity (§15), ID-adoption eligibility (§2), no automatic first baseline (§8), the architecture-governed yellow-comparison set incl. `NTF Request History` (§7), related-impact detector scope (§6), match resolution (§23), PG-owned durable-state boundary (§0). **Resolved in v3.2 — the three material blockers:** **R1** date change on unestablished grouping → A/B/C disposition (§6.1); **R2** concurrency reworded to never-*knowingly*-overwrite + accepted residual race, no absolute promise (§11); **R3** snapshot-based reset with baseline activation, render cutoff, and A/B/C failure semantics (§9). Also finalized the exact editable/comparable **field mapping** (§7), precise **cancellation** wording (§6/AC-15), and **minute-precision** early-check-in evaluation (§16).
+
+**Remaining unresolved — Product Owner (domain) inputs**
+1. **[M — deferred, non-blocking]** Payment vocabulary semantics (`NTF` vs `Paramount`/`Personal`/`Production`/`Self Pay`). v1 applies literal confirmed values only; taxonomy normalization is deferred, so this does not block the checkpoint.
+2. **[M — confirm]** The **current hotel's** actual HotelPolicy thresholds/percentages (the §16 bands are the approved default and treated as configurable).
+3. **[M — UAT-owned]** Final Kakao/email operational tone/style — owned by Myungha UAT (§19); truthful-minimum content is already specified, so this is not an architecture blocker.
+
+**Remaining unresolved — architecture**
+- **None blocking.** The yellow-comparison set is now **architecture-governed** (§7), not deferred. Residual items are purely **[impl]** decisions explicitly delegated to implementation — the **storage mechanisms and identifier formats** for `rooming_record_id` / baseline / `operation_ref` (§9, §15) — which are not architecture blockers.
+
+---
+
 ## 30. Path A/B orchestration & operational-continuity identity [⌂] (G7/B11)
 
 Path A/B share the SAME downstream pipeline (RoomingChange → human gates → preview →
@@ -541,20 +555,6 @@ identity repair / no-match / non-trivial review) carries no executable authoriza
 refused by the authorization boundary even if it holds a partial RoomingChange — it can only
 be resolved by a fresh-read resume. Legitimate gate resolution (R1 A/B/C, related-impact
 A/B/C, material policy decisions) is unaffected.
-
-## 29. Status & open items
-
-**Checkpoint status: ARCHITECTURE CHECKPOINT PASSED (Astra Medium final verdict — R1/R2/R3 CLOSED, no remaining architecture blockers).** Implementation is now authorized against this contract without inventing material product behavior. **Live Google Sheets verification and Myungha UAT remain separate gates and are NOT yet passed.** Resolved earlier and **no longer open**: automatic stay grouping (§5), yellow refresh timing (§8), rejected dependent-suggestion behavior (§6), row-repurpose identity (§3), reset safety (§9), revalidation dependency scope (§10), concurrency/atomicity expectations (§11, §14), confirmed-operation identity (§15), ID-adoption eligibility (§2), no automatic first baseline (§8), the architecture-governed yellow-comparison set incl. `NTF Request History` (§7), related-impact detector scope (§6), match resolution (§23), PG-owned durable-state boundary (§0). **Resolved in v3.2 — the three material blockers:** **R1** date change on unestablished grouping → A/B/C disposition (§6.1); **R2** concurrency reworded to never-*knowingly*-overwrite + accepted residual race, no absolute promise (§11); **R3** snapshot-based reset with baseline activation, render cutoff, and A/B/C failure semantics (§9). Also finalized the exact editable/comparable **field mapping** (§7), precise **cancellation** wording (§6/AC-15), and **minute-precision** early-check-in evaluation (§16).
-
-**Remaining unresolved — Product Owner (domain) inputs**
-1. **[M — deferred, non-blocking]** Payment vocabulary semantics (`NTF` vs `Paramount`/`Personal`/`Production`/`Self Pay`). v1 applies literal confirmed values only; taxonomy normalization is deferred, so this does not block the checkpoint.
-2. **[M — confirm]** The **current hotel's** actual HotelPolicy thresholds/percentages (the §16 bands are the approved default and treated as configurable).
-3. **[M — UAT-owned]** Final Kakao/email operational tone/style — owned by Myungha UAT (§19); truthful-minimum content is already specified, so this is not an architecture blocker.
-
-**Remaining unresolved — architecture**
-- **None blocking.** The yellow-comparison set is now **architecture-governed** (§7), not deferred. Residual items are purely **[impl]** decisions explicitly delegated to implementation — the **storage mechanisms and identifier formats** for `rooming_record_id` / baseline / `operation_ref` (§9, §15) — which are not architecture blockers.
-
----
 
 ## Change log — v3.2 cleanup (post-pass, non-blocking, 2026-09-16)
 - **Status → ARCHITECTURE CHECKPOINT PASSED** (Astra Medium: R1/R2/R3 CLOSED); implementation authorized. Live Sheets verification + UAT remain separate, not-yet-passed gates.

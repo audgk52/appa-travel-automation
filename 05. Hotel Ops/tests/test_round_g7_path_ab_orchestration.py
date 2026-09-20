@@ -86,7 +86,7 @@ def test_pathA_human_context_produces_plausible_candidate(make_store):
 def test_pathA_candidate_bound_by_record_id_not_row(make_store, durable_state):
     store, backend = make_store([
         record(name="Filler", record_id="rl-0", stay_id="S0"),
-        record(name="TBD - DP", record_id="rl-x", stay_id=""),
+        record(name="TBD - DP", record_id="rl-x", stay_id="", **{fields.TITLE: "DP"}),
     ])
     # Human confirms continuity, updates NAME, and the row physically MOVES before resume.
     _set(backend, "rl-x", fields.NAME, "John Smith")
@@ -105,7 +105,8 @@ def test_pathA_placeholder_requires_continuity_confirmation(make_store):
 
 
 def test_pathA_same_record_resolution_retains_existing_id(make_store):
-    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="")])
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="",
+                                        **{fields.TITLE: "DP"})])
     _set(backend, "rl-x", fields.NAME, "John Smith")
     prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
                                  fields.REMARK: "VIP"}, confirm_continuity="rl-x")
@@ -139,7 +140,8 @@ def test_pathA_acknowledgement_without_sheet_change_does_not_pass(make_store):
 
 
 def test_pathA_fresh_read_after_manual_update_gives_new_preview(make_store):
-    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="")])
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="",
+                                        **{fields.TITLE: "DP"})])
     _set(backend, "rl-x", fields.NAME, "John Smith")           # the required manual edit
     prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
                                  fields.REMARK: "VIP"}, confirm_continuity="rl-x")
@@ -345,3 +347,168 @@ def test_resolve_path_a_no_placeholder_is_none(make_store):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1")])
     recs = store.read_validated().records
     assert resolve_path_a(recs, "Nobody").status == "none"
+
+
+# ── Pre-Codex corrections ──────────────────────────────────────────────────────────
+
+# BLOCKER 1 — resume re-checks the matching evidence that justified the target.
+
+def test_resume_title_evidence_change_blocks_ready(make_store):
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="S1",
+                                        **{fields.TITLE: "DP", fields.PAYMENT: "Production"})])
+    _set(backend, "rl-x", fields.NAME, "John Smith")           # expected PO-1 NAME transition
+    _set(backend, "rl-x", fields.TITLE, "AC")                  # but TITLE evidence changed
+    prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
+                                 fields.REMARK: "VIP"}, confirm_continuity="rl-x")
+    assert prev.status != "ready"                              # must not build on changed evidence
+    assert prev.change is None
+
+
+def test_resume_payment_evidence_change_blocks_ready(make_store):
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="S1",
+                                        **{fields.TITLE: "DP", fields.PAYMENT: "Production"})])
+    _set(backend, "rl-x", fields.NAME, "John Smith")
+    _set(backend, "rl-x", fields.PAYMENT, "Personal")          # payment evidence changed
+    prev = resume_path_a(store, {"traveler": "John Smith", "payment": "Production",
+                                 fields.REMARK: "VIP"}, confirm_continuity="rl-x")
+    assert prev.status != "ready"
+
+
+def test_resume_unchanged_evidence_succeeds(make_store):
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="S1",
+                                        **{fields.TITLE: "DP", fields.PAYMENT: "Production"})])
+    _set(backend, "rl-x", fields.NAME, "John Smith")           # only the expected NAME transition
+    prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
+                                 "payment": "Production", fields.REMARK: "VIP"},
+                         confirm_continuity="rl-x")
+    assert prev.status == "ready"
+    assert prev.change.target_record_ids == ["rl-x"]
+
+
+def test_resume_row_move_with_unchanged_evidence_succeeds(make_store):
+    store, backend = make_store([
+        record(name="Other", record_id="rl-0", stay_id="S0"),
+        record(name="TBD - DP", record_id="rl-x", stay_id="S1", **{fields.TITLE: "DP"}),
+    ])
+    _set(backend, "rl-x", fields.NAME, "John Smith")
+    backend.grid[1], backend.grid[2] = backend.grid[2], backend.grid[1]     # physical move only
+    prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
+                                 fields.REMARK: "VIP"}, confirm_continuity="rl-x")
+    assert prev.status == "ready"
+    assert prev.change.target_record_ids == ["rl-x"]
+
+
+def test_resume_irrelevant_field_change_does_not_block(make_store):
+    store, backend = make_store([record(name="TBD - DP", record_id="rl-x", stay_id="S1",
+                                        **{fields.TITLE: "DP"})])
+    _set(backend, "rl-x", fields.NAME, "John Smith")
+    _set(backend, "rl-x", fields.RATE, "999")                  # irrelevant to the match
+    prev = resume_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
+                                 fields.REMARK: "VIP"}, confirm_continuity="rl-x")
+    assert prev.status == "ready"
+
+
+def test_exact_name_with_contradictory_context_not_ready(make_store):
+    store, _ = make_store([record(name="John Smith", record_id="rl-a", stay_id="S1",
+                                  **{fields.TITLE: "AC", fields.PAYMENT: "Production"})])
+    prev = preview_path_a(store, {"traveler": "John Smith", "context": {"title": "DP"},
+                                  fields.REMARK: "VIP"})       # title context contradicts TITLE=AC
+    assert prev.status != "ready"
+
+
+# BLOCKER 2 — Path B multi-match human selection is resumable.
+
+def _james_pair(make_store):
+    return make_store([
+        record(name="James", record_id="rl-a", stay_id="S1", **{fields.PAYMENT: "Production"}),
+        record(name="James", record_id="rl-b", stay_id="S2", **{fields.PAYMENT: "Personal"}),
+    ])
+
+
+def test_pathB_multimatch_selection_resumes_to_ready(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, _ = _james_pair(make_store)
+    assert preview_quick_ops(store, "James remark VIP").status == "needs_target_selection"
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-a")
+    assert prev.status == "ready"
+    assert prev.change.target_record_ids == ["rl-a"]
+
+
+def test_pathB_selection_binds_by_id_after_row_move(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, backend = _james_pair(make_store)
+    backend.grid[1], backend.grid[2] = backend.grid[2], backend.grid[1]
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-a")
+    assert prev.status == "ready"
+    assert prev.change.target_record_ids == ["rl-a"]
+
+
+def test_pathB_selection_deleted_candidate_stops(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, backend = _james_pair(make_store)
+    _set(backend, "rl-a", fields.ROOMING_RECORD_ID, "")        # effectively drop rl-a identity
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-a")
+    assert prev.status != "ready"
+    assert prev.change is None
+
+
+def test_pathB_arbitrary_non_candidate_id_refused(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, _ = make_store([
+        record(name="James", record_id="rl-a", stay_id="S1", **{fields.PAYMENT: "Production"}),
+        record(name="James", record_id="rl-b", stay_id="S2", **{fields.PAYMENT: "Personal"}),
+        record(name="Bob", record_id="rl-c", stay_id="S3"),
+    ])
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-c")  # Bob, not James
+    assert prev.status != "ready"
+    assert prev.change is None
+
+
+def test_pathB_selection_targeting_fact_changed_refused(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, backend = _james_pair(make_store)
+    _set(backend, "rl-a", fields.NAME, "Jamie")                # relevant targeting fact changed
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-a")
+    assert prev.status != "ready"
+
+
+def test_pathB_direct_confirm_of_multimatch_refused(make_store):
+    store, _ = _james_pair(make_store)
+    with pytest.raises(ConfirmationBypassError):
+        confirm_preview(preview_quick_ops(store, "James remark VIP"))
+
+
+def test_pathB_duplicate_id_at_selection_hits_integrity_stop(make_store):
+    from hotelops_pg.spine import resume_quick_ops
+    store, _ = make_store([
+        record(name="James", record_id="dup", stay_id="S1", **{fields.PAYMENT: "Production"}),
+        record(name="James", record_id="dup", stay_id="S2", **{fields.PAYMENT: "Personal"}),
+    ])
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="dup")
+    assert prev.status == "integrity_failed"
+
+
+def test_pathB_resume_uses_shared_execution_pipeline(make_store, durable_state):
+    from hotelops_pg.spine import resume_quick_ops
+    store, _ = _james_pair(make_store)
+    prev = resume_quick_ops(store, "James remark VIP", select_record_id="rl-a")
+    res = execute_confirmed(store, durable_state, confirm_preview(prev))
+    assert res.overall == "complete"
+
+
+# SHOULD FIX — matching dependency expectations survive payload round-trip.
+
+def test_matching_evidence_survives_payload_roundtrip(make_store):
+    from hotelops_pg.change import from_payload, to_payload
+    store, _ = make_store([record(name="John Smith", record_id="rl-a", stay_id="S1",
+                                  **{fields.TITLE: "DP", fields.PAYMENT: "Production"})])
+    prev = preview_path_a(store, {"traveler": "John Smith", "payment": "Production",
+                                  "context": {"title": "DP"}, fields.REMARK: "VIP"})
+    confirmed = confirm_preview(prev)
+    reconstructed = from_payload(to_payload(confirmed))
+    assert reconstructed.matching_evidence == confirmed.matching_evidence
+    assert reconstructed.matching_evidence.get(fields.TITLE) == "DP"
+    # And the reconstructed artifact still invalidates when the evidence changes.
+    fresh = store.snapshot_records()
+    fresh[0].values[fields.TITLE] = "AC"
+    assert revalidate(reconstructed, fresh).ok is False

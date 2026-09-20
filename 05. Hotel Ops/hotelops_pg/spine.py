@@ -249,41 +249,92 @@ def preview_quick_ops(store, instruction, state=None) -> Preview:
                        detail=f"no existing record matches {op.name!r}; manual handoff (§20/§23)")
     if match.status == "many":
         return Preview("needs_target_selection", candidates=match.candidates,
-                       detail=f"multiple records match {op.name!r}; human selects (§23)")
-    change = propose(records, {match.record_id: {op.field: op.new_value}}, state=state)
+                       detail=f"multiple records match {op.name!r}; human selects by "
+                       "rooming_record_id (§23) — resume via resume_quick_ops()")
+    return _build_quick_ops_preview(records, _find(records, match.record_id), op, state)
+
+
+def _build_quick_ops_preview(records, rec, op, state):
+    """Build a Path B proposal on a resolved record, recording payment (when used to
+    target) as protected matching evidence (§11)."""
+    evidence = {fields.PAYMENT: rec.get(fields.PAYMENT)} if op.payment else {}
+    change = propose(records, {rec.record_id: {op.field: op.new_value}}, state=state,
+                     matching_evidence=evidence)
     # Path B carries no arrival context and its payment is human-supplied, so only
     # context-genuine decisions (currently none for Quick Ops) are surfaced (B6/B11-C).
     change.policy_flags.extend(_evaluate_decisions(change, path="B"))
     return _preview_from_change(change)
 
 
+def resume_quick_ops(store, instruction, *, select_record_id, state=None) -> Preview:
+    """Resume a Path B ``needs_target_selection`` after the human picks a candidate (§23, B11).
+
+    Stateless fresh-read resume (never "old preview + answer → execute"): re-parse the
+    instruction, do a fresh validated read (duplicate id → integrity STOP), then bind the
+    chosen ``rooming_record_id`` ONLY if it still exists, is eligible, and remains consistent
+    with THIS instruction's targeting facts (NAME, and payment when the instruction supplied
+    one) — so a deleted candidate, an arbitrary non-candidate id, or a candidate whose
+    relevant fact changed is refused rather than silently retargeted. A physical row move is
+    fine (resolution is by id). On success it rebuilds a NEW RoomingChange → the SAME shared
+    confirm_preview → execute_confirmed pipeline.
+    """
+    op = parse_quick_ops(instruction)
+    records, err = _validated(store)
+    if err:
+        return err
+    rec = _find(records, select_record_id)
+    if rec is None or not rec.eligible:
+        return Preview("no_match", detail=f"selected record {select_record_id!r} is no longer "
+                       "present/eligible; re-resolve from a fresh read (§10)")
+    if _canon(rec.get(fields.NAME)) != _canon(op.name) or (
+            op.payment and _canon(rec.get(fields.PAYMENT)) != _canon(op.payment)):
+        return Preview("no_match", detail=f"selected record {select_record_id!r} is not a current "
+                       f"candidate for {op.name!r}{(' ' + op.payment) if op.payment else ''}; "
+                       "re-resolve (§23)")
+    return _build_quick_ops_preview(records, rec, op, state)
+
+
 def _find(records, record_id):
     return next((r for r in records if r.record_id == record_id), None)
 
 
-def _evidence_fields(payment, context):
-    """The NARROW comparable fields a Path A match/continuity relied on beyond NAME (§11).
+# Human-supplied Path A matching-context keys → the STABLE comparable field each pins.
+_CONTEXT_FIELD = {"title": fields.TITLE, "payment": fields.PAYMENT,
+                  "check_in": fields.CHECK_IN, "check_out": fields.CHECK_OUT}
 
-    Only fields the human ACTUALLY supplied as evidence become dependencies, so unrelated
-    manual fields never turn into revalidation blockers. Captured by name; their observed
-    values live in ``change.snapshots`` (``comparable()``), which revalidation checks.
+
+def _supplied_evidence(payment, context):
+    """{stable field → human-supplied expected value} for the evidence actually provided.
+
+    Only fields the human ACTUALLY supplied become dependencies, so unrelated manual fields
+    never turn into revalidation blockers. NAME is deliberately excluded — the placeholder→
+    actual NAME transition is the EXPECTED PO-1 change (§3), while position/payment/dates are
+    the stable facts a selection relied upon.
     """
-    context = context or {}
-    used = []
-    if context.get("payment") is not None or payment is not None:
-        used.append(fields.PAYMENT)
-    if context.get("title"):
-        used.append(fields.TITLE)
-    if context.get("check_in"):
-        used.append(fields.CHECK_IN)
-    if context.get("check_out"):
-        used.append(fields.CHECK_OUT)
-    return used
+    ctx = dict(context or {})
+    if payment is not None and ctx.get("payment") is None:
+        ctx["payment"] = payment
+    return {header: ctx[key] for key, header in _CONTEXT_FIELD.items() if ctx.get(key)}
 
 
 def _build_path_a_preview(records, rec, name, edits, payment, context, arrival_ctx, state):
-    """Build the proposal on a resolved EXISTING record, capturing matching evidence."""
-    evidence = _evidence_fields(payment, context)
+    """Build the proposal on a resolved EXISTING record — but only after RE-CHECKING that
+    the record still satisfies the human-supplied matching evidence that justified it (§11).
+
+    If any supplied evidence value no longer matches (e.g. TITLE/Payment/date changed under
+    us), the selection may no longer hold: STOP for re-resolution rather than silently
+    adopting the changed value as a new baseline. A NAME transition is NOT evidence here, so
+    the expected placeholder→actual change is allowed; a physical row move is allowed.
+    """
+    supplied = _supplied_evidence(payment, context)
+    for f, want in supplied.items():
+        if _canon(rec.get(f)) != _canon(want):
+            return Preview("needs_matching_context", candidates=[rec.record_id],
+                           detail=f"record {rec.record_id!r} no longer matches the supplied "
+                           f"{f!r} evidence (expected {want!r}, now {rec.get(f)!r}); re-resolve "
+                           "before proceeding (§10/§11)")
+    # Record the actual current values (verified == supplied) as explicit expectations.
+    evidence = {f: rec.get(f) for f in supplied}
     change = propose(records, {rec.record_id: edits}, state=state, matching_evidence=evidence)
     hotel_arrival, flight_arrival = arrival_ctx
     arrival = hotel_arrival or flight_arrival
