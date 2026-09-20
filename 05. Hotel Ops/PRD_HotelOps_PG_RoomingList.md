@@ -22,7 +22,7 @@
 - **[A]** `01. Rooming List` is a shared, human-edited **native Google Sheet** (Main Unit layout). Managed columns: `NAME, TITLE, Room No., TYPE OF ROOM, Rate, Check-in, Check-out, Total # of Nights, In Room?, Row Number, Payment, Reservation No., Airport Arrival, Late Check out, Remark, Request History`.
 - **[A]** Changes today are hand-applied and logged as `* MMDD <korean desc>` lines in **Request History**; changed cells are hand-highlighted **yellow** (`FFFFFF00`).
 - **[A]** Humans routinely insert/delete/sort/restructure rows. Physical row position is **not** stable and is never identity.
-- **[A]** `Row Number` (col K) `=IF(In Room?="Y", ROW())` is a physical-row echo, not a key. (Any separate workbook tab such as a payment-tracking sheet is **outside Hotel Ops PG's product boundary** — PG neither inspects, depends on, nor writes to it; see §21.)
+- **[A]** `Row Number` (col K) `=IF(In Room?="Y", ROW())` is a physical-row echo, not a key.
 - **[A]** Hotel communication is separate — concise Kakao/email summaries sent as an actionable checklist + paper trail (evidenced by dated `지배인님 공유본` snapshot tabs; actual messages not in any artifact).
 - **[M]** Human judgment gates payer/approval, early-check-in guarantees, and hotel-confirmation-dependent items.
 
@@ -354,21 +354,11 @@ Do **not** let one overall `complete / incomplete / uncertain` label hide which 
 - **Zero existing-record match:** **STOP / manual handoff**; do **not** silently create a new row or stay.
 - **Path A:** itinerary facts do **not** automatically imply every booking-date change; when the itinerary→rooming implication is non-trivial, **propose/ask** rather than inventing the booking decision.
 
-## 21. Payment Tracker is outside the product boundary [⌂]
-
-**Payment Tracker is not part of Hotel Ops PG's product boundary** — it is not deferred and not future scope. A separate payment-tracking tab (e.g. `02. Rooming List - Payment Trac`) may exist in a historical/operational workbook, but PG:
-
-- does **not** inspect, depend on, synchronize with, validate, or repair it;
-- does **not** emit any Payment Tracker warning (a normal date/`Payment` change produces none);
-- does **not** write to it.
-
-PG operates solely against the `01. Rooming List` contract (§0). The `Payment` **column** inside `01. Rooming List` is a normal PG-writable business field under the closed two-value vocabulary (§20) — not to be confused with any separate Payment Tracker tab. PG never deletes, renames, or mutates such a tab; it simply has no relationship with it.
-
 ## 22. Scope discipline
 
 **In scope [M]:** targeted **business** writes to `01. Rooming List` only (PG-owned durable operational state permitted, §0); Path A (itinerary reconciliation) + Path B (quick ops NL); updates to existing records/stays (date change, late checkout, room/room-type change, payment change, extension/shortening, remark); one `RoomingChange` (one or many records) → verified writes + nights recalc + per-record Request History append + drafts; explicit targeting selection; dependency-aware revalidation; on-demand yellow refresh/reset; detect→suggest→confirm related impacts with A/B/C disposition.
 
-**Out of scope [M]:** manager-shared snapshot tabs; late-checkout/parking/from-hotel tabs; speculative/TBD capacity planning; **all** PG-driven TBD assign/reassign/release; autonomous stay creation/split/merge; Telegram/Web implementation; actual Kakao/email **sending**; generalized cross-system canonical identity. (Payment Tracker is not in the product boundary at all, §21; the `Payment` field vocabulary is closed to Production/Personal, §20.)
+**Out of scope [M]:** manager-shared snapshot tabs; late-checkout/parking/from-hotel tabs; speculative/TBD capacity planning; **all** PG-driven TBD assign/reassign/release; autonomous stay creation/split/merge; Telegram/Web implementation; actual Kakao/email **sending**; generalized cross-system canonical identity. (The `Payment` field vocabulary is closed to Production/Personal, §20.)
 
 ## 23. Entry-path workflows
 
@@ -415,7 +405,6 @@ PG operates solely against the `01. Rooming List` contract (§0). The `Payment` 
 | BR-16 | Early check-in: HotelPolicy tiers vs ArrivalEstimate ranges surfaced separately; missing input → unresolved, no invented tier. Boundaries evaluated at **minute precision** (seconds normalized to the minute); destination-local midnight rollover preserved; bands unchanged. | **[M/⌂]** |
 | BR-17 | `Payment` is the closed two-value vocabulary `Production`/`Personal` (case/whitespace normalized, no alias inference); unsupported input is non-executable. Late-checkout has no default; TBD out of scope; zero match → handoff. | **[M/⌂]** |
 | BR-18 | Requested ≠ hotel-confirmed ≠ production-approved; drafts/records stay truthful to known status; hotel confirmation human-owned. | **[M/⌂]** |
-| BR-19 | Payment Tracker is not part of PG's product boundary: PG never inspects, depends on, warns about, or writes to it (§21). | **[⌂]** |
 | BR-20 | Targeted cell writes only; PG never auto-inserts/deletes/reorders/splits/merges rows. PG business-writable fields (v1) are exactly `Check-in`, `Check-out`, `Room No.`, `TYPE OF ROOM`, `Payment`, `Late Check out`, `Remark`; `NAME`, `TITLE`, `Rate`, `In Room?`, `Reservation No.`, `Airport Arrival` are visible/manual only; `Total # of Nights` is PG-derived; `Request History` is not a direct business-field edit but **is** PG-appended as a derived verified-agent output (§17). | **[⌂]** |
 
 ## 26. Acceptance criteria
@@ -450,7 +439,7 @@ PG operates solely against the `01. Rooming List` contract (§0). The `Payment` 
 - **AC-25 (zero-match manual handoff):** zero existing-record match stops with manual handoff; no row/stay is created.
 - **AC-26 (payment literal-value behavior):** a payment value is written only when explicitly supplied/confirmed; no equivalence inference across payment terms.
 - **AC-27 (missing late-checkout time):** a required-but-missing late-checkout time stays unresolved and asks the human; no default is invented.
-- **AC-28 (Payment closed vocabulary):** a `Payment` value of `Production`/`Personal` (case/whitespace-normalized) is accepted and applied as the canonical literal; any other value is non-executable (no confirmation, no write). No Payment Tracker warning is emitted for any date/`Payment` change (§21).
+- **AC-28 (Payment closed vocabulary):** a `Payment` value of `Production`/`Personal` (case/whitespace-normalized) is accepted and applied as the canonical literal; any other value is non-executable (no confirmation, no write).
 - **AC-29 (early-check-in boundary / missing input):** HotelPolicy tiers and ArrivalEstimate ranges are surfaced separately; a range crossing a threshold does not auto-select a tier; missing arrival/policy input stays unresolved. Boundary tests evaluate at **minute precision** (seconds normalized to the minute) and cover **destination-local midnight rollover** (e.g. `19:01–03:59`).
 - **AC-30 (schema safety):** required fields resolve by header name; missing/duplicate required header fails fast before any write; a resolvable column reorder still works.
 - **AC-31 (per-effect ExecutionResult):** ExecutionResult separately reports business writes, nights recalc, Request History append, verification, and draft generation; yellow is not among commit outputs.
@@ -598,6 +587,6 @@ A/B/C, material policy decisions) is unaffected.
 - **§11/§14** **No atomicity promise**; optimistic concurrency; explicit partial/uncertain recovery from observed state.
 - **§15** **Confirmed-operation identity** bound to one exact proposal version; retry recognition across restarts; equal values ≠ proof.
 - **§17/§18** History/ExecutionResult now **verified-state, per-effect**; yellow removed as a commit output.
-- **§19/§20/§21** Requested-vs-confirmed truthfulness; narrowed operation semantics (payment literal-only, no late-checkout default, TBD out, zero-match handoff, thin Path A); Payment Tracker residual-risk statement.
+- **§19/§20** Requested-vs-confirmed truthfulness; narrowed operation semantics (payment literal-only, no late-checkout default, TBD out, zero-match handoff, thin Path A).
 - **§26/§27** Acceptance criteria and test obligations expanded to the full remediation list; unit/integration vs live-Sheets vs UAT kept separate.
 - **§29** Open items pruned to genuinely unresolved PO/impl items; previously-open questions marked resolved.
