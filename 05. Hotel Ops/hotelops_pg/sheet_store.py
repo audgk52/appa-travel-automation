@@ -24,7 +24,9 @@ _USER_ENTERED_FIELDS = (fields.CHECK_IN, fields.CHECK_OUT, fields.NIGHTS)
 
 
 class InMemoryBackend:
-    """A list-of-rows grid (row 0 = header). Targeted, neighbour-preserving writes."""
+    """A list-of-rows grid modelling the physical sheet (which may have blank/title
+    preamble rows above the managed header, and unmanaged leading columns like column A).
+    Targeted, neighbour-preserving writes by ABSOLUTE physical (row, col)."""
 
     def __init__(self, grid=None):
         self.grid = [list(r) for r in (grid or [])]
@@ -40,17 +42,19 @@ class InMemoryBackend:
         while len(row) <= col_index:
             row.append("")
 
-    def write_cells(self, row_index, updates: dict):
-        """Write {col_index: value} in one row; other cells untouched (§7)."""
+    def write_cells(self, row_index, updates: dict, header_row=0):
+        """Write {col_index: value} at ABSOLUTE physical (row_index, col); other cells
+        untouched (§7). ``header_row`` is unused here (writes are already absolute)."""
         for col_index, value in updates.items():
             self._ensure(row_index, col_index)
             self.grid[row_index][col_index] = str(value)
             self.writes.append((row_index, col_index, str(value)))
 
-    def append_header_columns(self, names):
-        """Append new system columns to the header row, returning their indexes."""
-        self._ensure(0, 0)
-        header = self.grid[0]
+    def append_header_columns(self, names, header_row=0):
+        """Append new system columns to the ACTUAL managed header row, returning their
+        absolute indexes. Preamble/title rows are never touched."""
+        self._ensure(header_row, 0)
+        header = self.grid[header_row]
         out = {}
         for name in names:
             header.append(name)
@@ -62,24 +66,57 @@ class RoomingSheetStore:
     def __init__(self, backend):
         self.backend = backend
 
-    # --- reads ---------------------------------------------------------------
-    def _resolve(self, grid):
-        return fields.resolve_headers(grid[0]) if grid else fields.resolve_headers([])
+    # --- layout resolution (the ONE authoritative physical↔logical mapping) --
+    def _layout(self, grid):
+        """Locate the single managed-header row and resolve its ABSOLUTE column map (§12).
 
-    def _ensure_system_columns(self, grid, headers):
-        """Ensure hidden ``rooming_record_id``/``stay_id`` columns exist (PG-owned, §0)."""
+        The physical sheet may carry blank/title preamble rows above the managed header
+        and unmanaged leading columns (e.g. column A); the PG-managed logical grid always
+        has ``logical row 0 = managed header``. This bridges the two: it scans for the one
+        row that contains the exact required business headers (trim-only match, no fuzzy
+        aliases / template inference), then returns ``(header_row, headers)`` where
+        ``header_row`` is that row's PHYSICAL index and ``headers`` maps header name →
+        ABSOLUTE column index. Zero valid header rows → ``SchemaError``; more than one →
+        ``SchemaError`` (ambiguous) — both fail closed BEFORE any mutation. The single map
+        ``physical grid row = header_row + 1 + logical row_index`` governs every read,
+        adoption, targeted write and yellow range; no module recomputes its own offset.
+        """
+        found = None
+        for idx, row in enumerate(grid or []):
+            names = {str(c).strip() for c in row if str(c).strip()}
+            if all(h in names for h in fields.REQUIRED_BUSINESS_HEADERS):
+                if found is not None:
+                    raise fields.SchemaError(
+                        f"ambiguous managed layout: the required business headers resolve on "
+                        f"multiple rows (physical rows {found + 1} and {idx + 1}); refuse "
+                        "before any mutation (§12). Remove the duplicate header row and re-run."
+                    )
+                found = idx
+        if found is None:
+            raise fields.SchemaError(
+                "no managed-header row found (the required business headers are absent from "
+                "every row); refuse before any mutation (§12)."
+            )
+        return found, fields.resolve_headers(grid[found])   # resolve_headers re-checks dup/missing
+
+    def _ensure_system_columns(self, grid, headers, header_row):
+        """Ensure hidden ``rooming_record_id``/``stay_id`` columns exist on the ACTUAL
+        managed header row (PG-owned, §0); preamble/title rows are never modified."""
         missing = [h for h in fields.SYSTEM_HEADERS if h not in headers]
         if missing:
-            added = self.backend.append_header_columns(missing)
+            added = self.backend.append_header_columns(missing, header_row)
             headers = dict(headers)
             headers.update(added)
         return headers
 
     def snapshot_records(self):
-        """Resolve headers + read records WITHOUT adoption writes (revalidation/verify)."""
+        """Resolve layout + read records WITHOUT adoption writes (revalidation/verify).
+
+        Records are read from the logical header-first view (``grid[header_row:]``) so
+        ``record.row_index`` is the 0-based LOGICAL data index, exactly as before."""
         grid = self.backend.read_grid()
-        headers = self._resolve(grid)
-        return read_records(grid, headers)
+        header_row, headers = self._layout(grid)
+        return read_records(grid[header_row:], headers)
 
     def validated_observation(self):
         """One coherent, integrity-VALIDATED observation for a yellow diff AND its render
@@ -94,30 +131,34 @@ class RoomingSheetStore:
         edit occurring AFTER this observation remains the accepted residual race (§9/§11).
         """
         result = self.read_validated()                 # schema + duplicate-id STOP + adoption
-        return result.records, result.headers          # the validated, post-adoption view
+        return result.records, result.headers, result.header_row   # validated, post-adoption view
 
     def read_validated(self):
         """Validated read: schema → duplicate-id → eligible blank-id adoption (§2, §4).
 
         Adoption cells are written only AFTER whole-sheet validation succeeds, so a
         read never partial-assigns then fails. Returns the post-adoption
-        :class:`~hotelops_pg.adoption.AdoptionResult`.
+        :class:`~hotelops_pg.adoption.AdoptionResult` (with its physical ``header_row``).
         """
         grid = self.backend.read_grid()
-        headers = self._resolve(grid)                 # step 1: schema (may raise)
-        headers = self._ensure_system_columns(grid, headers)
+        header_row, headers = self._layout(grid)      # step 1: locate + schema (may raise)
+        headers = self._ensure_system_columns(grid, headers, header_row)
         grid = self.backend.read_grid()               # re-read after header columns added
-        result = plan_adoption(grid)                  # steps 1–3 validate; plan adoption
+        header_row, headers = self._layout(grid)      # re-locate (stable row, now w/ system cols)
+        result = plan_adoption(grid[header_row:])     # steps 1–3 validate on the logical view
         id_col = headers[fields.ROOMING_RECORD_ID]
         for row_index, new_id in result.assignments.items():
-            self.backend.write_cells(row_index + 1, {id_col: new_id})  # +1 for header row
+            # logical data row_index → physical grid row = header_row + 1 + row_index.
+            self.backend.write_cells(header_row + 1 + row_index, {id_col: new_id},
+                                     header_row=header_row)
+        result.header_row = header_row
         return result
 
     # --- writes --------------------------------------------------------------
-    def _locate(self, grid, headers, record_id):
-        """All grid-row indexes carrying ``record_id`` (audit B2: never first-match)."""
+    def _locate(self, grid, headers, header_row, record_id):
+        """All PHYSICAL grid-row indexes carrying ``record_id`` (audit B2: never first-match)."""
         id_col = headers[fields.ROOMING_RECORD_ID]
-        return [i + 1 for i, row in enumerate(grid[1:])
+        return [header_row + 1 + i for i, row in enumerate(grid[header_row + 1:])
                 if (row[id_col] if id_col < len(row) else "") == record_id]
 
     def apply_writes(self, record_id, updates: dict) -> bool:
@@ -137,15 +178,15 @@ class RoomingSheetStore:
                 f"writable set is {fields.PG_PERSISTABLE!r}."
             )
         grid = self.backend.read_grid()
-        headers = self._resolve(grid)
-        matches = self._locate(grid, headers, record_id)
+        header_row, headers = self._layout(grid)
+        matches = self._locate(grid, headers, header_row, record_id)
         if len(matches) > 1:
             # Corrupt identity namespace — never silently pick one of several (B2).
             raise DuplicateRecordIdError({record_id})
         if not matches:
             return False
         col_updates = {headers[f]: v for f, v in updates.items() if f in headers}
-        self.backend.write_cells(matches[0], col_updates)
+        self.backend.write_cells(matches[0], col_updates, header_row=header_row)
         return True
 
 
@@ -178,13 +219,16 @@ class GoogleBackend:
         resp = self._values().get(spreadsheetId=self.spreadsheet_id, range=self.tab).execute()
         return [list(r) for r in (resp.get("values") or [])]
 
-    def write_cells(self, row_index, updates: dict):
-        # Type-aware writes (audit B10): booked dates and the derived nights are
-        # written USER_ENTERED so Sheets keeps real date / numeric semantics; every
-        # other field is written RAW so text stays literal text (a Remark or room
-        # number is never reinterpreted as a formula/number). PG only writes its own
-        # targeted business cells, so neighbouring formulas/human fields are untouched.
-        header = self.read_grid()[0] if self.read_grid() else []
+    def write_cells(self, row_index, updates: dict, header_row=0):
+        # ``row_index`` is the ABSOLUTE physical grid index (0-based); the A1 row is
+        # ``row_index + 1``. Type-aware writes (audit B10): booked dates and the derived
+        # nights are written USER_ENTERED so Sheets keeps real date / numeric semantics;
+        # every other field is written RAW so text stays literal (a Remark/room number is
+        # never reinterpreted). The field for a column is resolved from the ACTUAL managed
+        # header row (``header_row``), not an assumed row 1. PG only writes its own targeted
+        # cells, so neighbouring formulas/human fields and preamble rows are untouched.
+        grid = self.read_grid()
+        header = grid[header_row] if header_row < len(grid) else []
         for col_index, value in updates.items():
             field_name = header[col_index] if col_index < len(header) else ""
             option = "USER_ENTERED" if field_name in _USER_ENTERED_FIELDS else "RAW"
@@ -194,13 +238,13 @@ class GoogleBackend:
                 valueInputOption=option, body={"values": [[str(value)]]},
             ).execute()
 
-    def append_header_columns(self, names):
+    def append_header_columns(self, names, header_row=0):
         grid = self.read_grid()
-        header = grid[0] if grid else []
+        header = grid[header_row] if header_row < len(grid) else []
         out = {}
         for offset, name in enumerate(names):
             col = len(header) + offset
-            a1 = f"{self.tab}!{self._a1_col(col)}1"
+            a1 = f"{self.tab}!{self._a1_col(col)}{header_row + 1}"   # write onto the header row
             self._values().update(
                 spreadsheetId=self.spreadsheet_id, range=a1,
                 valueInputOption="RAW", body={"values": [[name]]},

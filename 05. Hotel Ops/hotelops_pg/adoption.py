@@ -39,9 +39,12 @@ class DuplicateRecordIdError(ValueError):
 class AdoptionResult:
     """Outcome of the validated read (PRD §2)."""
 
-    headers: dict                          # header name -> column index
+    headers: dict                          # header name -> ABSOLUTE column index
     records: list                          # RoomingRecord list (ids filled post-adoption)
-    assignments: dict = field(default_factory=dict)  # row_index -> newly minted id
+    assignments: dict = field(default_factory=dict)  # LOGICAL data row_index -> newly minted id
+    header_row: int = 0                    # PHYSICAL grid index of the managed header row
+    #   (the store fills this; plan_adoption is layout-agnostic and leaves it 0). The
+    #   logical→physical map is: physical grid row = header_row + 1 + logical row_index.
 
     @property
     def adopted_row_indexes(self):

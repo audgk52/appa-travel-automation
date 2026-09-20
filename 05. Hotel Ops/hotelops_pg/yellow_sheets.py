@@ -40,34 +40,39 @@ def _bg_request(sheet_id, start_row, end_row, col, color):
     }
 
 
-def build_yellow_requests(yellow_cells, id_to_row, field_to_col, sheet_id, data_row_count):
+def build_yellow_requests(yellow_cells, id_to_row, field_to_col, sheet_id, data_row_count,
+                          header_row=0):
     """Build clear+render batchUpdate requests from a diff (§8/§9).
 
-    ``id_to_row`` maps record_id → 0-based DATA-row index (header excluded);
-    ``field_to_col`` maps header name → 0-based column index. Only comparable columns
-    are cleared/rendered; metadata columns are never touched.
+    ``id_to_row`` maps record_id → 0-based LOGICAL data-row index; ``field_to_col`` maps
+    header name → ABSOLUTE column index; ``header_row`` is the PHYSICAL grid index of the
+    managed header. Every range is physical: the data region starts at ``header_row + 1``,
+    so preamble/title/header rows are never cleared or painted, and unmanaged columns
+    (metadata) are never touched.
     """
     requests = []
-    # 1. Clear prior change-yellow across the comparable columns (data rows only).
+    data_start = header_row + 1                          # first physical data row
+    # 1. Clear prior change-yellow across the comparable columns (physical data rows only).
     if data_row_count > 0:
         for field in fields.YELLOW_COMPARISON:
             col = field_to_col.get(field)
             if col is None:
                 continue
-            requests.append(_bg_request(sheet_id, 1, 1 + data_row_count, col, CLEAR_RGB))
-    # 2. Render each changed / new comparable cell yellow.
+            requests.append(_bg_request(sheet_id, data_start, data_start + data_row_count,
+                                        col, CLEAR_RGB))
+    # 2. Render each changed / new comparable cell yellow at its physical row.
     for cell in yellow_cells:
         row = id_to_row.get(cell.record_id)
         col = field_to_col.get(cell.field)
         if row is None or col is None:
             continue                                    # deleted/unmapped → never highlighted
-        grid_row = row + 1                              # +1 for the header row
+        grid_row = data_start + row                     # logical→physical data row
         requests.append(_bg_request(sheet_id, grid_row, grid_row + 1, col, YELLOW_RGB))
     return requests
 
 
 def apply_yellow(service, spreadsheet_id, refresh_result, records, field_to_col,
-                 sheet_id=0):
+                 sheet_id=0, header_row=0):
     """Build clear+paint requests from a diff and the SAME observation it was computed
     on, then (if ``service`` is given) apply them in ONE ``batchUpdate`` (§8/§9, B9).
 
@@ -81,7 +86,7 @@ def apply_yellow(service, spreadsheet_id, refresh_result, records, field_to_col,
     id_to_row = {r.record_id: r.row_index for r in records if r.record_id}
     data_row_count = len(records)
     requests = build_yellow_requests(
-        refresh_result.yellow, id_to_row, field_to_col, sheet_id, data_row_count
+        refresh_result.yellow, id_to_row, field_to_col, sheet_id, data_row_count, header_row
     )
     if service is not None and requests:
         service.spreadsheets().batchUpdate(
@@ -100,7 +105,9 @@ def render_yellow(store, refresh_result, sheet_id=0, service=None):
     wrapper stays for direct/unit use. Returns the request list.
     """
     grid = store.backend.read_grid()
-    headers = fields.resolve_headers(grid[0]) if grid else {}
-    records = read_records(grid, headers) if grid else []
+    if not grid:
+        return []
+    header_row, headers = store._layout(grid)
+    records = read_records(grid[header_row:], headers)
     return apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
-                        refresh_result, records, headers, sheet_id)
+                        refresh_result, records, headers, sheet_id, header_row)

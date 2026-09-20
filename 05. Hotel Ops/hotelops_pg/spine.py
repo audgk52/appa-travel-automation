@@ -591,13 +591,13 @@ def yellow_refresh(store, state, service, sheet_id):
     obs = {}
 
     def observe():
-        records, headers = store.validated_observation()
-        obs["records"], obs["headers"] = records, headers
+        records, headers, header_row = store.validated_observation()
+        obs["records"], obs["headers"], obs["header_row"] = records, headers, header_row
         return records
 
     result = refresh(observe, state)                 # UNCERTAIN / no-baseline STOP here
     apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
-                 result, obs["records"], obs["headers"], sheet_id)
+                 result, obs["records"], obs["headers"], sheet_id, obs["header_row"])
     return result
 
 
@@ -633,8 +633,8 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     obs = {}
 
     def observe():
-        records, headers = store.validated_observation()
-        obs["records"], obs["headers"] = records, headers
+        records, headers, header_row = store.validated_observation()
+        obs["records"], obs["headers"], obs["header_row"] = records, headers, header_row
         return records
 
     def render(final_records, baseline):
@@ -642,7 +642,7 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
         # same observe() call), so the diff and its paint use one coherent snapshot.
         result = _diff(final_records, baseline)
         apply_yellow(service, getattr(store.backend, "spreadsheet_id", None),
-                     result, obs["records"], obs["headers"], sheet_id)
+                     result, obs["records"], obs["headers"], sheet_id, obs["header_row"])
         return result
 
     return reset(observe, state, persist=persist, render=render)
