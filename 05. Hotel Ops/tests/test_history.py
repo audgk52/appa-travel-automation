@@ -1,6 +1,6 @@
-"""NTF Request History — verified-effect append (PRD §17; AC-23).
+"""Request History — verified-effect append (PRD §17; AC-23).
 
-A concise per-record line for verified business effects only; NTF/derived-only
+A concise per-record line for verified business effects only; Request-History/derived-only
 deltas produce no line (nothing invented); append is append-only.
 """
 from hotelops_pg import fields
@@ -19,9 +19,9 @@ def test_entry_renders_verified_business_effects():
     assert "nights 2→3" in line
 
 
-def test_entry_excludes_ntf_history_delta():
-    # §17: PG never authors a manual-edit reason; an NTF-only delta yields no line.
-    deltas = [FieldDelta(fields.NTF_HISTORY, "", "* 0610 manual note")]
+def test_entry_excludes_request_history_delta():
+    # §17: PG never authors a manual-edit reason; an Request-History-only delta yields no line.
+    deltas = [FieldDelta(fields.REQUEST_HISTORY, "", "* 0610 manual note")]
     assert history_entry("0610", deltas) == ""
 
 

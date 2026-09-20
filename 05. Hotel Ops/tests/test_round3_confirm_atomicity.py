@@ -3,7 +3,7 @@
 Disposition-A dependent deltas were folded into the mutable proposal BEFORE the
 unresolved-decision gate was checked. A confirmation that raises UnresolvedDecision
 therefore left the proposal already mutated, so a retry appended DUPLICATE dependent
-deltas (and duplicate NTF wording downstream). Confirmation must be all-or-nothing.
+deltas (and duplicate Request History wording downstream). Confirmation must be all-or-nothing.
 """
 import pytest
 

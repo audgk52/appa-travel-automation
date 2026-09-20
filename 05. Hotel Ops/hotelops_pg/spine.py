@@ -6,7 +6,7 @@ caller from skipping a required safety stage:
     input → validated read (integrity/adoption) → target resolution → RoomingChange
     build → R1 handling → related-impact detection/disposition → policy/decision
     resolution → preview → explicit confirmation → dependency-aware revalidation →
-    targeted execution → post-write verification → verified NTF → drafts
+    targeted execution → post-write verification → verified Request History → drafts
 
 Yellow stays separate/on-demand (§8). This is NOT a UI or a generalized NLP platform:
 Path B accepts a NARROW, explicit Quick Ops grammar; Path A accepts narrow structured
@@ -108,7 +108,7 @@ def _require_render_target(service, sheet_id, flow):
 
 # Payment vocabulary is PRD-enumerated (§20). Recognizing a trailing payment token
 # disambiguates "<Name> <Payment> <op>" WITHOUT inferring equivalence between terms.
-_KNOWN_PAYMENTS = {"production", "paramount", "ntf", "personal", "self pay", "selfpay"}
+_KNOWN_PAYMENTS = {"production", "personal"}   # closed Payment vocabulary (§20)
 _ARROW = r"(?:->|→|=>|to)"
 
 
@@ -258,8 +258,11 @@ def _build_quick_ops_preview(records, rec, op, state):
     """Build a Path B proposal on a resolved record, recording payment (when used to
     target) as protected matching evidence (§11)."""
     evidence = {rec.record_id: {fields.PAYMENT: rec.get(fields.PAYMENT)}} if op.payment else {}
-    change = propose(records, {rec.record_id: {op.field: op.new_value}}, state=state,
-                     matching_evidence=evidence)
+    try:
+        change = propose(records, {rec.record_id: {op.field: op.new_value}}, state=state,
+                         matching_evidence=evidence)
+    except fields.InvalidPaymentError as exc:
+        return Preview("needs_review", detail=str(exc))   # unsupported Payment → non-executable (§20)
     # Path B carries no arrival context and its payment is human-supplied, so only
     # context-genuine decisions (currently none for Quick Ops) are surfaced (B6/B11-C).
     change.policy_flags.extend(_evaluate_decisions(change, path="B"))
@@ -336,7 +339,10 @@ def _build_path_a_preview(records, rec, name, edits, payment, context, arrival_c
     # Record the actual current values (verified == supplied) as explicit expectations,
     # RECORD-SCOPED to this target only (B1).
     evidence = {rec.record_id: {f: rec.get(f) for f in supplied}} if supplied else {}
-    change = propose(records, {rec.record_id: edits}, state=state, matching_evidence=evidence)
+    try:
+        change = propose(records, {rec.record_id: edits}, state=state, matching_evidence=evidence)
+    except fields.InvalidPaymentError as exc:
+        return Preview("needs_review", detail=str(exc))   # unsupported Payment → non-executable (§20)
     hotel_arrival, flight_arrival = arrival_ctx
     arrival = hotel_arrival or flight_arrival
     change.policy_flags.extend(_evaluate_decisions(
@@ -369,12 +375,20 @@ def preview_path_a(store, itinerary_fact, state=None) -> Preview:
     arrival_ctx = (hotel_arrival, flight_arrival)
     if not name:
         raise ValueError("itinerary fact requires a 'traveler'")
-    # Conflicting payment inputs (top-level ``payment`` vs ``context.payment``) are NOT
-    # silently reconciled: if both are supplied and canonically DIFFERENT it is an explicit
-    # non-executable conflict (no ready proposal / confirmation / write). Canonically
-    # equivalent values are the same supplied fact and proceed. Applies to fresh + resume.
+    # Closed Payment vocabulary (§20): canonicalize/validate supplied payment inputs up
+    # front. An unsupported value is non-executable; conflicting canonical values are an
+    # explicit non-executable conflict (never silently reconciled); canonically equivalent
+    # values (e.g. production/Production) are the same fact and proceed. Fresh + resume.
+    raw_ctx_payment = context.get("payment")
+    try:
+        payment = fields.canonical_payment(payment) if payment is not None else None
+        if raw_ctx_payment is not None:
+            context = dict(context)
+            context["payment"] = fields.canonical_payment(raw_ctx_payment)
+    except fields.InvalidPaymentError as exc:
+        return Preview("needs_review", detail=str(exc))
     ctx_payment = context.get("payment")
-    if payment is not None and ctx_payment is not None and _canon(payment) != _canon(ctx_payment):
+    if payment is not None and ctx_payment is not None and payment != ctx_payment:
         return Preview("needs_review",
                        detail=f"conflicting payment inputs (payment={payment!r} vs "
                        f"context.payment={ctx_payment!r}); resolve to one value before "
@@ -534,7 +548,7 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,
            limited_check_authorized=False, decisions=None, request_date="MMDD",
            hotel_confirmed=False):
-    """Confirm → revalidate → execute → verify → NTF → drafts (§23).
+    """Confirm → revalidate → execute → verify → Request History → drafts (§23).
 
     Convenience over :func:`confirm_preview` + :func:`execute_confirmed`. Committing the
     SAME preview twice is idempotent (B7-A): the second call re-confirms the already-

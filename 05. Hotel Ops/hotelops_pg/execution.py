@@ -6,13 +6,13 @@ KNOWINGLY overwrites observed newer state (revalidation stops first), but a
 post-revalidation race edit is an accepted residual risk — post-write verification
 confirms only that the intended write landed, not that no intervening edit was lost.
 
-Outputs are truthful and per-effect (§18): business writes, nights recalc, NTF
+Outputs are truthful and per-effect (§18): business writes, nights recalc, Request History
 append, verification, and drafts are reported separately; ``overall`` is
 ``complete`` / ``incomplete`` / ``uncertain`` and never hides which effects
 succeeded. History/drafts describe VERIFIED state only (§17/§19).
 
 Idempotency (§15): work is keyed by ``operation_ref`` + record and persisted, so a
-retry/restart neither re-applies writes nor duplicates NTF history. Partial/uncertain
+retry/restart neither re-applies writes nor duplicates Request History. Partial/uncertain
 results are NOT silently compensated; recovery is proposed from the new observed
 state with renewed confirmation (§14).
 """
@@ -28,15 +28,29 @@ from hotelops_pg.revalidation import revalidate
 
 def _forbidden_business_fields(change):
     """Business deltas that PG may not write (audit B1). NIGHTS is the derived
-    recompute and NTF history is appended internally — both are allowed; anything
+    recompute and Request History is appended internally — both are allowed; anything
     else must be in the PG business-writable set."""
     bad = []
     for rid in change.target_record_ids:
         for d in change.field_deltas.get(rid, []):
-            if d.field in (fields.NTF_HISTORY, fields.NIGHTS):
+            if d.field in (fields.REQUEST_HISTORY, fields.NIGHTS):
                 continue
             if not fields.is_pg_writable(d.field):
                 bad.append((rid, d.field))
+    return bad
+
+
+def _invalid_payment_fields(change):
+    """Payment deltas whose value is outside the closed vocabulary (PRD §20; audit B1).
+
+    A hard backstop mirroring :func:`_forbidden_business_fields`: even a directly
+    constructed change that bypassed propose() cannot write an unsupported Payment value.
+    """
+    bad = []
+    for rid in change.target_record_ids:
+        for d in change.field_deltas.get(rid, []):
+            if d.field == fields.PAYMENT and d.new not in fields.PAYMENT_VALUES:
+                bad.append((rid, d.new))
     return bad
 
 
@@ -50,7 +64,7 @@ class EffectResult:
 @dataclass
 class ExecutionResult:
     operation_ref: str
-    overall: str                              # complete | incomplete | uncertain | noop_already_done | revalidation_failed
+    overall: str                              # complete | incomplete | uncertain | noop_already_done | revalidation_failed | invalid_payment
     per_record: dict = field(default_factory=dict)   # rid -> {"applied":[FieldDelta], "effects":[EffectResult]}
     effects: list = field(default_factory=list)      # top-level effects (revalidation, verification, drafts)
     drafts: dict = field(default_factory=dict)
@@ -115,6 +129,16 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                                      f"(PRD §7); writable set {fields.PG_WRITABLE!r}")],
                                detail="forbidden-field write rejected before any write (B1)")
 
+    # (§20) Closed Payment vocabulary backstop: an unsupported Payment value is refused
+    # before any write, even if a directly constructed change bypassed propose().
+    bad_payment = _invalid_payment_fields(change)
+    if bad_payment:
+        return ExecutionResult(op, "invalid_payment",
+                               effects=[EffectResult("write_safety", "failed",
+                                                     f"unsupported Payment value(s) {bad_payment!r}; "
+                                                     f"canonical values are {fields.PAYMENT_VALUES!r} (§20)")],
+                               detail="unsupported Payment write rejected before any write (§20)")
+
     # (B6) A material human decision left unresolved must never reach a business write.
     unresolved = [f["key"] for f in change.policy_flags
                   if f.get("needs_confirmation") and not change.authorized_decisions.get(f["key"])]
@@ -135,7 +159,7 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     # (B7-C) Record-global unresolved state: a NEW operation must not run over a record
     # left PENDING or UNCERTAIN by a DIFFERENT prior operation — reconcile/recover first,
     # no stale replay. Derived from the authoritative durable journal so a `pending`
-    # record (business/NTF landed, completion never persisted) also blocks and the block
+    # record (business/Request History landed, completion never persisted) also blocks and the block
     # survives reload; a retry of the SAME operation is not self-blocked.
     blocked = [rid for rid in change.target_record_ids if state.blocking_op(rid, op)]
     if blocked:
@@ -190,7 +214,7 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
 
     for rid in change.target_record_ids:
         deltas = change.field_deltas.get(rid, [])
-        business = [d for d in deltas if d.field != fields.NTF_HISTORY]
+        business = [d for d in deltas if d.field != fields.REQUEST_HISTORY]
         effects = []
 
         # Per-record idempotency (§15): skip a record already verified done for this op.
@@ -255,50 +279,50 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
             result.per_record[rid] = {"applied": [], "effects": effects}
             continue
 
-        # 3. NTF history append for VERIFIED effects only (§17). Idempotency is by
+        # 3. Request History append for VERIFIED effects only (§17). Idempotency is by
         # OPERATION/EFFECT identity via the durable journal — NOT by text (B7-B), so
         # two distinct operations with identical text each get their own entry, while a
         # retry/restart of the SAME operation reconciles against the persisted intent.
         line = history_entry(request_date, business)
-        ntf_ok = True
+        request_history_ok = True
         if line:
-            cur = after[rid].get(fields.NTF_HISTORY) or ""
+            cur = after[rid].get(fields.REQUEST_HISTORY) or ""
             jn = state.journal(op, rid)
-            intended_prev = jn.get("ntf_intended")
+            intended_prev = jn.get("request_history_intended")
             if intended_prev is not None and cur == intended_prev:
                 # This op's history already landed on a prior attempt → do not duplicate.
-                effects.append(EffectResult("ntf_append", "already_done", line))
-            elif intended_prev is not None and cur not in (jn.get("ntf_prior", ""), intended_prev):
-                ntf_ok = False
-                effects.append(EffectResult("ntf_append", "uncertain",
+                effects.append(EffectResult("request_history_append", "already_done", line))
+            elif intended_prev is not None and cur not in (jn.get("request_history_prior", ""), intended_prev):
+                request_history_ok = False
+                effects.append(EffectResult("request_history_append", "uncertain",
                                             "history cell changed under us since pre-write intent"))
             else:
                 intended = append_history(cur, line)
                 try:
                     state.record_history_intent(op, rid, cur, intended)   # durable BEFORE write
                 except Exception as exc:  # noqa: BLE001 — cannot persist intent → fail closed
-                    ntf_ok = False
-                    effects.append(EffectResult("ntf_append", "uncertain", f"cannot persist history intent: {exc}"))
+                    request_history_ok = False
+                    effects.append(EffectResult("request_history_append", "uncertain", f"cannot persist history intent: {exc}"))
                 else:
                     try:
-                        wrote = store.apply_writes(rid, {fields.NTF_HISTORY: intended})
+                        wrote = store.apply_writes(rid, {fields.REQUEST_HISTORY: intended})
                         write_detail = ""
                     except Exception as exc:  # noqa: BLE001
                         wrote, write_detail = False, f"history write raised: {exc}"
                     post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
-                    landed = bool(post and (post.get(fields.NTF_HISTORY) or "") == intended)
+                    landed = bool(post and (post.get(fields.REQUEST_HISTORY) or "") == intended)
                     if wrote and landed:
-                        effects.append(EffectResult("ntf_append", "verified", line))
+                        effects.append(EffectResult("request_history_append", "verified", line))
                     else:
-                        ntf_ok = False
-                        effects.append(EffectResult("ntf_append", "failed",
+                        request_history_ok = False
+                        effects.append(EffectResult("request_history_append", "failed",
                                                     write_detail or "history write not verified on re-read"))
         else:
-            effects.append(EffectResult("ntf_append", "skipped"))
+            effects.append(EffectResult("request_history_append", "skipped"))
 
-        if not ntf_ok:
+        if not request_history_ok:
             result.overall = "uncertain"
-            _mark_uncertain_safe(state, op, rid, "ntf_unverified", effects)
+            _mark_uncertain_safe(state, op, rid, "request_history_unverified", effects)
             result.per_record[rid] = {"applied": [], "effects": effects}
             continue
 

@@ -1,6 +1,6 @@
 """B7-C — `pending` is ALSO record-global unresolved state (audit B7-C).
 
-A record whose prior operation landed the business + NTF effect but whose completion
+A record whose prior operation landed the business + Request History effect but whose completion
 never durably persisted is left `pending` in the journal — NOT in the uncertain index.
 Any unresolved durable journal entry (pending OR uncertain) from a previous operation
 must block unrelated new work, derivable from the authoritative journal after reload.
@@ -12,8 +12,8 @@ from hotelops_pg.execution import execute
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 def _cell(store, rid, field):
@@ -36,7 +36,7 @@ class FlakyStateStore(StateStore):
 
 
 def _leave_pending(store, path):
-    """Run op-1 so business + NTF land but the completion flush (3rd) fails → pending."""
+    """Run op-1 so business + Request History land but the completion flush (3rd) fails → pending."""
     op1 = confirm(propose(store.snapshot_records(), {"rl-a": {fields.REMARK: "VIP"}}))
     res = execute(op1, store, FlakyStateStore(path, fail_on=3))
     assert res.overall == "uncertain"
@@ -62,7 +62,7 @@ def test_same_op_recovery_is_allowed_through_pending(make_store, tmp_path):
     op1 = _leave_pending(store, path)
     res = execute(op1, store, StateStore(path))               # SAME op reconciles
     assert res.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1           # no duplicate
+    assert _req_history(store, "rl-a").count("* MMDD") == 1           # no duplicate
 
 
 def test_resolved_pending_no_longer_blocks(make_store, tmp_path):

@@ -3,7 +3,7 @@
 Covers AC-7 (no false yellow on reorder), AC-8 (explicit-only; alignment by id),
 AC-10 (accumulated manual+agent changes), AC-11 (R3 render cutoff), AC-12 (R3
 reset failure semantics), AC-32 (no automatic first baseline), AC-33 (initial
-capture), AC-34 (NTF history in yellow), AC-35 (nights in yellow).
+capture), AC-34 (Request History in yellow), AC-35 (nights in yellow).
 """
 import pytest
 
@@ -55,13 +55,13 @@ def test_reorder_produces_no_false_yellow(make_store):
     assert res.yellow == []
 
 
-def test_ntf_history_and_nights_are_in_yellow_set(make_store):
-    # AC-34/AC-35: changed NTF history and PG-derived nights both surface yellow.
+def test_request_history_and_nights_are_in_yellow_set(make_store):
+    # AC-34/AC-35: changed Request History and PG-derived nights both surface yellow.
     state = StateStore()
-    reset(lambda: [rr("rl-a", nights="2", **{fields.NTF_HISTORY: ""})], state)
-    res = refresh(lambda: [rr("rl-a", nights="3", **{fields.NTF_HISTORY: "* 0610 x"})], state)
+    reset(lambda: [rr("rl-a", nights="2", **{fields.REQUEST_HISTORY: ""})], state)
+    res = refresh(lambda: [rr("rl-a", nights="3", **{fields.REQUEST_HISTORY: "* 0610 x"})], state)
     fields_changed = {c.field for c in res.yellow}
-    assert fields.NTF_HISTORY in fields_changed
+    assert fields.REQUEST_HISTORY in fields_changed
     assert fields.NIGHTS in fields_changed
 
 

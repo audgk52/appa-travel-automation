@@ -2,7 +2,7 @@
 
 `commit()` used to call `confirm()` on every invocation, minting a fresh confirmation
 identity / operation_ref each time — so committing the same preview twice executed
-twice and duplicated NTF history. The three concepts must be distinct:
+twice and duplicated Request History. The three concepts must be distinct:
 
 * proposal            — unconfirmed candidate,
 * confirmed artifact  — ONE human authorization instance (stable confirmation id + ref),
@@ -35,8 +35,8 @@ class FlakyStateStore(StateStore):
         super()._flush()
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 def _preview(store):
@@ -55,7 +55,7 @@ def test_commit_same_preview_twice_is_idempotent(make_store, tmp_path):
     r2 = commit(store, StateStore(tmp_path / "s.json"), prev)
     assert r2.operation_ref == op
     assert r2.overall == "noop_already_done"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1
 
 
 def test_restart_recovers_persisted_artifact_without_reusing_object(make_store, tmp_path):
@@ -74,7 +74,7 @@ def test_restart_recovers_persisted_artifact_without_reusing_object(make_store, 
     recovered = recover(store, StateStore(path), op)
     assert recovered.operation_ref == op
     assert recovered.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1           # not duplicated
+    assert _req_history(store, "rl-a").count("* MMDD") == 1           # not duplicated
 
 
 def test_recovery_rejects_tampered_reconstructed_scope(make_store, tmp_path):
@@ -113,7 +113,7 @@ def test_new_human_confirmation_of_identical_content_is_a_new_operation(make_sto
     r2 = commit(store, StateStore(path), _preview(store))  # fresh preview → new artifact
     assert r2.operation_ref != op1.operation_ref
     assert r2.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 2
+    assert _req_history(store, "rl-a").count("* MMDD") == 2
 
 
 def test_confirm_preview_is_idempotent_on_same_object(make_store):

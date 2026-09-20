@@ -2,7 +2,7 @@
 
 Deterministic request-level tests (fake Sheets service): refresh/reset produce
 batchUpdate requests that clear prior yellow on comparable columns and paint changed
-/ new comparable cells FFFFFF00, exclude metadata columns, include NTF history +
+/ new comparable cells FFFFFF00, exclude metadata columns, include Request History +
 nights, and never highlight a deleted record.
 """
 from conftest import record, rr
@@ -80,23 +80,23 @@ def test_clear_covers_only_comparable_columns(make_store):
     # Metadata columns are never cleared/painted.
     for meta in (fields.ROW_NUMBER, fields.ROOMING_RECORD_ID, fields.STAY_ID):
         assert headers[meta] not in cleared_cols
-    # Comparable columns (incl NTF history + nights) are cleared.
-    for f in (fields.REMARK, fields.NTF_HISTORY, fields.NIGHTS, fields.CHECK_IN):
+    # Comparable columns (incl Request History + nights) are cleared.
+    for f in (fields.REMARK, fields.REQUEST_HISTORY, fields.NIGHTS, fields.CHECK_IN):
         assert headers[f] in cleared_cols
 
 
-def test_ntf_history_and_nights_changes_render_yellow(make_store):
+def test_request_history_and_nights_changes_render_yellow(make_store):
     store, backend = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1",
-                                        nights="2", **{fields.NTF_HISTORY: ""})])
+                                        nights="2", **{fields.REQUEST_HISTORY: ""})])
     state = StateStore()
     reset(lambda: store.snapshot_records(), state)
     headers = fields.resolve_headers(backend.read_grid()[0])
-    backend.grid[1][headers[fields.NTF_HISTORY]] = "* 0610 x"
+    backend.grid[1][headers[fields.REQUEST_HISTORY]] = "* 0610 x"
     backend.grid[1][headers[fields.NIGHTS]] = "3"
     res = refresh(lambda: store.snapshot_records(), state)
 
     painted_cols = {_col(r) for r in _yellow_reqs(render_yellow(store, res))}
-    assert headers[fields.NTF_HISTORY] in painted_cols
+    assert headers[fields.REQUEST_HISTORY] in painted_cols
     assert headers[fields.NIGHTS] in painted_cols
 
 

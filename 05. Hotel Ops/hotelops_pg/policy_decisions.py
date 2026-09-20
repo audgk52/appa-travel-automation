@@ -13,8 +13,7 @@ PRD's distinctions:
   (Path A) is not human-supplied and must be confirmed, whereas a Path-B instruction
   that literally states the payment is already the human's explicit choice (§20/§23);
 * hotel-confirmed state is NOT an execution gate — it is a draft status (§19), so it is
-  represented by the draft's requested-vs-confirmed wording, not a blocking decision;
-* the Payment Tracker warning stays display-only.
+  represented by the draft's requested-vs-confirmed wording, not a blocking decision.
 """
 from hotelops_pg import fields
 from hotelops_pg.policy import arrival_estimate, hotel_policy_tier

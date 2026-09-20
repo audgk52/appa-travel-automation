@@ -1,6 +1,6 @@
 """Durable execution / idempotency under failure (PRD §14/§15/§17/§18; audit B7).
 
-NTF history is claimed only when the write is VERIFIED; an unverified history write
+Request History is claimed only when the write is VERIFIED; an unverified history write
 never yields a 'complete' op; retries/restarts never duplicate history; uncertain
 effects are durably discoverable so a later operation cannot assume prior success.
 """
@@ -11,8 +11,8 @@ from hotelops_pg.execution import execute
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 def _confirmed(store, rid="rl-a"):
@@ -20,7 +20,7 @@ def _confirmed(store, rid="rl-a"):
 
 
 class HistoryFailStore:
-    """Business writes go through; the NTF history write fails or silently no-ops."""
+    """Business writes go through; the Request History write fails or silently no-ops."""
 
     def __init__(self, inner, mode):
         self.inner, self.mode = inner, mode          # mode: "fail_return" | "raise" | "silent"
@@ -32,7 +32,7 @@ class HistoryFailStore:
         return self.inner.snapshot_records()
 
     def apply_writes(self, rid, updates):
-        if fields.NTF_HISTORY in updates:
+        if fields.REQUEST_HISTORY in updates:
             if self.mode == "raise":
                 raise RuntimeError("history write crashed")
             if self.mode == "fail_return":
@@ -61,7 +61,7 @@ def test_history_write_failure_is_not_reported_verified(make_store):
     state = StateStore()
     res = execute(_confirmed(store), HistoryFailStore(store, "fail_return"), state)
     assert res.overall == "uncertain"
-    assert res.record_status("rl-a")["ntf_append"] == "failed"
+    assert res.record_status("rl-a")["request_history_append"] == "failed"
     assert state.is_executed(res.operation_ref) is False        # never falsely complete
     assert state.record_status(res.operation_ref, "rl-a") == "uncertain"
 
@@ -71,8 +71,8 @@ def test_history_write_claiming_success_but_not_persisted_is_caught(make_store):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     res = execute(_confirmed(store), HistoryFailStore(store, "silent"), StateStore())
     assert res.overall == "uncertain"
-    assert res.record_status("rl-a")["ntf_append"] == "failed"
-    assert _ntf(store, "rl-a") == ""                            # nothing actually written
+    assert res.record_status("rl-a")["request_history_append"] == "failed"
+    assert _req_history(store, "rl-a") == ""                            # nothing actually written
 
 
 def test_prewrite_state_failure_causes_no_business_mutation(make_store, tmp_path):
@@ -95,14 +95,14 @@ def test_postwrite_state_failure_is_uncertain_and_reconciles_on_restart(make_sto
     # Flushes per record: begin_record(1), record_history_intent(2), complete_record(3).
     res = execute(change, store, FlakyStateStore(path, fail_on=3))
     assert res.overall == "uncertain"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1            # history already landed
+    assert _req_history(store, "rl-a").count("* MMDD") == 1            # history already landed
     # Persisted journal shows pending intent (begin_record + history intent survived).
     assert StateStore(path).record_status(change.operation_ref, "rl-a") == "pending"
 
     # Restart with healthy durable state reconciles: no duplicate history, completes.
     res2 = execute(change, store, StateStore(path))
     assert res2.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1            # NOT duplicated
+    assert _req_history(store, "rl-a").count("* MMDD") == 1            # NOT duplicated
 
 
 def test_uncertain_execution_is_durably_discoverable(make_store, tmp_path):
@@ -149,4 +149,4 @@ def test_clean_restart_retry_no_duplicate(make_store, tmp_path):
     assert first.overall == "complete"
     second = execute(change, store, StateStore(path))          # reload → idempotent no-op
     assert second.overall == "noop_already_done"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1

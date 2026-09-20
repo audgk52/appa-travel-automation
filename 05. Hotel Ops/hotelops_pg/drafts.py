@@ -11,7 +11,7 @@ from hotelops_pg.history import _LABELS
 
 
 def _describe(deltas) -> str:
-    business = [d for d in deltas if d.field not in (fields.NTF_HISTORY, fields.NIGHTS)]
+    business = [d for d in deltas if d.field not in (fields.REQUEST_HISTORY, fields.NIGHTS)]
     return "; ".join(f"{_LABELS.get(d.field, d.field)} {d.old or '∅'} → {d.new}" for d in business)
 
 

@@ -2,8 +2,7 @@
 
 An unresolved authorization-bearing decision (payer, early-check-in, hotel-confirm)
 blocks an executable confirmation; the resolved value binds operation_ref; changing
-it is a new authorization. The Payment Tracker residual warning is display-only and
-neither gates confirmation nor affects operation_ref.
+it is a new authorization.
 """
 import pytest
 
@@ -53,16 +52,3 @@ def test_unresolved_decision_also_blocked_at_execution(make_store):
     res = execute(change, store, StateStore())
     assert res.overall in ("unresolved_decision", "authorization_invalidated")
     assert {r.record_id: r.get(fields.REMARK) for r in store.snapshot_records()}["rl-a"] == ""
-
-
-def test_payment_tracker_warning_is_display_only(make_store):
-    # A payment change adds a display-only warning; it must NOT gate confirmation
-    # nor enter operation_ref.
-    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1",
-                                  **{fields.PAYMENT: "Production"})])
-    change = propose(store.snapshot_records(), {"rl-a": {fields.PAYMENT: "Personal"}})
-    warn = [f for f in change.policy_flags if f["kind"] == "payment_tracker_residual"]
-    assert warn and warn[0].get("needs_confirmation") is False
-    confirmed = confirm(change)                          # not blocked
-    assert confirmed.operation_ref
-    assert confirmed.authorized_decisions == {}          # warning not folded into identity

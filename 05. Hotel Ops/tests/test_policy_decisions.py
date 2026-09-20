@@ -55,8 +55,8 @@ def test_path_b_payment_is_human_supplied_no_payer_gate(make_store):
     prev = preview_quick_ops(store, "James payment Personal")
     assert prev.status == "ready"
     assert not any(f.get("needs_confirmation") for f in prev.change.policy_flags)
-    # The display-only Payment Tracker warning is present but does not gate.
-    assert any(f["kind"] == "payment_tracker_residual" for f in prev.change.policy_flags)
+    # Payment Tracker is out of the product scope: no such warning is ever emitted.
+    assert not any(f.get("kind") == "payment_tracker_residual" for f in prev.change.policy_flags)
 
 
 def test_simple_change_is_not_polluted_with_gates(make_store):

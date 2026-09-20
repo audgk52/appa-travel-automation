@@ -38,7 +38,7 @@ def record(name="Traveler A", check_in="2026-06-10", check_out="2026-06-12",
         fields.CHECK_IN: check_in, fields.CHECK_OUT: check_out, fields.NIGHTS: nights,
         fields.IN_ROOM: "Y", fields.ROW_NUMBER: "1", fields.PAYMENT: "Production",
         fields.RESERVATION_NO: "R1", fields.AIRPORT_ARRIVAL: "", fields.LATE_CHECKOUT: "",
-        fields.REMARK: "", fields.NTF_HISTORY: "",
+        fields.REMARK: "", fields.REQUEST_HISTORY: "",
         fields.ROOMING_RECORD_ID: record_id, fields.STAY_ID: stay_id,
     }
     base.update(extra)

@@ -10,10 +10,10 @@ def test_writable_and_comparison_sets_are_exact():
         "Check-in", "Check-out", "Room No.", "TYPE OF ROOM", "Payment",
         "Late Check out", "Remark",
     )
-    # NTF history + nights are comparable but NOT business-writable (§7/AC-40).
+    # Request History + nights are comparable but NOT business-writable (§7/AC-40).
     assert fields.NIGHTS in fields.YELLOW_COMPARISON
-    assert fields.NTF_HISTORY in fields.YELLOW_COMPARISON
-    assert not fields.is_pg_writable(fields.NTF_HISTORY)
+    assert fields.REQUEST_HISTORY in fields.YELLOW_COMPARISON
+    assert not fields.is_pg_writable(fields.REQUEST_HISTORY)
     assert not fields.is_pg_writable(fields.NIGHTS)
     # Excluded from yellow: system/physical-location metadata.
     for f in (fields.ROW_NUMBER, fields.ROOMING_RECORD_ID, fields.STAY_ID):

@@ -1,4 +1,4 @@
-"""NTF Request History — verified-effect append (PRD §17).
+"""Request History — verified-effect append (PRD §17).
 
 Agent-executed changes append a concise per-record entry for VERIFIED applied
 effects only; retries/restarts must not duplicate entries (idempotency is enforced
@@ -28,7 +28,7 @@ def history_entry(request_date: str, deltas) -> str:
     failed/unapplied delta must NOT be included (§17). Returns "" if nothing was
     verified (no history is invented).
     """
-    business = [d for d in deltas if d.field != fields.NTF_HISTORY]
+    business = [d for d in deltas if d.field != fields.REQUEST_HISTORY]
     if not business:
         return ""
     parts = [f"{_LABELS.get(d.field, d.field)} {d.old or '∅'}→{d.new}" for d in business]
@@ -36,7 +36,7 @@ def history_entry(request_date: str, deltas) -> str:
 
 
 def append_history(existing: str, line: str) -> str:
-    """Append ``line`` to an existing NTF Request History cell (append-only, §17)."""
+    """Append ``line`` to an existing Request History cell (append-only, §17)."""
     if not line:
         return existing
     existing = (existing or "").rstrip()

@@ -1,7 +1,7 @@
 """Entry-path orchestration spine — Path A + Path B (PRD §22/§23; audit B11).
 
 Proves the shared safety spine (validated read → resolve → build → gates → confirm →
-revalidate → execute → verify → NTF → drafts) is enforced and cannot be skipped, and
+revalidate → execute → verify → Request History → drafts) is enforced and cannot be skipped, and
 that neither path ever creates a row/stay or invents a booking decision.
 """
 import pytest
@@ -21,8 +21,8 @@ from hotelops_pg.spine import (
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 # --- Quick Ops parser (narrow, explicit) ----------------------------------------
@@ -49,7 +49,7 @@ def test_path_b_happy_runs_full_spine(make_store, durable_state):
     assert res.overall == "complete"
     # Spine actually wrote + verified + recorded history + drafted.
     assert {r.record_id: r for r in store.snapshot_records()}["rl-a"].get(fields.CHECK_OUT) == "2026-06-14"
-    assert "* MMDD" in _ntf(store, "rl-a")
+    assert "* MMDD" in _req_history(store, "rl-a")
     assert set(res.drafts) == {"kakao", "email"}
 
 

@@ -127,7 +127,7 @@ class StateStore:
     # executed_ops[op]["records"][rid] = {
     #   "status": "pending"|"done"|"uncertain",
     #   "business_intended": {field: value},        # durable pre-write intent (B7-D)
-    #   "ntf_prior": str, "ntf_intended": str,      # NTF reconciliation state (B7-B)
+    #   "request_history_prior": str, "request_history_intended": str,      # Request History reconciliation state (B7-B)
     #   "summary"/"reason": ...}
     def _op(self, operation_ref):
         return self._data["executed_ops"].setdefault(operation_ref, {"records": {}, "complete": False})
@@ -166,10 +166,10 @@ class StateStore:
         self._flush()
 
     def record_history_intent(self, operation_ref: str, record_id: str, prior: str, intended: str):
-        """Durably persist the intended NTF cell content before writing it (B7-B/-D)."""
+        """Durably persist the intended Request History cell content before writing it (B7-B/-D)."""
         rec = self._rec(operation_ref, record_id)
-        rec["ntf_prior"] = prior
-        rec["ntf_intended"] = intended
+        rec["request_history_prior"] = prior
+        rec["request_history_intended"] = intended
         self._flush()
 
     def complete_record(self, operation_ref: str, record_id: str, summary=None):
@@ -223,7 +223,7 @@ class StateStore:
         unresolved (pending/uncertain) durable journal state, else None (audit B7-C).
 
         Derived from the AUTHORITATIVE journal (not only the uncertain_records index),
-        so a `pending` record — business/NTF landed but completion never persisted —
+        so a `pending` record — business/Request History landed but completion never persisted —
         also blocks unrelated new work, and the block survives reload. A retry of the
         SAME operation (``current_op``) is not self-blocked; it recovers via execute.
         """

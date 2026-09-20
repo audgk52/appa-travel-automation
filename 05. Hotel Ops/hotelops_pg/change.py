@@ -158,9 +158,13 @@ def propose(records, edits: dict, state=None, matching_evidence=None) -> Rooming
                     f"{fname!r} is not PG-business-writable in v1 (PRD §7); "
                     f"writable fields are {fields.PG_WRITABLE!r}."
                 )
+            # Closed Payment vocabulary (§20): canonicalize (case/whitespace) and reject any
+            # unsupported value here, so an unsupported Payment can never become an executable
+            # delta. No alias inference. Other fields pass through unchanged.
+            new_val = fields.canonical_payment(new) if fname == fields.PAYMENT else str(new)
             old = rec.get(fname)
-            if str(new) != str(old):
-                deltas.append(FieldDelta(fname, old, str(new)))
+            if new_val != str(old):
+                deltas.append(FieldDelta(fname, old, new_val))
         if not deltas:
             continue
 
@@ -201,22 +205,6 @@ def propose(records, edits: dict, state=None, matching_evidence=None) -> Rooming
 
     # §6.1 detector scope: date-boundary overlap/gap within a CONFIRMED stay only.
     change.detected_related_impacts = _detect_related_impacts(by_id, records, change, state)
-
-    # §21 residual risk: a date/payment change may misalign the positionally-coupled
-    # Payment Tracker (IMPORTRANGE). PG WARNS only — it never validates/repairs it.
-    for rid in change.target_record_ids:
-        if any(d.field in (fields.CHECK_IN, fields.CHECK_OUT, fields.PAYMENT)
-               for d in change.field_deltas[rid]):
-            change.policy_flags.append({
-                "kind": "payment_tracker_residual",
-                "record_id": rid,
-                "needs_confirmation": False,
-                "message": (
-                    "date/payment change may misalign the positionally-coupled "
-                    "'02. Rooming List - Payment Trac' IMPORTRANGE; PG warns only and "
-                    "performs no Payment Tracker validation or repair (§21)."
-                ),
-            })
     return change
 
 
@@ -267,7 +255,7 @@ def proposal_digest(change: RoomingChange) -> str:
     """Content digest of ONE EXACT proposal VERSION (§15): target ids, per-record field
     deltas, related-impact dispositions, grouping disposition, limited-check flag, and
     resolved authorization decisions. Any change to scope/deltas/disposition/decision
-    yields a new digest. Display-only warnings (payment_tracker_residual) are excluded.
+    yields a new digest. Non-authorizing display-only warnings are excluded.
     """
     payload = {
         "targets": sorted(change.confirmed_scope.get("record_ids", change.target_record_ids)),

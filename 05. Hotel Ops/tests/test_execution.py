@@ -11,8 +11,8 @@ from hotelops_pg.execution import execute
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY)
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY)
 
 
 class PartialStore:
@@ -41,7 +41,7 @@ def _confirm_date_change(store):
 
 
 def test_happy_path_reports_each_effect_separately(make_store):
-    # AC-31: business write, nights recalc, verification, NTF append, drafts — each reported.
+    # AC-31: business write, nights recalc, verification, Request History append, drafts — each reported.
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1",
                                   check_in="2026-06-10", check_out="2026-06-12", nights="2")])
     res = execute(_confirm_date_change(store), store, StateStore())
@@ -50,11 +50,11 @@ def test_happy_path_reports_each_effect_separately(make_store):
     assert st["business_write"] == "verified"
     assert st["nights_recalc"] == "verified"
     assert st["verification"] == "verified"
-    assert st["ntf_append"] == "verified"
+    assert st["request_history_append"] == "verified"
     assert set(res.drafts) == {"kakao", "email"}
     # Yellow is NOT a commit output (§8/§18): no effect is named "yellow".
     assert all(e.name != "yellow" for e in res.effects)
-    assert "* MMDD" in _ntf(store, "rl-a")
+    assert "* MMDD" in _req_history(store, "rl-a")
 
 
 def test_partial_multi_record_reports_verified_vs_failed(make_store):
@@ -68,9 +68,9 @@ def test_partial_multi_record_reports_verified_vs_failed(make_store):
     res = execute(change, PartialStore(store, fail_id="rl-b"), StateStore())
     assert res.overall == "incomplete"
     assert res.record_status("rl-a")["business_write"] == "verified"
-    assert res.record_status("rl-a")["ntf_append"] == "verified"
+    assert res.record_status("rl-a")["request_history_append"] == "verified"
     assert res.record_status("rl-b")["business_write"] == "failed"
-    assert "ntf_append" not in res.record_status("rl-b")     # no history for a failed effect
+    assert "request_history_append" not in res.record_status("rl-b")     # no history for a failed effect
     assert "recovery" in res.detail                          # not silently compensated
 
 
@@ -114,7 +114,7 @@ def test_equal_values_do_not_prove_pg_acted(make_store):
     # AC-22 (Round 3.1 correction): equivalent current values alone do NOT prove PG
     # acted. A human pre-applying the target value — with no PRE-EXISTING same-operation
     # execution evidence — must NOT be attributed to PG: revalidation invalidates and no
-    # NTF/applied-effect is recorded (PG never claims an effect it cannot prove it made).
+    # Request History/applied-effect is recorded (PG never claims an effect it cannot prove it made).
     store, backend = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     change = confirm(propose(store.snapshot_records(), {"rl-a": {fields.REMARK: "VIP"}}))
     grid = backend.read_grid()
@@ -122,21 +122,21 @@ def test_equal_values_do_not_prove_pg_acted(make_store):
     backend.grid[1][headers[fields.REMARK]] = "VIP"          # human already set the target
     res = execute(change, store, StateStore())
     assert res.overall == "revalidation_failed"             # not attributed to PG
-    assert not _ntf(store, "rl-a")                          # no PG history recorded
+    assert not _req_history(store, "rl-a")                          # no PG history recorded
 
 
 def test_restart_safe_idempotency_no_double_history(make_store, tmp_path):
     # AC-22: re-running a confirmed op after a restart neither re-applies nor
-    # duplicates NTF history.
+    # duplicates Request History.
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     change = confirm(propose(store.snapshot_records(), {"rl-a": {fields.REMARK: "VIP"}}))
     state_path = tmp_path / "state.json"
 
     first = execute(change, store, StateStore(state_path))
     assert first.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1
 
     # Restart: a fresh StateStore reloads executed_ops from disk.
     second = execute(change, store, StateStore(state_path))
     assert second.overall == "noop_already_done"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1          # not duplicated
+    assert _req_history(store, "rl-a").count("* MMDD") == 1          # not duplicated

@@ -18,8 +18,8 @@ from hotelops_pg.execution import execute
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 def _cell(store, rid, field):
@@ -44,7 +44,7 @@ class FlakyStateStore(StateStore):
 
 
 class CountingStore:
-    """Wraps a real store, counting BUSINESS (non-NTF) apply_writes."""
+    """Wraps a real store, counting BUSINESS (non-Request-History) apply_writes."""
 
     def __init__(self, inner):
         self.inner = inner
@@ -57,13 +57,13 @@ class CountingStore:
         return self.inner.snapshot_records()
 
     def apply_writes(self, rid, updates):
-        if fields.NTF_HISTORY not in updates:
+        if fields.REQUEST_HISTORY not in updates:
             self.business_writes += 1
         return self.inner.apply_writes(rid, updates)
 
 
 class BusinessRaiseStore:
-    """Business writes raise; NTF writes pass through."""
+    """Business writes raise; Request History writes pass through."""
 
     def __init__(self, inner):
         self.inner = inner
@@ -75,7 +75,7 @@ class BusinessRaiseStore:
         return self.inner.snapshot_records()
 
     def apply_writes(self, rid, updates):
-        if fields.NTF_HISTORY not in updates:
+        if fields.REQUEST_HISTORY not in updates:
             raise RuntimeError("business write 503")
         return self.inner.apply_writes(rid, updates)
 
@@ -85,7 +85,7 @@ def test_landed_business_is_not_reissued_on_restart(make_store, tmp_path):
     path = tmp_path / "state.json"
     change = _confirmed(store)
 
-    # Attempt 1: business + NTF land, completion flush (3rd) fails → pending.
+    # Attempt 1: business + Request History land, completion flush (3rd) fails → pending.
     first = execute(change, CountingStore(store), FlakyStateStore(path, fail_on=3))
     assert first.overall == "uncertain"
     assert StateStore(path).record_status(change.operation_ref, "rl-a") == "pending"
@@ -95,7 +95,7 @@ def test_landed_business_is_not_reissued_on_restart(make_store, tmp_path):
     res = execute(change, counting, StateStore(path))
     assert res.overall == "complete"
     assert counting.business_writes == 0                      # reconciled, not replayed
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1
 
 
 def test_third_value_is_not_overwritten(make_store, tmp_path):
@@ -142,12 +142,12 @@ def test_completion_persist_failure_is_not_authoritative(make_store, tmp_path):
     res = execute(change, store, flaky)
     assert res.overall == "uncertain"                          # not authoritative complete
     assert flaky.is_executed(change.operation_ref) is False    # in-memory reverted (no bypass)
-    assert _ntf(store, "rl-a").count("* MMDD") == 1            # business + history truthful
+    assert _req_history(store, "rl-a").count("* MMDD") == 1            # business + history truthful
 
     # Same-instance retry must NOT bypass recovery via mutated memory → reconciles.
     res2 = execute(change, store, flaky)
     assert res2.overall == "complete"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1
 
     # A genuinely fresh reload respects the same durable authority and completes.
     fresh = StateStore(path)
@@ -169,4 +169,4 @@ def test_unlanded_business_is_recovered_on_restart(make_store, tmp_path):
     res = execute(change, store, StateStore(path))
     assert res.overall == "complete"
     assert _cell(store, "rl-a", fields.REMARK) == "VIP"
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1

@@ -1,8 +1,8 @@
-"""Confirmed-operation identity + op/effect-based NTF idempotency (audit B7-A/B).
+"""Confirmed-operation identity + op/effect-based Request History idempotency (audit B7-A/B).
 
 A retry of the SAME confirmed instance keeps its identity; a NEW human confirmation of
 identical content is a distinct operation (so a historically-completed op never
-suppresses it). NTF idempotency is by operation identity, not text, so two distinct
+suppresses it). Request History idempotency is by operation identity, not text, so two distinct
 operations with identical rendered history each get their own chronology entry.
 """
 from conftest import record
@@ -12,8 +12,8 @@ from hotelops_pg.execution import execute
 from hotelops_pg.state_store import StateStore
 
 
-def _ntf(store, rid):
-    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.NTF_HISTORY) or ""
+def _req_history(store, rid):
+    return {r.record_id: r for r in store.snapshot_records()}[rid].get(fields.REQUEST_HISTORY) or ""
 
 
 def _set_remark(backend, value):
@@ -54,13 +54,13 @@ def test_distinct_ops_identical_text_each_get_chronology_entry(make_store, tmp_p
     path = tmp_path / "s.json"
     op1 = _confirm_remark(store, "VIP")
     execute(op1, store, StateStore(path))
-    assert _ntf(store, "rl-a").count("* MMDD") == 1
+    assert _req_history(store, "rl-a").count("* MMDD") == 1
 
     _set_remark(backend, "")                                  # revert so op2 renders identical text
     op2 = _confirm_remark(store, "VIP")
     execute(op2, store, StateStore(path))
-    assert _ntf(store, "rl-a").count("* MMDD") == 2          # B7-B: distinct op → own entry
+    assert _req_history(store, "rl-a").count("* MMDD") == 2          # B7-B: distinct op → own entry
 
     # Retrying op2 does not add a third.
     execute(op2, store, StateStore(path))
-    assert _ntf(store, "rl-a").count("* MMDD") == 2
+    assert _req_history(store, "rl-a").count("* MMDD") == 2
