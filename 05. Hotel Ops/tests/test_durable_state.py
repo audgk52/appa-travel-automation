@@ -52,7 +52,7 @@ def test_operational_commit_rejects_non_durable_state(make_store):
 def test_operational_yellow_reset_rejects_non_durable_state(make_store):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     with pytest.raises(NonDurableStateError):
-        yellow_reset(store, StateStore(), service=_FakeSheets())  # fails before claiming activation
+        yellow_reset(store, StateStore(), service=_FakeSheets(), sheet_id=0)  # fails before claiming activation
 
 
 def test_operational_commit_works_with_durable_state(make_store, durable_state):
@@ -64,6 +64,6 @@ def test_operational_commit_works_with_durable_state(make_store, durable_state):
 def test_operational_yellow_reset_works_with_durable_state(make_store, durable_state):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     fake = _FakeSheets()
-    res = yellow_reset(store, durable_state, service=fake)
+    res = yellow_reset(store, durable_state, service=fake, sheet_id=0)
     assert res.status == "ok" and durable_state.has_baseline
     assert fake.batch_bodies                                 # the render actually ran (no silent skip)

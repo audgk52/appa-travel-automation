@@ -82,20 +82,19 @@ class RoomingSheetStore:
         return read_records(grid, headers)
 
     def validated_observation(self):
-        """One coherent validated observation for a yellow diff AND its render (B9).
+        """One coherent, integrity-VALIDATED observation for a yellow diff AND its render
+        (B9). Returns ``(records, headers)`` taken directly from the validated read's own
+        result — the SAME grid the schema/duplicate-id gate ran on, with adopted ids
+        reflected in the records — rather than a second, unvalidated ``read_grid``.
 
-        Runs the full validated-read gate (schema → duplicate-id STOP → eligible blank-id
-        adoption), then reads the grid ONCE and derives BOTH the header→col map and the
-        records from that single post-adoption grid. Returning them together lets the
-        operational yellow flow diff and render off ONE consistent view — values, ids,
-        physical rows and columns all mutually coherent — instead of re-reading at render
-        time. A duplicate/ambiguous ``rooming_record_id`` fails fast in ``read_validated``
-        here, BEFORE any rendering. Returns ``(records, headers)``.
+        This closes the window where an extra post-validation read could observe (and then
+        render against) a state the integrity contract must reject: a duplicate/ambiguous
+        ``rooming_record_id`` STOPs here (``DuplicateRecordIdError``), and an eligible
+        blank-id row is adopted, both BEFORE the records are ever used for diff/render. An
+        edit occurring AFTER this observation remains the accepted residual race (§9/§11).
         """
-        self.read_validated()                          # schema + duplicate-id STOP + adoption
-        grid = self.backend.read_grid()                # single post-adoption grid
-        headers = self._resolve(grid)                  # header map from THIS grid
-        return read_records(grid, headers), headers
+        result = self.read_validated()                 # schema + duplicate-id STOP + adoption
+        return result.records, result.headers          # the validated, post-adoption view
 
     def read_validated(self):
         """Validated read: schema → duplicate-id → eligible blank-id adoption (§2, §4).

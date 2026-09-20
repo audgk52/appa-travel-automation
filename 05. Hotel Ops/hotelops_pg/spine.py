@@ -48,6 +48,16 @@ class NonDurableStateError(RuntimeError):
     """
 
 
+class RenderTargetError(RuntimeError):
+    """An operational yellow flow lacks a verified render target (audit B9).
+
+    The operational refresh/reset must actually DELIVER the formatting, so a missing
+    Sheets render ``service`` (including an explicit ``service=None``) or an unspecified
+    numeric target ``sheet_id`` (which must be the verified ``01. Rooming List`` gid, never
+    an assumed 0) is refused BEFORE any read, mutation, or claim of success (§8/§9).
+    """
+
+
 def _require_durable(state, flow):
     if not getattr(state, "durable", False):
         raise NonDurableStateError(
@@ -61,6 +71,27 @@ def _require_durable(state, flow):
             f"operational {flow} has a configured durable path that is not currently "
             "usable (missing/unwritable parent); refusing before confirmation or any "
             "business mutation (§0/§9/§15, B8)."
+        )
+
+
+def _require_render_target(service, sheet_id, flow):
+    """Refuse an operational yellow flow that lacks a verified render target (B9).
+
+    Guards against a renderer-less success: an absent/``None`` Sheets ``service`` would
+    let ``apply_yellow`` skip the ``batchUpdate`` yet still return a 'successful' diff-only
+    result, and a ``None`` ``sheet_id`` would leave the target tab unspecified (the numeric
+    ``01. Rooming List`` gid must be explicit, never assumed 0). Called BEFORE any read,
+    mutation, or claim of success.
+    """
+    if service is None:
+        raise RenderTargetError(
+            f"operational {flow} requires a Sheets render service; a diff-only / "
+            "renderer-less call must not report success (§8/§9, B9)."
+        )
+    if sheet_id is None:
+        raise RenderTargetError(
+            f"operational {flow} requires an explicit numeric target sheet id (the verified "
+            "'01. Rooming List' gid); it must not assume 0 (B9)."
         )
 
 
@@ -319,13 +350,15 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
                              hotel_confirmed=hotel_confirmed)
 
 
-def yellow_refresh(store, state, service, sheet_id=0):
+def yellow_refresh(store, state, service, sheet_id):
     """Operational yellow refresh — validated observation → diff → RENDER, as ONE
     composed flow (§8, B9-composition). A §4 integrity entry point (B9-C).
 
-    ``service`` (a Sheets service) is REQUIRED: an operational refresh must actually
-    deliver the formatting, so there is no diff-only call form that could silently report
-    a successful refresh without rendering. The observation is taken lazily INSIDE
+    ``service`` (a Sheets service) and the numeric ``sheet_id`` are BOTH required with no
+    default: an operational refresh must actually deliver the formatting to a verified
+    target, so an absent/``None`` renderer or an unspecified/assumed target is refused
+    up front (``RenderTargetError``) — there is no diff-only or ``sheet_id=0`` call form
+    that could silently report a successful refresh. The observation is taken lazily INSIDE
     ``baseline.refresh`` — so an UNCERTAIN authority (R3-C) or a NO-BASELINE state (§8,
     AC-32) STOPs before any read/adoption and before any formatting request. The diff and
     its render share ONE validated observation (values/ids/rows/columns coherent); a
@@ -335,6 +368,8 @@ def yellow_refresh(store, state, service, sheet_id=0):
     """
     from hotelops_pg.baseline import refresh
     from hotelops_pg.yellow_sheets import apply_yellow
+
+    _require_render_target(service, sheet_id, "yellow refresh")
 
     obs = {}
 
@@ -349,13 +384,15 @@ def yellow_refresh(store, state, service, sheet_id=0):
     return result
 
 
-def yellow_reset(store, state, service, persist=None, sheet_id=0):
+def yellow_reset(store, state, service, sheet_id, persist=None):
     """Operational yellow reset — DURABLE state (B8) + validated observation + real render.
 
     Preserves the R3 §9 sequence: capture candidate → persist → verify/activate → NEW
     baseline authoritative → FINAL comparison read → render from THAT snapshot. ``service``
-    is REQUIRED and is wired as the render step, so there is no ``render=None`` call form
-    that returns a successful reset without delivering the formatting. ``persist`` stays
+    and the numeric ``sheet_id`` are BOTH required with no default and validated up front
+    (``RenderTargetError``, before ``_require_durable`` and before any capture/persist), so
+    there is no ``render=None``/``sheet_id=0`` call form that returns a successful reset
+    without delivering the formatting to a verified target. ``persist`` stays
     injectable for durability tests; the real Sheets render is supplied by the operational
     entry (distinct from any test-injected domain render).
 
@@ -365,9 +402,11 @@ def yellow_reset(store, state, service, persist=None, sheet_id=0):
     authoritative (``failed_before_activation``); a render (batchUpdate) failure AFTER
     activation → new baseline retained, ``activated_render_incomplete`` (no rollback).
     """
-    _require_durable(state, "yellow reset")
     from hotelops_pg.baseline import AUTHORITY_UNCERTAIN, UncertainBaselineError, _diff, reset
     from hotelops_pg.yellow_sheets import apply_yellow
+
+    _require_render_target(service, sheet_id, "yellow reset")
+    _require_durable(state, "yellow reset")
 
     if state.authority == AUTHORITY_UNCERTAIN:
         raise UncertainBaselineError(
