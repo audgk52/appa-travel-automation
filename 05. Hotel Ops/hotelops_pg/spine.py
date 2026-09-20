@@ -257,7 +257,7 @@ def preview_quick_ops(store, instruction, state=None) -> Preview:
 def _build_quick_ops_preview(records, rec, op, state):
     """Build a Path B proposal on a resolved record, recording payment (when used to
     target) as protected matching evidence (§11)."""
-    evidence = {fields.PAYMENT: rec.get(fields.PAYMENT)} if op.payment else {}
+    evidence = {rec.record_id: {fields.PAYMENT: rec.get(fields.PAYMENT)}} if op.payment else {}
     change = propose(records, {rec.record_id: {op.field: op.new_value}}, state=state,
                      matching_evidence=evidence)
     # Path B carries no arrival context and its payment is human-supplied, so only
@@ -333,8 +333,9 @@ def _build_path_a_preview(records, rec, name, edits, payment, context, arrival_c
                            detail=f"record {rec.record_id!r} no longer matches the supplied "
                            f"{f!r} evidence (expected {want!r}, now {rec.get(f)!r}); re-resolve "
                            "before proceeding (§10/§11)")
-    # Record the actual current values (verified == supplied) as explicit expectations.
-    evidence = {f: rec.get(f) for f in supplied}
+    # Record the actual current values (verified == supplied) as explicit expectations,
+    # RECORD-SCOPED to this target only (B1).
+    evidence = {rec.record_id: {f: rec.get(f) for f in supplied}} if supplied else {}
     change = propose(records, {rec.record_id: edits}, state=state, matching_evidence=evidence)
     hotel_arrival, flight_arrival = arrival_ctx
     arrival = hotel_arrival or flight_arrival
@@ -368,6 +369,16 @@ def preview_path_a(store, itinerary_fact, state=None) -> Preview:
     arrival_ctx = (hotel_arrival, flight_arrival)
     if not name:
         raise ValueError("itinerary fact requires a 'traveler'")
+    # Conflicting payment inputs (top-level ``payment`` vs ``context.payment``) are NOT
+    # silently reconciled: if both are supplied and canonically DIFFERENT it is an explicit
+    # non-executable conflict (no ready proposal / confirmation / write). Canonically
+    # equivalent values are the same supplied fact and proceed. Applies to fresh + resume.
+    ctx_payment = context.get("payment")
+    if payment is not None and ctx_payment is not None and _canon(payment) != _canon(ctx_payment):
+        return Preview("needs_review",
+                       detail=f"conflicting payment inputs (payment={payment!r} vs "
+                       f"context.payment={ctx_payment!r}); resolve to one value before "
+                       "proceeding — PG does not silently prefer one (§20/§23)")
     edits = {k: v for k, v in fact.items() if k in fields.PG_WRITABLE}
     if not edits or len(edits) != len(fact):
         return Preview("needs_review",

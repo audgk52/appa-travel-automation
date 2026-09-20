@@ -6,12 +6,22 @@ matching / placeholder continuity / PO-1 manual identity update / true-repurpose
 lives BEFORE the shared confirmation boundary; nothing here creates a row or stay, and an
 unresolved interrupt can never be confirmed.
 """
+import hashlib
+import json
+
 import pytest
 
 from conftest import record
 from hotelops_pg import fields
 from hotelops_pg.adoption import DuplicateRecordIdError
-from hotelops_pg.change import NonWritableFieldError, confirm, propose
+from hotelops_pg.change import (
+    NonWritableFieldError,
+    compute_operation_ref,
+    confirm,
+    from_payload,
+    propose,
+    to_payload,
+)
 from hotelops_pg.matching import is_placeholder_name, resolve_path_a
 from hotelops_pg.revalidation import revalidate
 from hotelops_pg.spine import (
@@ -23,7 +33,9 @@ from hotelops_pg.spine import (
     preview_path_a,
     preview_quick_ops,
     resume_path_a,
+    resume_quick_ops,
 )
+from hotelops_pg.state_store import StateStore
 
 
 def _hdr(backend):
@@ -247,7 +259,7 @@ def test_matching_evidence_change_invalidates_stale_selection(make_store):
     prev = preview_path_a(store, {"traveler": "John Smith", "payment": "Production",
                                   "context": {"title": "DP"}, fields.REMARK: "VIP"})
     assert prev.status == "ready"
-    assert set(prev.change.matching_evidence) >= {fields.TITLE, fields.PAYMENT}
+    assert set(prev.change.matching_evidence["rl-a"]) >= {fields.TITLE, fields.PAYMENT}
     fresh = store.snapshot_records()
     fresh[0].values[fields.TITLE] = "AC"                       # evidence used for the match changed
     rv = revalidate(prev.change, fresh)
@@ -507,8 +519,179 @@ def test_matching_evidence_survives_payload_roundtrip(make_store):
     confirmed = confirm_preview(prev)
     reconstructed = from_payload(to_payload(confirmed))
     assert reconstructed.matching_evidence == confirmed.matching_evidence
-    assert reconstructed.matching_evidence.get(fields.TITLE) == "DP"
+    assert reconstructed.matching_evidence["rl-a"].get(fields.TITLE) == "DP"
     # And the reconstructed artifact still invalidates when the evidence changes.
     fresh = store.snapshot_records()
     fresh[0].values[fields.TITLE] = "AC"
     assert revalidate(reconstructed, fresh).ok is False
+
+
+# ── Codex blocker remediation ──────────────────────────────────────────────────────
+
+# B1 — matching evidence is record-scoped (a related-impact-A sibling does not inherit it).
+
+def _stay_pair_for_impact(make_store):
+    return make_store([
+        record(name="James", record_id="rl-a", stay_id="S1", check_in="2026-06-10",
+               check_out="2026-06-15", nights="5", **{fields.PAYMENT: "Production"}),
+        record(name="James", record_id="rl-b", stay_id="S1", check_in="2026-06-15",
+               check_out="2026-06-18", nights="3", **{fields.PAYMENT: "Personal"}),
+    ])
+
+
+def test_b1_dispositionA_sibling_does_not_inherit_primary_evidence(make_store, durable_state):
+    store, _ = _stay_pair_for_impact(make_store)
+    prev = preview_path_a(store, {"traveler": "James", "payment": "Production",
+                                  fields.CHECK_OUT: "2026-06-17"})   # extends → sibling impact
+    assert prev.status == "needs_disposition"
+    assert prev.change.matching_evidence == {"rl-a": {fields.PAYMENT: "Production"}}
+    confirmed = confirm_preview(prev, impact_dispositions={0: "A"})   # fold Personal sibling in
+    assert set(confirmed.target_record_ids) == {"rl-a", "rl-b"}
+    # rl-b (Personal) is in scope but is NOT required to match the primary's Production.
+    res = execute_confirmed(store, durable_state, confirmed)
+    assert res.overall == "complete"
+
+
+def test_b1_primary_evidence_change_still_invalidates(make_store):
+    store, _ = _stay_pair_for_impact(make_store)
+    prev = preview_path_a(store, {"traveler": "James", "payment": "Production",
+                                  fields.CHECK_OUT: "2026-06-17"})
+    confirmed = confirm_preview(prev, impact_dispositions={0: "A"})
+    fresh = store.snapshot_records()
+    for r in fresh:
+        if r.record_id == "rl-a":
+            r.values[fields.PAYMENT] = "Personal"            # primary's own evidence changed
+    assert revalidate(confirmed, fresh).ok is False
+
+
+# B2 — same-operation recovery accepts observed NEW for an evidence field that is also written.
+
+def test_b2_same_operation_recovery_accepts_observed_new(make_store, durable_state):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.PAYMENT: "Production"})])
+    confirmed = confirm_preview(preview_path_a(
+        store, {"traveler": "James", "payment": "Production", fields.PAYMENT: "Personal"}),
+        decisions={"payer": "approved"})                    # Payment change → payer decision
+    op = confirmed.operation_ref
+    # Durable pre-write intent recorded, business write landed, then failure before
+    # completion (record left pending); a restart re-reads durable state.
+    durable_state.begin_record(op, "rl-a", {fields.PAYMENT: "Personal"})
+    store.apply_writes("rl-a", {fields.PAYMENT: "Personal"})
+    durable_state.reload()
+    res = execute_confirmed(store, durable_state, confirmed)     # recover SAME op
+    assert res.overall == "complete"
+    assert store.snapshot_records()[0].get(fields.PAYMENT) == "Personal"
+
+
+def test_b2_external_new_without_durable_intent_invalidates(make_store, durable_state):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.PAYMENT: "Production"})])
+    confirmed = confirm_preview(preview_path_a(
+        store, {"traveler": "James", "payment": "Production", fields.PAYMENT: "Personal"}),
+        decisions={"payer": "approved"})
+    # External actor set Payment to the intended NEW, but there is NO same-op durable intent.
+    store.apply_writes("rl-a", {fields.PAYMENT: "Personal"})
+    res = execute_confirmed(store, durable_state, confirmed)
+    assert res.overall == "revalidation_failed"
+
+
+# B3 — legacy operation_ref compatibility (fixed fixture; independent oracle).
+
+def _legacy_operation_ref(payload):
+    """Replicates the PRE-G7 proposal_digest formula (no matching_evidence), independent
+    of the current implementation, so the fixture's expected ref is not self-generated."""
+    p = {
+        "targets": sorted(payload["confirmed_scope"].get("record_ids", payload["target_record_ids"])),
+        "deltas": {rid: sorted([(d[0], d[1], d[2]) for d in payload["field_deltas"].get(rid, [])])
+                   for rid in payload["target_record_ids"]},
+        "impacts": sorted((i["target_record_id"], i["suggested"][0], i["suggested"][2], i["disposition"])
+                          for i in payload["impacts"]),
+        "grouping_disposition": payload.get("grouping_disposition", ""),
+        "limited_check": payload.get("limited_check_authorized", False),
+        "decisions": {k: payload["authorized_decisions"][k] for k in sorted(payload["authorized_decisions"])},
+    }
+    blob = json.dumps(p, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return "op-" + hashlib.sha256(blob).hexdigest()[:24] + "-" + payload["confirmation_id"]
+
+
+# A hand-authored pre-G7 confirmed payload (NO matching_evidence key), shaped like the
+# closed-Foundation to_payload() at 33ba184.
+_LEGACY_PAYLOAD = {
+    "confirmation_id": "legacyfixedconfirmation0001",
+    "stay_id": "S1",
+    "target_record_ids": ["rl-a"],
+    "snapshots": {"rl-a": {fields.NAME: "James", fields.RESERVATION_NO: "R1",
+                           fields.REMARK: ""}},
+    "positions": {"rl-a": 0},
+    "field_deltas": {"rl-a": [[fields.REMARK, "", "VIP"]]},
+    "policy_flags": [],
+    "impacts": [],
+    "requires_grouping_disposition": False,
+    "grouping_disposition": "",
+    "limited_check_authorized": False,
+    "authorized_decisions": {},
+    "confirmed_scope": {"record_ids": ["rl-a"], "intentional_exceptions": []},
+}
+_LEGACY_PAYLOAD["operation_ref"] = _legacy_operation_ref(_LEGACY_PAYLOAD)
+
+
+def test_b3_legacy_artifact_recomputes_original_operation_ref():
+    reconstructed = from_payload(_LEGACY_PAYLOAD)
+    assert reconstructed.matching_evidence == {}                 # legacy: no evidence metadata
+    assert compute_operation_ref(reconstructed) == _LEGACY_PAYLOAD["operation_ref"]
+
+
+def test_b3_legacy_artifact_not_rejected_as_authorization_invalidated(make_store, durable_state):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.RESERVATION_NO: "R1"})])
+    res = execute_confirmed(store, durable_state, from_payload(_LEGACY_PAYLOAD))
+    assert res.overall != "authorization_invalidated"            # legacy ref still verifies
+    assert store.snapshot_records()[0].get(fields.REMARK) == "VIP"
+
+
+def test_b3_new_evidence_is_authorization_bound(make_store):
+    store, _ = make_store([record(name="John Smith", record_id="rl-a", stay_id="S1",
+                                  **{fields.TITLE: "DP", fields.PAYMENT: "Production"})])
+    confirmed = confirm_preview(preview_path_a(
+        store, {"traveler": "John Smith", "payment": "Production", "context": {"title": "DP"},
+                fields.REMARK: "VIP"}))
+    op0 = confirmed.operation_ref
+    # (a) changing an expected evidence value
+    c1 = from_payload(to_payload(confirmed)); c1.matching_evidence["rl-a"][fields.TITLE] = "AC"
+    assert compute_operation_ref(c1) != op0
+    # (b) removing evidence
+    c2 = from_payload(to_payload(confirmed)); c2.matching_evidence = {}
+    assert compute_operation_ref(c2) != op0
+    # (c) moving evidence to another record id
+    c3 = from_payload(to_payload(confirmed))
+    c3.matching_evidence = {"rl-z": c3.matching_evidence["rl-a"]}
+    assert compute_operation_ref(c3) != op0
+
+
+# Payment input conflict (fresh + resume).
+
+def test_payment_conflict_fresh_is_non_executable(make_store):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.PAYMENT: "Production"})])
+    prev = preview_path_a(store, {"traveler": "James", "payment": "Production",
+                                  "context": {"payment": "Personal"}, fields.REMARK: "VIP"})
+    assert prev.status == "needs_review"
+    with pytest.raises(ConfirmationBypassError):
+        confirm_preview(prev)
+
+
+def test_payment_conflict_resume_is_non_executable(make_store):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.PAYMENT: "Production"})])
+    prev = resume_path_a(store, {"traveler": "James", "payment": "Production",
+                                 "context": {"payment": "Personal"}, fields.REMARK: "VIP"},
+                         confirm_continuity="rl-a")
+    assert prev.status == "needs_review"
+
+
+def test_payment_equivalent_normalized_inputs_proceed(make_store):
+    store, _ = make_store([record(name="James", record_id="rl-a", stay_id="S1",
+                                  **{fields.PAYMENT: "Production"})])
+    prev = preview_path_a(store, {"traveler": "James", "payment": "Production",
+                                  "context": {"payment": "production"}, fields.REMARK: "VIP"})
+    assert prev.status == "ready"

@@ -133,13 +133,15 @@ def propose(records, edits: dict, state=None, matching_evidence=None) -> Rooming
     and the proposal is flagged ``requires_grouping_reconciliation`` so downstream
     preview/confirmation STOP until the grouping is reconciled.
 
-    ``matching_evidence`` (optional, Path A/B11) maps the NARROW comparable fields the
-    human-assisted target selection/continuity relied on (beyond NAME/Reservation No.) to
-    their EXPECTED values (e.g. {TITLE: "DP", Payment: "Production"}); revalidation protects
-    exactly those through pre-write so a stale selection cannot execute if its evidence changed.
+    ``matching_evidence`` (optional, Path A/B11) is RECORD-SCOPED: ``{record_id: {field:
+    expected_value}}`` for exactly the record(s) whose targeting/continuity relied on that
+    evidence (beyond NAME/Reservation No.), e.g. {"rl-a": {TITLE: "DP", Payment: "Production"}}.
+    Revalidation protects each record's own evidence through pre-write; a dependent record
+    added later by a related-impact disposition never inherits another record's evidence (B1).
     """
     by_id = _record_map(records)
-    change = RoomingChange(matching_evidence=dict(matching_evidence or {}))
+    change = RoomingChange(matching_evidence={rid: dict(ev)
+                           for rid, ev in (matching_evidence or {}).items()})
 
     stay_ids = set()
     for rid, edit in edits.items():
@@ -277,9 +279,17 @@ def proposal_digest(change: RoomingChange) -> str:
         "grouping_disposition": change.grouping_disposition,
         "limited_check": change.limited_check_authorized,
         "decisions": {k: change.authorized_decisions[k] for k in sorted(change.authorized_decisions)},
-        "matching_evidence": {k: change.matching_evidence[k]
-                              for k in sorted(change.matching_evidence)},
     }
+    # (B3) Legacy compatibility: only bind matching evidence into the digest when it
+    # actually exists, so a pre-G7 confirmed artifact (which had no such field) recomputes
+    # its ORIGINAL operation_ref and stays recoverable. When present it is bound
+    # record-scoped, so changing/removing/moving evidence changes the authorization (B11).
+    evidence = {
+        rid: {k: change.matching_evidence[rid][k] for k in sorted(change.matching_evidence[rid])}
+        for rid in sorted(change.matching_evidence) if change.matching_evidence[rid]
+    }
+    if evidence:
+        payload["matching_evidence"] = evidence
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:24]
 
@@ -324,7 +334,7 @@ def to_payload(change: RoomingChange) -> dict:
         "authorized_decisions": dict(change.authorized_decisions),
         "confirmed_scope": {k: (list(v) if isinstance(v, list) else v)
                             for k, v in change.confirmed_scope.items()},
-        "matching_evidence": dict(change.matching_evidence),
+        "matching_evidence": {rid: dict(ev) for rid, ev in change.matching_evidence.items()},
     }
 
 
@@ -347,7 +357,8 @@ def from_payload(payload: dict) -> RoomingChange:
         limited_check_authorized=payload.get("limited_check_authorized", False),
         authorized_decisions=dict(payload["authorized_decisions"]),
         confirmed_scope=dict(payload["confirmed_scope"]),
-        matching_evidence=dict(payload.get("matching_evidence", {})),
+        matching_evidence={rid: dict(ev)
+                           for rid, ev in payload.get("matching_evidence", {}).items()},
     )
     change.detected_related_impacts = [RelatedImpact(
         kind=i["kind"], source_record_id=i["source_record_id"],

@@ -83,21 +83,29 @@ def revalidate(change, fresh_records, state=None) -> RevalidationResult:
                     "material",
                 )
 
-        # (B11 §11) The NARROW human-supplied matching evidence the target selection/
+        # (B11 §11) The NARROW human-supplied matching evidence THIS record's targeting/
         # continuity actually relied on (e.g. TITLE, Payment, planned dates) must survive
-        # to pre-write: the record must still hold the EXPECTED value recorded at build
-        # (an explicit expectation, so it also survives a confirmed/recovery round-trip and
-        # cannot be silently reinterpreted). Only fields recorded as evidence are checked,
-        # so unrelated manual fields never become blockers.
-        for f, expected in change.matching_evidence.items():
-            if rec.get(f) != expected:
-                return RevalidationResult(
-                    False,
-                    f"{rid!r} matching evidence {f!r} changed (expected {expected!r}→now "
-                    f"{rec.get(f)!r}); the selection this proposal relied on may no longer "
-                    "hold — re-preview/confirm",
-                    "material",
-                )
+        # to pre-write. Evidence is RECORD-SCOPED (B1): a dependent record folded in by a
+        # related-impact disposition has its OWN (usually empty) evidence and never inherits
+        # the primary's. The record must still hold the EXPECTED value recorded at build; an
+        # evidence field that is ALSO this operation's confirmed delta may legitimately read
+        # as the intended NEW on a same-operation retry/recovery — accepted ONLY with
+        # pre-existing durable journal intent, exactly like the delta base (B2/B5). Only
+        # recorded evidence fields are checked, so unrelated manual fields never block.
+        for f, expected in change.matching_evidence.get(rid, {}).items():
+            cur = rec.get(f)
+            if cur == expected:
+                continue
+            delta_new = next((d.new for d in change.field_deltas.get(rid, []) if d.field == f), None)
+            if delta_new is not None and cur == str(delta_new) and _op_intended(state, op, rid, f, delta_new):
+                continue
+            return RevalidationResult(
+                False,
+                f"{rid!r} matching evidence {f!r} changed (expected {expected!r}→now "
+                f"{cur!r}); the selection this proposal relied on may no longer "
+                "hold — re-preview/confirm",
+                "material",
+            )
 
         # The base each delta was computed from must be unchanged. current == old (base)
         # is eligible ordinary pre-write state. current == new is accepted ONLY as a
