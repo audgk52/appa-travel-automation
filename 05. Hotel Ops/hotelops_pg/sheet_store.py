@@ -262,3 +262,19 @@ def build_sheets_service(key_path):
         key_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def open_rooming_store(config=None):
+    """The ONE live Hotel Ops entrypoint: build a store for the configured target.
+
+    Resolves :func:`hotelops_pg.config.hotel_sheet_config` FIRST, so a missing or
+    unsafe Hotel target (e.g. inheriting the Dispatch ``APPA_GSHEET_ID``) fails
+    closed before a Google service is ever constructed or a cell is ever touched.
+    Pass ``config`` to inject an already-resolved target (tests / session-scoped id).
+    """
+    from hotelops_pg.config import hotel_sheet_config
+
+    cfg = config or hotel_sheet_config()
+    service = build_sheets_service(cfg["key_path"])
+    backend = GoogleBackend(service, cfg["spreadsheet_id"], tab=cfg["tab"])
+    return RoomingSheetStore(backend)
