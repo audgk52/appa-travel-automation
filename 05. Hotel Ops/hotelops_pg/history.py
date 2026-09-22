@@ -21,17 +21,31 @@ _LABELS = {
 }
 
 
+def _norm(value) -> str:
+    """Collapse surrounding/internal whitespace for the HUMAN-READABLE rendering ONLY.
+
+    Presentation layer only (§17): the raw typed value is preserved untouched in the
+    RoomingChange snapshots / field deltas / revalidation evidence and in
+    ``proposal_digest`` — this never weakens the exact OLD-value comparison, it only
+    keeps the rendered ``* MMDD`` line clean (e.g. a source cell of ``'  11 '`` renders
+    as ``11``)."""
+    return " ".join(str(value).split())
+
+
 def history_entry(request_date: str, deltas) -> str:
     """Render one concise ``* MMDD <desc>`` line for a record's VERIFIED effects.
 
     ``deltas`` are the field deltas actually applied+verified for this record; a
     failed/unapplied delta must NOT be included (§17). Returns "" if nothing was
-    verified (no history is invented).
+    verified (no history is invented). Old/new values are whitespace-normalized for
+    readability only (:func:`_norm`); the raw delta values remain the authoritative
+    evidence used by revalidation and operation identity.
     """
     business = [d for d in deltas if d.field != fields.REQUEST_HISTORY]
     if not business:
         return ""
-    parts = [f"{_LABELS.get(d.field, d.field)} {d.old or '∅'}→{d.new}" for d in business]
+    parts = [f"{_LABELS.get(d.field, d.field)} {_norm(d.old) or '∅'} → {_norm(d.new)}"
+             for d in business]
     return f"* {request_date} " + ", ".join(parts)
 
 
