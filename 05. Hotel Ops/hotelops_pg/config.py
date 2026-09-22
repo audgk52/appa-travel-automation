@@ -11,10 +11,16 @@ Schedule. Hotel Ops therefore requires a dedicated ``APPA_HOTEL_GSHEET_ID`` with
 shared Dispatch id — all BEFORE any read/write can reach another agent's sheet.
 """
 import os
+from pathlib import Path
 
 # Default managed tab (the real Rooming List carries preamble rows above the
 # managed header — the store's §12 layout resolver, not this default, finds it).
 DEFAULT_TAB = "01. Rooming List"
+
+# The authoritative PG-owned durable StateStore path must be a stable, explicit
+# location — never a temporary/scratch directory (which would not survive the
+# restart/retry contract) and never inside the repository.
+_FORBIDDEN_STATE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
 
 
 class HotelSheetConfigError(ValueError):
@@ -22,6 +28,15 @@ class HotelSheetConfigError(ValueError):
 
     Never a silent "disabled": Hotel Ops has no offline path, so an absent or
     unsafe target is an operator mistake that must stop before any live call.
+    """
+
+
+class HotelStateConfigError(ValueError):
+    """Hotel Ops durable StateStore path is missing or unsafely configured — fail closed.
+
+    PG v1 uses one JSON-backed authoritative operational store on one machine (§0/§15).
+    The path must be explicit/stable and must NOT fall back to in-memory, a temporary
+    path, or a shared cross-agent path on the supported live path.
     """
 
 
@@ -61,3 +76,50 @@ def hotel_sheet_config():
         )
     tab = os.environ.get("APPA_HOTEL_GSHEET_TAB", DEFAULT_TAB)
     return {"key_path": key, "spreadsheet_id": sid, "tab": tab}
+
+
+def _within_git_repo(path: Path) -> bool:
+    """True iff ``path`` or any ancestor directory contains a ``.git`` entry (repo guard)."""
+    for parent in [path, *path.parents]:
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
+def hotel_state_path() -> str:
+    """Resolve the authoritative PG-owned durable StateStore path (PG v1; §0/§15).
+
+    Requires ``APPA_HOTEL_STATE_PATH``. Fails closed (:class:`HotelStateConfigError`) when
+    it is missing (NO fallback to ``StateStore(None)``, a temporary path, or a shared
+    cross-agent path), not an explicit absolute path, under a temporary/scratch directory
+    (``/tmp``, ``/private/tmp`` — which also covers the Claude scratch dir — or ``/var/tmp``),
+    or inside a git repository. Validates the configured string only; it does not create
+    the file (the parent dir is created at establishment time via ``persistence_ready``).
+    Returns the absolute path string.
+    """
+    raw = os.environ.get("APPA_HOTEL_STATE_PATH")
+    if not raw:
+        raise HotelStateConfigError(
+            "APPA_HOTEL_STATE_PATH is required for Hotel Ops durable operational state and "
+            "has NO fallback (no in-memory StateStore(None), no temporary path, no shared "
+            "cross-agent path on the supported live path). Set it to a stable PG-owned path, "
+            "e.g. ~/.appa/hotel_ops/state.json."
+        )
+    path = Path(raw)
+    if not path.is_absolute():
+        raise HotelStateConfigError(
+            f"APPA_HOTEL_STATE_PATH must be an explicit absolute path; got {raw!r}."
+        )
+    s = str(path)
+    for pref in _FORBIDDEN_STATE_PREFIXES:
+        if s == pref or s.startswith(pref + "/"):
+            raise HotelStateConfigError(
+                f"APPA_HOTEL_STATE_PATH must not be under a temporary/scratch directory "
+                f"({pref}); the authoritative store must survive process restart. Got {raw!r}."
+            )
+    if _within_git_repo(path):
+        raise HotelStateConfigError(
+            f"APPA_HOTEL_STATE_PATH must not be inside a git repository; PG operational state "
+            f"lives outside the repo. Got {raw!r}."
+        )
+    return s

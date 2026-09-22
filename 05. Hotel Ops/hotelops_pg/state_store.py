@@ -23,6 +23,21 @@ class GroupingScopeError(ValueError):
     together — the state-transition primitive refuses an unchecked subset clear."""
 
 
+class StateAuthorityError(ValueError):
+    """The durable state's Hotel target binding is missing/mismatched — fail closed.
+
+    A state file bound to one Sheet target (spreadsheet_id + tab + numeric sheet_gid)
+    must never authorize or suppress operations on a DIFFERENT target, and PG never
+    silently resets or rebinds an existing binding (target isolation, §0)."""
+
+
+def _norm_identity(identity: dict) -> dict:
+    """Normalize a Hotel destination identity to the exact bound triple."""
+    return {"spreadsheet_id": str(identity["spreadsheet_id"]),
+            "tab": str(identity["tab"]),
+            "sheet_gid": int(identity["sheet_gid"])}
+
+
 class StateStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else None
@@ -33,12 +48,49 @@ class StateStore:
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
             "grouping_uncertain": {},       # record_id -> {"stay_id":..., "reason":...} (B4)
             "operations": {},               # operation_ref -> confirmed-artifact payload (B7-A)
+            "target_binding": None,         # {"spreadsheet_id","tab","sheet_gid"} authority (§0)
         }
         if self.path and self.path.exists():
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
         self._data.setdefault("grouping_uncertain", {})
         self._data.setdefault("operations", {})
+        self._data.setdefault("target_binding", None)
+
+    # --- Hotel target authority (§0; target isolation) -----------------------
+    @property
+    def target_binding(self):
+        return self._data.get("target_binding")
+
+    def bind_or_verify_target(self, identity: dict) -> dict:
+        """Establish (first use) or VERIFY the Hotel destination this state authorizes.
+
+        On first use the binding is persisted durably (before any business mutation).
+        On subsequent use a mismatch fails closed (:class:`StateAuthorityError`); PG
+        NEVER silently resets or rebinds. Returns the effective binding.
+        """
+        ident = _norm_identity(identity)
+        cur = self._data.get("target_binding")
+        if cur is None:
+            self._data["target_binding"] = ident
+            self._flush()                       # establish authority durably (§0/§15)
+            return ident
+        if _norm_identity(cur) != ident:
+            raise StateAuthorityError(
+                f"durable state is bound to {cur!r}, not {ident!r}; refusing to authorize a "
+                "different Sheet target and never silently rebinding (§0)."
+            )
+        return cur
+
+    def verify_target(self, identity: dict) -> bool:
+        """Read-only authority check (NEVER writes). An existing binding that mismatches
+        fails closed; an absent binding returns ``False`` (nothing is established here)."""
+        cur = self._data.get("target_binding")
+        if cur is not None and _norm_identity(cur) != _norm_identity(identity):
+            raise StateAuthorityError(
+                f"durable state is bound to {cur!r}, not the current target; fail closed (§0)."
+            )
+        return cur is not None
 
     @property
     def durable(self) -> bool:
