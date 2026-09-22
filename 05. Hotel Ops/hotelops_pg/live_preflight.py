@@ -131,7 +131,10 @@ def run(expect_gid=None, expect_header_a1_row=4, expect_title=None):
     print("eligible (operational)   :", sum(1 for r in records if r.eligible))
     print("would-adopt (blank id)   :", len(result.assignments))
 
-    print("\n=== AUTOMATIC MANDATORY CHECKS (all PASS — exit 0) ===")
+    review_pending = expect_gid is None or expect_title is None
+    headline = ("AUTOMATIC CHECKS PASSED — MANDATORY HUMAN REVIEW PENDING"
+                if review_pending else "AUTOMATIC CHECKS PASSED")
+    print(f"\n=== {headline} ===")
     print("  [PASS] config resolves to the Hotel-isolated target (never Dispatch)")
     print("  [PASS] spreadsheet + managed tab reachable")
     print("  [PASS] managed schema resolves; header at expected A1 row", expect_header_a1_row)

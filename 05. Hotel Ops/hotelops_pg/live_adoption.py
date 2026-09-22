@@ -234,47 +234,91 @@ def execute_adoption(store, plan: AdoptionPlan) -> AdoptionOutcome:
 def _verify_readback(store, plan: AdoptionPlan, write_error=None) -> AdoptionOutcome:
     """Classify the post-write read-back into VERIFIED / NOT_OBSERVED / UNCERTAIN (§4).
 
-    VERIFIED and NOT_OBSERVED both require the destination and frozen schema to remain
-    verifiable; otherwise the read cannot be trusted and the outcome is UNCERTAIN. A
-    captured ``write_error`` is preserved as diagnostic evidence but never changes the
-    truthful disposition and never triggers a retry, rollback, or id regeneration.
+    STRICTLY READ-ONLY: it takes ONE coherent fresh snapshot and validates it with the
+    pure planner (schema resolution, duplicate-id detection, eligible-set computation) —
+    never :meth:`read_validated` (which would adopt ids), never header creation, schema
+    repair, a default write, cleanup, retry, or rollback. Any schema/duplicate fault
+    raised by the pure validator is caught and mapped to UNCERTAIN.
+
+    Neither VERIFIED nor NOT_OBSERVED is returned unless the FULL common evidence holds:
+    the actual backend destination, frozen header row, frozen id column, and required
+    system columns are unchanged; every planned target still carries its frozen NAME
+    evidence at its position; and the complete ``rooming_record_id`` namespace is
+    duplicate-free. A captured ``write_error`` is preserved as diagnostics but never
+    changes the disposition and never triggers a retry, rollback, or id regeneration.
     """
     diag = "" if write_error is None else f" [batch raised: {write_error!r}; reconciled by read-back]"
+
+    # One coherent, strictly read-only snapshot. plan_adoption is PURE (no writes); it
+    # raises SchemaError / DuplicateRecordIdError on any schema or duplicate-id fault
+    # across the WHOLE namespace, so a duplicate (incl. a frozen id appearing twice)
+    # cannot yield a conclusive result.
     try:
         actual = _backend_destination(store)
         grid = store.backend.read_grid()
         header_row, headers = store._layout(grid)
         _require_system_columns(headers)
+        result = plan_adoption(grid[header_row:])      # dup-id raises; eligible set; NO writes
         id_col = headers[fields.ROOMING_RECORD_ID]
         name_col = headers[fields.NAME]
-        verifiable = (actual == plan.destination
-                      and header_row == plan.header_row and id_col == plan.id_col)
     except Exception as exc:                 # noqa: BLE001 — any read-back fault is UNCERTAIN
         return AdoptionOutcome(UNCERTAIN, plan.write_cells,
                                f"read-back failed ({exc!r}); outcome UNCERTAIN — stop (§4).{diag}")
+
+    # Common evidence gate for ANY conclusive result: destination + frozen schema.
+    if not (actual == plan.destination and header_row == plan.header_row and id_col == plan.id_col):
+        return AdoptionOutcome(UNCERTAIN, plan.write_cells,
+                               "read-back could not verify the destination / frozen schema; outcome "
+                               f"UNCERTAIN — stop (§4).{diag}")
 
     def _cell(row_index, col):
         row = grid[row_index] if 0 <= row_index < len(grid) else []
         return row[col] if col < len(row) else ""
 
+    # Per-target evidence, read directly from the coherent grid (never from plan_adoption's
+    # records, whose blank-row record_id it overwrites with freshly-minted plan ids).
     verified = blank = 0
+    name_evidence_ok = True
     for t in plan.targets:
         physical = header_row + 1 + t.row_index
-        if _cell(physical, id_col) == t.frozen_id and _cell(physical, name_col) == t.name:
+        name_here = _cell(physical, name_col)
+        id_here = _cell(physical, id_col)
+        if name_here != t.name:                        # changed / moved / substituted evidence
+            name_evidence_ok = False
+        if id_here == t.frozen_id and name_here == t.name:
             verified += 1
-        elif _cell(physical, id_col) == "":
+        elif id_here == "":
             blank += 1
 
     n = len(plan.targets)
-    if verifiable and verified == n:
+    by_index = {rec.row_index: rec for rec in result.records}
+    current_signature = frozenset(
+        (idx, by_index[idx].get(fields.NAME)) for idx in result.adopted_row_indexes)
+
+    # A. VERIFIED — every approved target holds its exact frozen id (namespace proven
+    #    duplicate-free above, so each frozen id occurs exactly once), NAME evidence
+    #    intact, and NO unexpected eligible blank-id record remains outside the plan
+    #    (a successfully adopted target is no longer a blank-eligible member).
+    if name_evidence_ok and verified == n and not result.adopted_row_indexes:
         return AdoptionOutcome(VERIFIED, plan.write_cells,
-                               f"all {n} frozen id(s) verified applied on the approved records.{diag}")
-    if verifiable and blank == n:
+                               f"all {n} frozen id(s) verified applied on the approved records; "
+                               f"namespace duplicate-free; no unexpected eligible blank remains.{diag}")
+
+    # B. NOT_OBSERVED — all approved target id cells blank AND the complete eligible
+    #    blank-id target signature still equals the frozen plan (no added / removed /
+    #    substituted / moved / already-adopted target).
+    if name_evidence_ok and blank == n and current_signature == plan.signature:
         return AdoptionOutcome(NOT_OBSERVED, plan.write_cells,
-                               f"all {n} target id cell(s) read blank; application NOT observed at "
-                               "this read. This is not proof an outstanding write cannot land later "
-                               f"— do not auto-retry; reconcile before any fresh A1 (§4).{diag}")
+                               f"all {n} target id cell(s) read blank with the exact original target "
+                               "signature; application NOT observed at this read. Not proof an "
+                               "outstanding write cannot land later — do not auto-retry; reconcile "
+                               f"before any fresh A1 (§4).{diag}")
+
+    # C. UNCERTAIN — anything else (changed NAME evidence, added/removed/substituted/moved
+    #    target, partial / different id, duplicate id anywhere, unexpected blank, or any
+    #    ambiguity that prevents A or B from being proven).
     return AdoptionOutcome(UNCERTAIN, plan.write_cells,
-                           f"read-back inconsistent (verifiable={verifiable}, {verified}/{n} verified, "
-                           f"{blank}/{n} blank, remainder different/ambiguous); outcome UNCERTAIN — "
-                           f"stop, no further writes, ids not regenerated (§4).{diag}")
+                           f"read-back inconsistent (name_evidence_ok={name_evidence_ok}, "
+                           f"{verified}/{n} verified, {blank}/{n} blank, eligible-blank="
+                           f"{sorted(current_signature)!r} vs planned {sorted(plan.signature)!r}); "
+                           f"outcome UNCERTAIN — stop, no further writes, ids not regenerated (§4).{diag}")

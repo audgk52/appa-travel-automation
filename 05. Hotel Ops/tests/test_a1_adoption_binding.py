@@ -21,7 +21,7 @@ from hotelops_pg.identity import ID_PREFIX
 from hotelops_pg.adoption import DuplicateRecordIdError
 from hotelops_pg.sheet_store import InMemoryBackend, RoomingSheetStore, GoogleBackend
 from hotelops_pg.live_adoption import (
-    AdoptionPlanInvalidated, preview_adoption, execute_adoption,
+    AdoptionPlanInvalidated, preview_adoption, execute_adoption, _verify_readback,
     VERIFIED, NOT_OBSERVED, UNCERTAIN,
 )
 
@@ -338,6 +338,128 @@ def test_partial_readback_no_exception_is_uncertain():
     outcome = execute_adoption(store, plan)
     assert outcome.status == UNCERTAIN and not outcome.applied
     assert len(backend.writes) == 1
+
+
+# --- read-back evidence completeness (direct _verify_readback) -------------------
+# These post-write states (changed NAME, duplicate id, added blank) are exactly the
+# residual-race conditions the pre-write gate cannot have observed (§11), so they are
+# exercised directly against the strictly read-only reconciliation path.
+
+def _plan_store(rows):
+    store, backend = _store(rows)
+    return store, backend, preview_adoption(store)
+
+
+def _apply_ids(backend, cells):
+    # Write directly into the grid (NOT via backend.write_cells), so backend.writes
+    # stays empty — proving _verify_readback itself issues no write.
+    for (r, c, v) in cells:
+        while len(backend.grid) <= r:
+            backend.grid.append([])
+        while len(backend.grid[r]) <= c:
+            backend.grid[r].append("")
+        backend.grid[r][c] = v
+
+
+def _set_name(backend, old, new):
+    nc = fields.resolve_headers(backend.grid[0])[fields.NAME]
+    for row in backend.grid[1:]:
+        if len(row) > nc and row[nc] == old:
+            row[nc] = new
+            return
+    raise AssertionError(f"row {old!r} not found")
+
+
+def test_readback_all_ids_unchanged_unique_namespace_verified():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    assert _verify_readback(store, plan).status == VERIFIED
+    assert backend.writes == []
+
+
+def test_readback_all_blank_exact_signature_not_observed():
+    store, backend, plan = _plan_store(_blank_targets())
+    assert _verify_readback(store, plan).status == NOT_OBSERVED
+    assert backend.writes == []
+
+
+def test_readback_changed_name_all_blank_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _set_name(backend, "Charlie", "Charlie CHANGED")            # evidence changed, ids blank
+    assert _verify_readback(store, plan).status == UNCERTAIN
+    assert backend.writes == []
+
+
+def test_readback_changed_name_ids_present_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    _set_name(backend, "Golf", "Golf CHANGED")
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_added_blank_target_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    backend.grid.append([str(record(name="Delta", record_id="").get(h))
+                         for h in fields.REQUIRED_BUSINESS_HEADERS + fields.SYSTEM_HEADERS])
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_substituted_target_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    _set_name(backend, "Charlie", "Substitute")
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_duplicate_frozen_id_elsewhere_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    i, headers = _grid_row(backend, "Existing")
+    backend.grid[i][headers[fields.ROOMING_RECORD_ID]] = plan.targets[0].frozen_id  # dup
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_duplicate_unrelated_id_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    i, headers = _grid_row(backend, "Existing")
+    backend.grid[i][headers[fields.ROOMING_RECORD_ID]] = "rl-shared"
+    backend.grid.append([str(record(name="Zeta", record_id="rl-shared").get(h))
+                         for h in fields.REQUIRED_BUSINESS_HEADERS + fields.SYSTEM_HEADERS])
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_partial_ids_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells[:1])
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_different_id_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    r, c, _v = plan.write_cells[0]
+    _apply_ids(backend, [(r, c, "rl-different")])
+    _apply_ids(backend, plan.write_cells[1:])
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_failure_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    backend.grid[0].remove(fields.CHECK_IN)                     # corrupt schema for read-back
+    assert _verify_readback(store, plan).status == UNCERTAIN
+
+
+def test_readback_is_strictly_read_only_and_ids_frozen():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    frozen = {t.frozen_id for t in plan.targets}
+    before = backend.read_grid()
+    _verify_readback(store, plan)
+    assert backend.read_grid() == before                        # nothing mutated
+    assert backend.writes == []
+    assert {t.frozen_id for t in plan.targets} == frozen
 
 
 # --- BLOCKER 4: exact three-cell atomic request (production path) ----------------

@@ -105,3 +105,15 @@ def test_title_match_passes(monkeypatch):
     rc = live_preflight.run(expect_gid=GID, expect_header_a1_row=4,
                             expect_title=META["properties"]["title"])
     assert rc == 0
+
+
+def test_title_omitted_headline_is_review_pending_not_all_pass(monkeypatch, capsys):
+    grid = [[""], ["APPA Hotel Ops"], [""]] + build_grid(_rows())
+    svc = _patch(monkeypatch, grid)
+    rc = live_preflight.run(expect_gid=GID, expect_header_a1_row=4)   # no expect_title
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert svc._ss.batch_calls == [] and svc._ss.values().updates == []
+    assert "MANDATORY HUMAN REVIEW PENDING" in out
+    assert "all PASS" not in out                                     # no unqualified headline
+    assert "--expect-title" in out                                  # pending item surfaced
