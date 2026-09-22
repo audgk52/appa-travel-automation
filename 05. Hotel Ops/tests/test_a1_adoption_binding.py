@@ -462,6 +462,83 @@ def test_readback_is_strictly_read_only_and_ids_frozen():
     assert {t.frozen_id for t in plan.targets} == frozen
 
 
+# --- eligibility predicate in conclusive read-back (final blocker) ---------------
+
+def _make_ineligible(backend, name):
+    """Blank every business field EXCEPT NAME for ``name``'s row, keeping its position
+    and any id — so it stays same-NAME/same-position but structurally ineligible under
+    is_eligible_record() (NAME present but no other operational value)."""
+    headers = fields.resolve_headers(backend.grid[0])
+    nc = headers[fields.NAME]
+    for row in backend.grid[1:]:
+        if len(row) > nc and row[nc] == name:
+            for h in fields.REQUIRED_BUSINESS_HEADERS:
+                if h == fields.NAME:
+                    continue
+                c = headers[h]
+                while len(row) <= c:
+                    row.append("")
+                row[c] = ""
+            return
+    raise AssertionError(f"row {name!r} not found")
+
+
+def _assert_adversarial(backend, plan, frozen):
+    """Read-only reconciliation: no writes, grid untouched, frozen ids unchanged."""
+    before = backend.read_grid()
+    status = _verify_readback(store=RoomingSheetStore(backend), plan=plan).status
+    assert backend.writes == []
+    assert backend.read_grid() == before
+    assert {t.frozen_id for t in plan.targets} == frozen
+    return status
+
+
+def test_readback_target_ineligible_ids_present_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    _make_ineligible(backend, "Charlie")                        # same NAME/position, ineligible
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == UNCERTAIN
+
+
+def test_readback_target_ineligible_all_blank_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _make_ineligible(backend, "Charlie")                        # ids stay blank, ineligible
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == UNCERTAIN
+
+
+def test_readback_all_eligible_unique_frozen_ids_is_verified():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == VERIFIED
+
+
+def test_readback_all_eligible_blank_exact_signature_is_not_observed():
+    store, backend, plan = _plan_store(_blank_targets())
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == NOT_OBSERVED
+
+
+def test_readback_planned_row_removed_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    nc = fields.resolve_headers(backend.grid[0])[fields.NAME]
+    backend.grid[:] = ([backend.grid[0]]
+                       + [r for r in backend.grid[1:] if not (len(r) > nc and r[nc] == "Golf")])
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == UNCERTAIN
+
+
+def test_readback_planned_row_moved_is_uncertain():
+    store, backend, plan = _plan_store(_blank_targets())
+    _apply_ids(backend, plan.write_cells)
+    backend.grid[1], backend.grid[3] = backend.grid[3], backend.grid[1]   # move planned rows
+    frozen = {t.frozen_id for t in plan.targets}
+    assert _assert_adversarial(backend, plan, frozen) == UNCERTAIN
+
+
 # --- BLOCKER 4: exact three-cell atomic request (production path) ----------------
 
 META = {

@@ -260,7 +260,6 @@ def _verify_readback(store, plan: AdoptionPlan, write_error=None) -> AdoptionOut
         _require_system_columns(headers)
         result = plan_adoption(grid[header_row:])      # dup-id raises; eligible set; NO writes
         id_col = headers[fields.ROOMING_RECORD_ID]
-        name_col = headers[fields.NAME]
     except Exception as exc:                 # noqa: BLE001 — any read-back fault is UNCERTAIN
         return AdoptionOutcome(UNCERTAIN, plan.write_cells,
                                f"read-back failed ({exc!r}); outcome UNCERTAIN — stop (§4).{diag}")
@@ -275,50 +274,55 @@ def _verify_readback(store, plan: AdoptionPlan, write_error=None) -> AdoptionOut
         row = grid[row_index] if 0 <= row_index < len(grid) else []
         return row[col] if col < len(row) else ""
 
-    # Per-target evidence, read directly from the coherent grid (never from plan_adoption's
-    # records, whose blank-row record_id it overwrites with freshly-minted plan ids).
+    by_index = {rec.row_index: rec for rec in result.records}
+
+    # Per-target COMMON evidence — the single predicate both conclusive outcomes share,
+    # so VERIFIED and NOT_OBSERVED can never diverge on it. Each planned target must
+    # STILL: be present at its planned position, carry its frozen NAME, and remain
+    # ELIGIBLE under the existing is_eligible_record() rule — read from THIS fresh
+    # snapshot's record (never inferred from the frozen id, from preview-time
+    # eligibility, or from a post-mint planner id). Id state is read from the grid
+    # (plan_adoption overwrites blank rows' record_id with freshly-minted plan ids).
+    targets_ok = True
     verified = blank = 0
-    name_evidence_ok = True
     for t in plan.targets:
-        physical = header_row + 1 + t.row_index
-        name_here = _cell(physical, name_col)
-        id_here = _cell(physical, id_col)
-        if name_here != t.name:                        # changed / moved / substituted evidence
-            name_evidence_ok = False
+        rec = by_index.get(t.row_index)
+        name_here = rec.get(fields.NAME) if rec is not None else None
+        id_here = _cell(header_row + 1 + t.row_index, id_col)
+        if rec is None or name_here != t.name or not rec.eligible:
+            targets_ok = False                         # missing / moved / renamed / now ineligible
         if id_here == t.frozen_id and name_here == t.name:
             verified += 1
         elif id_here == "":
             blank += 1
 
     n = len(plan.targets)
-    by_index = {rec.row_index: rec for rec in result.records}
     current_signature = frozenset(
         (idx, by_index[idx].get(fields.NAME)) for idx in result.adopted_row_indexes)
 
-    # A. VERIFIED — every approved target holds its exact frozen id (namespace proven
-    #    duplicate-free above, so each frozen id occurs exactly once), NAME evidence
-    #    intact, and NO unexpected eligible blank-id record remains outside the plan
-    #    (a successfully adopted target is no longer a blank-eligible member).
-    if name_evidence_ok and verified == n and not result.adopted_row_indexes:
+    # A. VERIFIED — common evidence holds; every approved target holds its exact frozen
+    #    id (namespace proven duplicate-free above, so each frozen id occurs exactly
+    #    once); and NO unexpected eligible blank-id record remains outside the plan.
+    if targets_ok and verified == n and not result.adopted_row_indexes:
         return AdoptionOutcome(VERIFIED, plan.write_cells,
-                               f"all {n} frozen id(s) verified applied on the approved records; "
-                               f"namespace duplicate-free; no unexpected eligible blank remains.{diag}")
+                               f"all {n} frozen id(s) verified applied on the approved (present, "
+                               "named, eligible) records; namespace duplicate-free; no unexpected "
+                               f"eligible blank remains.{diag}")
 
-    # B. NOT_OBSERVED — all approved target id cells blank AND the complete eligible
-    #    blank-id target signature still equals the frozen plan (no added / removed /
-    #    substituted / moved / already-adopted target).
-    if name_evidence_ok and blank == n and current_signature == plan.signature:
+    # B. NOT_OBSERVED — common evidence holds; all approved target id cells blank; AND
+    #    the complete eligible blank-id target signature still equals the frozen plan.
+    if targets_ok and blank == n and current_signature == plan.signature:
         return AdoptionOutcome(NOT_OBSERVED, plan.write_cells,
                                f"all {n} target id cell(s) read blank with the exact original target "
                                "signature; application NOT observed at this read. Not proof an "
                                "outstanding write cannot land later — do not auto-retry; reconcile "
                                f"before any fresh A1 (§4).{diag}")
 
-    # C. UNCERTAIN — anything else (changed NAME evidence, added/removed/substituted/moved
-    #    target, partial / different id, duplicate id anywhere, unexpected blank, or any
-    #    ambiguity that prevents A or B from being proven).
+    # C. UNCERTAIN — anything else (missing/moved/renamed/now-ineligible target, added/
+    #    substituted target, partial / different id, duplicate id anywhere, unexpected
+    #    blank, or any ambiguity that prevents A or B from being proven).
     return AdoptionOutcome(UNCERTAIN, plan.write_cells,
-                           f"read-back inconsistent (name_evidence_ok={name_evidence_ok}, "
+                           f"read-back inconsistent (targets_ok={targets_ok}, "
                            f"{verified}/{n} verified, {blank}/{n} blank, eligible-blank="
                            f"{sorted(current_signature)!r} vs planned {sorted(plan.signature)!r}); "
                            f"outcome UNCERTAIN — stop, no further writes, ids not regenerated (§4).{diag}")
