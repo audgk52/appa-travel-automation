@@ -28,9 +28,23 @@ class InMemoryBackend:
     preamble rows above the managed header, and unmanaged leading columns like column A).
     Targeted, neighbour-preserving writes by ABSOLUTE physical (row, col)."""
 
-    def __init__(self, grid=None):
+    def __init__(self, grid=None, identity=None):
         self.grid = [list(r) for r in (grid or [])]
         self.writes = []  # (row_index, col_index, value) — audit that writes are targeted
+        # Deterministic destination identity for A1 binding tests (mirrors the fields a
+        # live GoogleBackend resolves): {"spreadsheet_id", "tab", "sheet_gid"} or None.
+        self._identity = dict(identity) if identity else None
+
+    def destination_identity(self):
+        """The ACTUAL identity an A1 write would target (§ blocker 1).
+
+        In-memory backends expose deterministic metadata only when configured; an
+        unconfigured backend has no live destination and refuses to be used as one."""
+        if self._identity is None:
+            raise RuntimeError(
+                "InMemoryBackend has no destination identity; pass identity={'spreadsheet_id',"
+                "'tab','sheet_gid'} to use it as an A1 execution target.")
+        return dict(self._identity)
 
     def read_grid(self):
         return [list(r) for r in self.grid]
@@ -218,6 +232,26 @@ class GoogleBackend:
 
     def _values(self):
         return self.service.spreadsheets().values()
+
+    def destination_identity(self):
+        """Read (NO write) the ACTUAL identity this backend will write to: its
+        spreadsheet id, its tab title, and the numeric ``sheetId`` ``updateCells``
+        requires (§ blocker 1). The gid is resolved from live metadata for THIS
+        backend's own tab, so the A1 plan is bound to the real API destination —
+        never a caller-supplied value that could name a different backend.
+
+        Fails closed (:class:`fields.SchemaError`) if the tab is absent — the gid
+        cannot be resolved, so no A1 write may proceed.
+        """
+        meta = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        for sh in meta.get("sheets", []):
+            p = sh.get("properties", {})
+            if p.get("title") == self.tab:
+                return {"spreadsheet_id": self.spreadsheet_id, "tab": self.tab,
+                        "sheet_gid": p.get("sheetId")}
+        raise fields.SchemaError(
+            f"tab {self.tab!r} not found in spreadsheet {self.spreadsheet_id!r}; cannot "
+            "resolve its sheetId — fail closed before any A1 write.")
 
     @staticmethod
     def _a1_col(n):  # 0-based index -> A1 letters

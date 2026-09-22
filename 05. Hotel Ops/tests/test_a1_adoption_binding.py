@@ -1,10 +1,18 @@
-"""LIVE-1 A1 bound-adoption contract (PRD §2/§4; remediation of Codex findings 3 & 4).
+"""LIVE-1 A1 bound-adoption contract (PRD §2/§4).
 
-Proves the A1 write is bound to an explicit, destination-anchored plan and executed
-atomically: the previewed target set is executed (never silently re-planned), any drift
-invalidates with ZERO writes, the write is one atomic Sheets call of exactly the planned
-id cells, frozen ids survive an uncertain outcome, and read-back is reported truthfully.
+Covers the original Codex findings (3 & 4) and the Sol 5.6 xhigh re-audit blockers:
+
+* the plan is bound to the ACTUAL store/backend destination (spreadsheet / tab /
+  numeric sheetId), not a caller-supplied value (blocker 1);
+* the frozen managed header row, rooming_record_id column, required stay_id column, and
+  the exact three one-cell write ranges are enforced — execution never migrates to newly
+  discovered coordinates (blocker 2);
+* a batchUpdate exception is reconciled by read-back into verified/not_observed/uncertain
+  rather than escaping raw (blocker 3);
+* the atomic request is exactly one batchUpdate of N single-cell updateCells (blocker 4).
 """
+import dataclasses
+
 import pytest
 
 from conftest import build_grid, record
@@ -13,17 +21,17 @@ from hotelops_pg.identity import ID_PREFIX
 from hotelops_pg.adoption import DuplicateRecordIdError
 from hotelops_pg.sheet_store import InMemoryBackend, RoomingSheetStore, GoogleBackend
 from hotelops_pg.live_adoption import (
-    AdoptionDestination, AdoptionPlanInvalidated,
-    preview_adoption, execute_adoption,
+    AdoptionPlanInvalidated, preview_adoption, execute_adoption,
     VERIFIED, NOT_OBSERVED, UNCERTAIN,
 )
 
-DEST = AdoptionDestination(spreadsheet_id="hotel-throwaway", tab="01. Rooming List",
-                           sheet_gid=655539279)
+IDENTITY = {"spreadsheet_id": "hotel-throwaway", "tab": "01. Rooming List",
+            "sheet_gid": 655539279}
 
 
-def _store(rows, include_system=True):
-    backend = InMemoryBackend(build_grid(rows, include_system=include_system))
+def _store(rows, include_system=True, identity=None, backend_cls=InMemoryBackend):
+    backend = backend_cls(build_grid(rows, include_system=include_system),
+                          identity=dict(identity or IDENTITY))
     return RoomingSheetStore(backend), backend
 
 
@@ -36,48 +44,14 @@ def _blank_targets():
     ]
 
 
-# --- preview binds the full eligible set with frozen ids -------------------------
+def _three_blank():
+    return [
+        record(name="Charlie", record_id=""),
+        record(name="Existing", record_id="rl-existing"),
+        record(name="Golf", record_id=""),
+        record(name="Hotel", record_id=""),
+    ]
 
-def test_preview_binds_full_eligible_blank_set_with_frozen_ids():
-    store, _ = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    assert {t.name for t in plan.targets} == {"Charlie", "Golf"}   # only blank-id eligibles
-    assert all(t.frozen_id.startswith(ID_PREFIX) for t in plan.targets)
-    assert len({t.frozen_id for t in plan.targets}) == len(plan.targets)  # unique
-    assert plan.destination == DEST
-
-
-# --- happy path: exactly the planned cells, atomically, verified -----------------
-
-def test_execute_applies_exactly_planned_id_cells_and_verifies():
-    store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    outcome = execute_adoption(store, plan, DEST)
-
-    assert outcome.status == VERIFIED and outcome.applied
-    id_col = fields.resolve_headers(backend.read_grid()[0])[fields.ROOMING_RECORD_ID]
-    # Exactly len(targets) writes, all to the id column, all frozen ids.
-    assert len(backend.writes) == len(plan.targets)
-    assert all(col == id_col for _r, col, _v in backend.writes)
-    assert {v for _r, _c, v in backend.writes} == {t.frozen_id for t in plan.targets}
-    # No business/system-other cell touched.
-    recs = {r.get(fields.NAME): r for r in store.snapshot_records()}
-    assert recs["Charlie"].record_id and recs["Golf"].record_id
-    assert recs["Existing"].record_id == "rl-existing"            # neighbour untouched
-
-
-# --- destination change invalidates with zero writes -----------------------------
-
-def test_destination_change_invalidates_zero_writes():
-    store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    other = AdoptionDestination("SOME-OTHER-SHEET", "01. Rooming List", 111)
-    with pytest.raises(AdoptionPlanInvalidated):
-        execute_adoption(store, plan, other)
-    assert backend.writes == []
-
-
-# --- target-set drift each invalidates with zero writes --------------------------
 
 def _grid_row(backend, name):
     grid = backend.read_grid()
@@ -85,70 +59,180 @@ def _grid_row(backend, name):
     ncol = headers[fields.NAME]
     for i, row in enumerate(grid[1:], start=1):
         if (row[ncol] if ncol < len(row) else "") == name:
-            return i, grid, headers
+            return i, headers
     raise AssertionError(f"row {name!r} not found")
 
 
+# --- preview / happy path --------------------------------------------------------
+
+def test_preview_binds_full_eligible_blank_set_with_frozen_ids():
+    store, _ = _store(_blank_targets())
+    plan = preview_adoption(store)
+    assert {t.name for t in plan.targets} == {"Charlie", "Golf"}
+    assert all(t.frozen_id.startswith(ID_PREFIX) for t in plan.targets)
+    assert len({t.frozen_id for t in plan.targets}) == len(plan.targets)
+    assert (plan.destination.spreadsheet_id, plan.destination.tab,
+            plan.destination.sheet_gid) == (IDENTITY["spreadsheet_id"],
+                                            IDENTITY["tab"], IDENTITY["sheet_gid"])
+    assert len(plan.write_cells) == len(plan.targets)
+
+
+def test_matching_identity_executes_and_verifies():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == VERIFIED and outcome.applied
+    id_col = fields.resolve_headers(backend.read_grid()[0])[fields.ROOMING_RECORD_ID]
+    assert len(backend.writes) == len(plan.targets)
+    assert all(col == id_col for _r, col, _v in backend.writes)
+    assert {v for _r, _c, v in backend.writes} == {t.frozen_id for t in plan.targets}
+    recs = {r.get(fields.NAME): r for r in store.snapshot_records()}
+    assert recs["Charlie"].record_id and recs["Golf"].record_id
+    assert recs["Existing"].record_id == "rl-existing"        # neighbour untouched
+
+
+# --- BLOCKER 1: bound to the ACTUAL backend identity -----------------------------
+
+def test_plan_spreadsheet_id_differs_from_backend_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    backend._identity["spreadsheet_id"] = "OTHER-SHEET"       # backend now points elsewhere
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_plan_tab_differs_from_backend_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    backend._identity["tab"] = "Some Other Tab"
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_plan_sheet_gid_differs_from_backend_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    backend._identity["sheet_gid"] = 999999                   # numeric sheetId changed
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+# --- BLOCKER 2: frozen schema / permitted write set ------------------------------
+
+def test_leading_unmanaged_column_inserted_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    for row in backend.grid:                                  # shift every column right by 1
+        row.insert(0, "x")
+    with pytest.raises(AdoptionPlanInvalidated):              # id column moved
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_managed_header_row_moved_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    backend.grid.insert(0, [""])                              # header now one row lower
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_rooming_record_id_column_moved_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    idc = fields.resolve_headers(backend.read_grid()[0])[fields.ROOMING_RECORD_ID]
+    for row in backend.grid:                                  # relocate the id column to front
+        while len(row) <= idc:
+            row.append("")
+        row.insert(0, row.pop(idc))
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_stay_id_column_removed_stops_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    scol = fields.resolve_headers(backend.read_grid()[0])[fields.STAY_ID]
+    for row in backend.grid:
+        if scol < len(row):
+            del row[scol]
+    with pytest.raises(fields.SchemaError):                   # missing system column, no header creation
+        execute_adoption(store, plan)
+    assert backend.writes == []
+
+
+def test_write_range_drift_invalidates_zero_writes():
+    store, backend = _store(_blank_targets())
+    plan = preview_adoption(store)
+    tampered = dataclasses.replace(
+        plan, write_cells=tuple((r + 5, c, v) for (r, c, v) in plan.write_cells))
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, tampered)
+    assert backend.writes == []
+
+
+# --- target-set drift (already-accepted signature model) -------------------------
+
 def test_added_target_invalidates_zero_writes():
     store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
+    plan = preview_adoption(store)
     backend.grid.append([str(record(name="Delta", record_id="").get(h))
                          for h in fields.REQUIRED_BUSINESS_HEADERS + fields.SYSTEM_HEADERS])
     with pytest.raises(AdoptionPlanInvalidated):
-        execute_adoption(store, plan, DEST)
+        execute_adoption(store, plan)
     assert backend.writes == []
 
 
 def test_removed_target_invalidates_zero_writes():
     store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    # Blank a target's NAME → it stops being an eligible record → set shrinks.
-    i, grid, headers = _grid_row(backend, "Golf")
+    plan = preview_adoption(store)
+    i, headers = _grid_row(backend, "Golf")
     backend.grid[i][headers[fields.NAME]] = ""
     with pytest.raises(AdoptionPlanInvalidated):
-        execute_adoption(store, plan, DEST)
+        execute_adoption(store, plan)
     assert backend.writes == []
 
 
 def test_substituted_target_invalidates_zero_writes():
     store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    i, grid, headers = _grid_row(backend, "Charlie")
-    backend.grid[i][headers[fields.NAME]] = "Charlie RENAMED"     # NAME evidence changed
+    plan = preview_adoption(store)
+    i, headers = _grid_row(backend, "Charlie")
+    backend.grid[i][headers[fields.NAME]] = "Charlie RENAMED"
     with pytest.raises(AdoptionPlanInvalidated):
-        execute_adoption(store, plan, DEST)
+        execute_adoption(store, plan)
     assert backend.writes == []
 
 
 def test_newly_id_assigned_target_invalidates_zero_writes():
     store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    # Someone else adopted an id into a planned target between preview and execute.
-    i, grid, headers = _grid_row(backend, "Charlie")
+    plan = preview_adoption(store)
+    i, headers = _grid_row(backend, "Charlie")
     backend.grid[i][headers[fields.ROOMING_RECORD_ID]] = "rl-external"
     with pytest.raises(AdoptionPlanInvalidated):
-        execute_adoption(store, plan, DEST)
+        execute_adoption(store, plan)
     assert backend.writes == []
 
 
 def test_reorder_invalidates_safely_zero_writes():
     store, backend = _store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    # Swap the two data rows around 'Existing' (row positions of targets change).
+    plan = preview_adoption(store)
     backend.grid[1], backend.grid[3] = backend.grid[3], backend.grid[1]
-    with pytest.raises(AdoptionPlanInvalidated):     # safe invalidation is acceptable (§4)
-        execute_adoption(store, plan, DEST)
+    with pytest.raises(AdoptionPlanInvalidated):
+        execute_adoption(store, plan)
     assert backend.writes == []
 
 
-# --- schema / duplicate-id fail-fast, zero writes, no header creation ------------
+# --- schema / duplicate-id fail-fast ---------------------------------------------
 
 def test_missing_system_columns_stops_and_creates_no_header():
     store, backend = _store(_blank_targets(), include_system=False)
-    before = backend.read_grid()
     with pytest.raises(fields.SchemaError):
-        preview_adoption(store, DEST)
-    assert backend.read_grid() == before            # no header appended, no cell written
+        preview_adoption(store)
     assert backend.writes == []
 
 
@@ -158,11 +242,111 @@ def test_duplicate_id_stops_zero_writes():
         record(name="Golf", record_id="rl-dup"),
     ])
     with pytest.raises(DuplicateRecordIdError):
-        preview_adoption(store, DEST)
+        preview_adoption(store)
     assert backend.writes == []
 
 
-# --- one atomic API request of exactly N updateCells (GoogleBackend) -------------
+# --- BLOCKER 3: batchUpdate exception → read-back reconciliation ------------------
+
+class _ApplyThenRaiseBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        super().atomic_write_cells(sheet_gid, cells)
+        raise RuntimeError("transport blip AFTER all cells applied")
+
+
+class _RaiseNoApplyBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        raise RuntimeError("transport blip, NOTHING applied")
+
+
+class _PartialThenRaiseBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        super().atomic_write_cells(sheet_gid, list(cells)[:1])
+        raise RuntimeError("transport blip after PARTIAL apply")
+
+
+class _CorruptReadbackBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        super().atomic_write_cells(sheet_gid, cells)
+        self.grid[0].remove(fields.CHECK_IN)               # break schema for read-back
+
+
+class _BlackholeBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        self.attempted = list(cells)                       # accepted, never persisted
+
+
+class _PartialBackend(InMemoryBackend):
+    def atomic_write_cells(self, sheet_gid, cells):
+        super().atomic_write_cells(sheet_gid, list(cells)[:1])
+
+
+def test_batch_applies_all_then_raises_is_verified():
+    store, backend = _store(_blank_targets(), backend_cls=_ApplyThenRaiseBackend)
+    plan = preview_adoption(store)
+    frozen = {t.frozen_id for t in plan.targets}
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == VERIFIED and outcome.applied
+    assert "batch raised" in outcome.detail
+    assert {v for _r, _c, v in outcome.written} == frozen
+    assert {t.frozen_id for t in plan.targets} == frozen     # ids unchanged
+
+
+def test_batch_applies_nothing_then_raises_is_not_observed():
+    store, backend = _store(_blank_targets(), backend_cls=_RaiseNoApplyBackend)
+    plan = preview_adoption(store)
+    frozen = {t.frozen_id for t in plan.targets}
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == NOT_OBSERVED and not outcome.applied
+    assert backend.writes == []                              # no second write
+    assert {t.frozen_id for t in plan.targets} == frozen
+
+
+def test_partial_then_raises_is_uncertain_no_topup():
+    store, backend = _store(_blank_targets(), backend_cls=_PartialThenRaiseBackend)
+    plan = preview_adoption(store)
+    frozen = {t.frozen_id for t in plan.targets}
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == UNCERTAIN and not outcome.applied
+    assert len(backend.writes) == 1                          # only the partial cell; no top-up
+    assert {t.frozen_id for t in plan.targets} == frozen
+
+
+def test_readback_exception_is_uncertain_ids_frozen():
+    store, backend = _store(_blank_targets(), backend_cls=_CorruptReadbackBackend)
+    plan = preview_adoption(store)
+    frozen = {t.frozen_id for t in plan.targets}
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == UNCERTAIN and not outcome.applied
+    assert {t.frozen_id for t in plan.targets} == frozen
+
+
+def test_blank_readback_no_exception_is_not_observed_ids_frozen():
+    store, backend = _store(_blank_targets(), backend_cls=_BlackholeBackend)
+    plan = preview_adoption(store)
+    frozen = {t.frozen_id for t in plan.targets}
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == NOT_OBSERVED and not outcome.applied
+    assert "do not auto-retry" in outcome.detail.lower()
+    assert {v for _r, _c, v in outcome.written} == frozen
+    assert {t.frozen_id for t in plan.targets} == frozen
+
+
+def test_partial_readback_no_exception_is_uncertain():
+    store, backend = _store(_blank_targets(), backend_cls=_PartialBackend)
+    plan = preview_adoption(store)
+    outcome = execute_adoption(store, plan)
+    assert outcome.status == UNCERTAIN and not outcome.applied
+    assert len(backend.writes) == 1
+
+
+# --- BLOCKER 4: exact three-cell atomic request (production path) ----------------
+
+META = {
+    "properties": {"title": "APPA Hotel Ops - Live Verification Throwaway (PII-Free)"},
+    "sheets": [{"properties": {"title": "01. Rooming List", "sheetId": 655539279}}],
+}
+
 
 class _Exec:
     def __init__(self, result):
@@ -172,26 +356,31 @@ class _Exec:
         return self._result
 
 
-class _FakeSheets:
-    """Minimal Sheets v4 fake: values().get + spreadsheets().batchUpdate (+ .get)."""
-
-    def __init__(self, grid, meta=None):
+class _FakeValues:
+    def __init__(self, grid):
         self.grid = grid
-        self.meta = meta or {}
-        self.batch_calls = []          # bodies passed to spreadsheets().batchUpdate
-        self.value_updates = []        # any values().update (must stay empty for A1)
+        self.updates = []
 
-    # values() sub-service
     def get(self, spreadsheetId=None, range=None):
         return _Exec({"values": self.grid})
 
-    def update(self, spreadsheetId=None, range=None, valueInputOption=None, body=None):
-        self.value_updates.append((range, body))
+    def update(self, **kw):
+        self.updates.append(kw)               # must remain empty for A1
         return _Exec({})
 
-    # spreadsheets() sub-service
+
+class _FakeSpreadsheets:
+    def __init__(self, grid, meta):
+        self._values = _FakeValues(grid)
+        self.grid = self._values.grid          # SAME list object values().get() reads
+        self.meta = meta
+        self.batch_calls = []
+
     def values(self):
-        return self
+        return self._values
+
+    def get(self, spreadsheetId=None):
+        return _Exec(self.meta)
 
     def batchUpdate(self, spreadsheetId=None, body=None):
         self.batch_calls.append(body)
@@ -207,70 +396,44 @@ class _FakeSheets:
             self.grid[r][c] = val
         return _Exec({})
 
+
+class _FakeService:
+    def __init__(self, grid, meta):
+        self._ss = _FakeSpreadsheets([list(r) for r in grid], meta)
+
     def spreadsheets(self):
-        return self
-
-    def get_meta(self, spreadsheetId=None):
-        return _Exec(self.meta)
+        return self._ss
 
 
-def _google_store(rows):
-    grid = build_grid(rows)
-    svc = _FakeSheets([list(r) for r in grid])
+def test_atomic_request_exact_three_cell_shape():
+    svc = _FakeService(build_grid(_three_blank()), META)
     store = RoomingSheetStore(GoogleBackend(svc, "hotel-throwaway", tab="01. Rooming List"))
-    return store, svc
-
-
-def test_atomic_write_is_one_batchupdate_of_exactly_n_updatecells():
-    store, svc = _google_store(_blank_targets())
-    plan = preview_adoption(store, DEST)
-    outcome = execute_adoption(store, plan, DEST)
-
+    plan = preview_adoption(store)
+    assert len(plan.targets) == 3
+    outcome = execute_adoption(store, plan)
     assert outcome.status == VERIFIED
-    assert len(svc.batch_calls) == 1                              # ONE atomic API call
-    reqs = svc.batch_calls[0]["requests"]
-    assert len(reqs) == len(plan.targets)                         # exactly N updateCells
-    assert all("updateCells" in r for r in reqs)
-    assert all(r["updateCells"]["range"]["sheetId"] == DEST.sheet_gid for r in reqs)
-    assert svc.value_updates == []                                # no per-cell values().update
 
+    ss = svc._ss
+    assert len(ss.batch_calls) == 1                          # exactly one atomic API call
+    body = ss.batch_calls[0]
+    assert set(body.keys()) == {"requests"}                  # no extra body property
+    reqs = body["requests"]
+    assert len(reqs) == 3                                     # exactly three updateCells
 
-# --- uncertain-outcome handling: frozen ids never regenerate ---------------------
+    id_by_row = {r: v for (r, _c, v) in plan.write_cells}
+    for req in reqs:
+        assert set(req.keys()) == {"updateCells"}
+        uc = req["updateCells"]
+        assert set(uc.keys()) == {"range", "rows", "fields"}
+        rng = uc["range"]
+        assert rng["sheetId"] == 655539279                   # approved numeric sheet id
+        assert rng["endRowIndex"] - rng["startRowIndex"] == 1     # one cell tall
+        assert rng["endColumnIndex"] - rng["startColumnIndex"] == 1  # one cell wide
+        assert rng["startColumnIndex"] == plan.id_col        # only rooming_record_id
+        assert uc["fields"] == "userEnteredValue"            # exact field mask
+        vals = uc["rows"][0]["values"]
+        assert len(vals) == 1 and set(vals[0].keys()) == {"userEnteredValue"}
+        assert set(vals[0]["userEnteredValue"].keys()) == {"stringValue"}
+        assert vals[0]["userEnteredValue"]["stringValue"] == id_by_row[rng["startRowIndex"]]
 
-class _BlackholeBackend(InMemoryBackend):
-    """Accepts the atomic write but never persists it (models an unobserved write)."""
-
-    def atomic_write_cells(self, sheet_gid, cells):
-        self.attempted = list(cells)                              # recorded, not applied
-
-
-class _PartialBackend(InMemoryBackend):
-    """Persists only the FIRST planned cell (models a partial/ambiguous outcome)."""
-
-    def atomic_write_cells(self, sheet_gid, cells):
-        first = list(cells)[:1]
-        super().atomic_write_cells(sheet_gid, first)
-
-
-def test_blank_readback_is_not_observed_not_auto_retry_and_ids_frozen():
-    backend = _BlackholeBackend(build_grid(_blank_targets()))
-    store = RoomingSheetStore(backend)
-    plan = preview_adoption(store, DEST)
-    frozen_before = {t.frozen_id for t in plan.targets}
-
-    outcome = execute_adoption(store, plan, DEST)
-    assert outcome.status == NOT_OBSERVED and not outcome.applied
-    assert "not proof" in outcome.detail.lower() or "do not auto-retry" in outcome.detail.lower()
-    # Frozen ids submitted are exactly the plan's — never regenerated on uncertainty.
-    assert {v for _r, _c, v in outcome.written} == frozen_before
-    assert {t.frozen_id for t in plan.targets} == frozen_before   # plan unchanged
-
-
-def test_partial_readback_is_uncertain_no_further_write():
-    backend = _PartialBackend(build_grid(_blank_targets()))
-    store = RoomingSheetStore(backend)
-    plan = preview_adoption(store, DEST)
-    outcome = execute_adoption(store, plan, DEST)
-    assert outcome.status == UNCERTAIN and not outcome.applied
-    # Only the single partial cell landed; A1 does not top up the remainder.
-    assert len(backend.writes) == 1
+    assert ss._values.updates == []                          # no per-cell values().update

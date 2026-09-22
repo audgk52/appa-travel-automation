@@ -66,14 +66,18 @@ are observation evidence, never durable target identity.**
 - **Purpose:** system-maintenance adoption assigns a `rooming_record_id` to each
   eligible blank-id operational row, only after whole-sheet schema + dup-id pass.
 - **Entrypoint — bound two-phase (NOT `read_validated`):**
-  `plan = live_adoption.preview_adoption(store, destination)` then
-  `live_adoption.execute_adoption(store, plan, destination)`. The store is built by
-  `open_rooming_store()` (Hotel-isolated config, no injection); `destination`
-  (`AdoptionDestination(spreadsheet_id, tab, sheet_gid)`) is resolved fresh from the
-  config + the P3 metadata read and passed to **both** calls. This IS the exact-
-  instance gate: `preview_adoption` produces the explicit, destination-anchored plan
-  (Section 0 step 2), the PO confirms **that plan**, and `execute_adoption`
-  re-validates and executes **that same plan** — never a re-discovered set.
+  `plan = live_adoption.preview_adoption(store)` then
+  `live_adoption.execute_adoption(store, plan)`. The store is built by
+  `open_rooming_store()` (Hotel-isolated config, no injection). The destination is
+  **derived from the ACTUAL backend** the API request will use —
+  `store.backend.destination_identity()` reads (no-write) the backend's spreadsheet
+  id, tab title, and the numeric `sheetId` `updateCells` needs — at **both** preview
+  and execute; it is never a caller-supplied value that could name a different
+  backend. This IS the exact-instance gate: `preview_adoption` produces the explicit,
+  backend-anchored plan (Section 0 step 2), the PO confirms **that plan**, and
+  `execute_adoption` re-derives the backend identity + re-validates and executes
+  **that same plan** — never a re-discovered set. A change in the backend's actual
+  spreadsheet id / tab / sheetId invalidates with zero writes.
   > **Do NOT use `store.read_validated()` for LIVE-1 A1.** That reader re-plans
   > adoption for whatever blanks exist at call time and would also auto-create the
   > system columns — both forbidden here (§4).
@@ -88,18 +92,26 @@ are observation evidence, never durable target identity.**
 - **Proposed new values:** the plan's **frozen** minted ids (`identity.new_record_id`,
   one per target, minted once at preview and never regenerated).
 - **Plan-binding revalidation (execute, before any write):** `execute_adoption`
-  fails closed with **zero writes** if the destination changed, or if the fresh
-  eligible target set differs from the plan in any way — added / removed /
-  substituted / **reordered** / already-id-assigned target (`AdoptionPlanInvalidated`);
-  or on any schema / duplicate-id fault (`SchemaError` / `DuplicateRecordIdError`).
-  Pre-id NAME/row are not durable identity (§3), so a reorder is **safely
-  invalidated**, not guessed — take a fresh preview and re-confirm.
+  fails closed with **zero writes** if any of the following changed since preview:
+  the **actual backend destination** (spreadsheet id / tab / numeric sheetId); the
+  **frozen schema** (managed header row moved, `rooming_record_id` column moved, or a
+  missing `stay_id`/system column — a `SchemaError`, never header creation); the
+  **eligible target set** (added / removed / substituted / **reordered** / already-id-
+  assigned — `AdoptionPlanInvalidated`); or the **exact three one-cell write ranges**.
+  Execution never migrates the approved write set onto newly-discovered coordinates.
+  Also fails closed on any duplicate-id fault (`DuplicateRecordIdError`). Pre-id
+  NAME/row are not durable identity (§3), so a reorder is **safely invalidated**, not
+  guessed — take a fresh preview and re-confirm.
 - **Write primitive:** one atomic `spreadsheets().batchUpdate` of exactly the frozen
   id cells (documented all-or-none — "if any request is not valid … nothing will be
   applied"). Three targets ⇒ one API call, three `updateCells` requests. No per-cell
   `values().update`.
 - **Read-back outcome (§4 A/B/C) — reported truthfully, never inferred from the API
-  ack:**
+  ack.** A batch write **exception** is treated as an ambiguous server outcome and
+  reconciled through the SAME read-back (the exception is preserved as diagnostics,
+  never surfaced raw, never auto-retried, never rolled back). `verified`/`not_observed`
+  additionally require the destination + frozen schema to remain verifiable; otherwise
+  `uncertain`:
   - **A / `verified`** — every frozen id observed on its correctly-resolved approved
     record (id cell holds the frozen id AND NAME still matches): applied.
   - **B / `not_observed`** — all target id cells read blank: application **not

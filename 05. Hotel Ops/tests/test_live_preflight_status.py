@@ -88,3 +88,20 @@ def test_all_conditions_pass_returns_zero(monkeypatch):
     rc = live_preflight.run(expect_gid=GID, expect_header_a1_row=4)
     assert rc == 0
     assert svc._ss.batch_calls == [] and svc._ss.values().updates == []   # still zero writes
+
+
+def test_title_mismatch_fails_closed_nonzero_no_writes(monkeypatch):
+    grid = [[""], ["APPA Hotel Ops"], [""]] + build_grid(_rows())
+    svc = _patch(monkeypatch, grid)
+    rc = live_preflight.run(expect_gid=GID, expect_header_a1_row=4,
+                            expect_title="WRONG TITLE")               # P2 assertion violated
+    assert rc != 0
+    assert svc._ss.batch_calls == [] and svc._ss.values().updates == []
+
+
+def test_title_match_passes(monkeypatch):
+    grid = [[""], ["APPA Hotel Ops"], [""]] + build_grid(_rows())
+    svc = _patch(monkeypatch, grid)
+    rc = live_preflight.run(expect_gid=GID, expect_header_a1_row=4,
+                            expect_title=META["properties"]["title"])
+    assert rc == 0

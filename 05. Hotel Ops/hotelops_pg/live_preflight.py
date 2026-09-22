@@ -21,7 +21,7 @@ from hotelops_pg.config import hotel_sheet_config, HotelSheetConfigError
 from hotelops_pg.sheet_store import build_sheets_service, GoogleBackend, RoomingSheetStore
 
 
-def run(expect_gid=None, expect_header_a1_row=4):
+def run(expect_gid=None, expect_header_a1_row=4, expect_title=None):
     try:
         cfg = hotel_sheet_config()
     except HotelSheetConfigError as e:
@@ -38,7 +38,13 @@ def run(expect_gid=None, expect_header_a1_row=4):
     # 1. Identity — read-only metadata.
     meta = service.spreadsheets().get(spreadsheetId=cfg["spreadsheet_id"]).execute()
     print("\n=== SPREADSHEET IDENTITY ===")
-    print("title:", meta.get("properties", {}).get("title"))
+    title = meta.get("properties", {}).get("title")
+    print("title:", title)
+    # P2 — title is weaker identity than id+gid, but when the PO asserts an expected
+    # title a mismatch is an automatic fail-closed (never a warning that returns 0).
+    if expect_title is not None and title != expect_title:
+        print(f"IDENTITY FAIL-CLOSED: title {title!r} != expected {expect_title!r}")
+        return 8
     tab_gid = None
     for sh in meta.get("sheets", []):
         p = sh.get("properties", {})
@@ -134,11 +140,16 @@ def run(expect_gid=None, expect_header_a1_row=4):
     print("  [PASS] all nonblank Payment values canonical")
     print(f"  [{'PASS' if expect_gid is not None else 'NOT ASSERTED'}] managed tab gid"
           f" == {expect_gid} (throwaway-identity proof)")
+    print(f"  [{'PASS' if expect_title is not None else 'NOT ASSERTED'}] spreadsheet title"
+          f" == {expect_title!r} (P2 — weaker than id+gid)")
 
     print("\n=== CONDITIONS REQUIRING HUMAN REVIEW (not decided by this exit code) ===")
     if expect_gid is None:
         print("  [!] --expect-gid was NOT supplied: the throwaway-identity proof (runbook")
         print("      P3) was NOT automatically checked — supply the PO evidence gid.")
+    if expect_title is None:
+        print("  [!] --expect-title was NOT supplied: spreadsheet-title verification (P2)")
+        print("      is a HUMAN-REVIEW item — confirm the title by eye or pass --expect-title.")
     print("  [ ] the eligible blank-id target list above IS the PO-approved A1 set")
     print("  [ ] no concurrent human edits will occur during the LIVE-1 window (§11)")
 
@@ -155,8 +166,12 @@ def main(argv=None):
                     help="assert the managed tab's gid (test-artifact evidence, not a product invariant)")
     ap.add_argument("--expect-header-row", type=int, default=4,
                     help="expected physical A1 row of the managed header (default 4)")
+    ap.add_argument("--expect-title", type=str, default=None,
+                    help="assert the spreadsheet title (P2; weaker than id+gid). When "
+                         "omitted, title verification is a human-review item.")
     args = ap.parse_args(argv)
-    return run(expect_gid=args.expect_gid, expect_header_a1_row=args.expect_header_row)
+    return run(expect_gid=args.expect_gid, expect_header_a1_row=args.expect_header_row,
+               expect_title=args.expect_title)
 
 
 if __name__ == "__main__":
