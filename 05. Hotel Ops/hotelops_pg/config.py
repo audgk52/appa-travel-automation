@@ -19,8 +19,10 @@ DEFAULT_TAB = "01. Rooming List"
 
 # The authoritative PG-owned durable StateStore path must be a stable, explicit
 # location — never a temporary/scratch directory (which would not survive the
-# restart/retry contract) and never inside the repository.
-_FORBIDDEN_STATE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp")
+# restart/retry contract) and never inside the repository. Both the plain and the
+# macOS-canonical (/private-prefixed) temp roots are listed, because the path is
+# checked AFTER resolve() (e.g. /tmp→/private/tmp, /var/tmp→/private/var/tmp).
+_FORBIDDEN_STATE_PREFIXES = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp")
 
 
 class HotelSheetConfigError(ValueError):
@@ -89,13 +91,18 @@ def _within_git_repo(path: Path) -> bool:
 def hotel_state_path() -> str:
     """Resolve the authoritative PG-owned durable StateStore path (PG v1; §0/§15).
 
-    Requires ``APPA_HOTEL_STATE_PATH``. Fails closed (:class:`HotelStateConfigError`) when
-    it is missing (NO fallback to ``StateStore(None)``, a temporary path, or a shared
-    cross-agent path), not an explicit absolute path, under a temporary/scratch directory
-    (``/tmp``, ``/private/tmp`` — which also covers the Claude scratch dir — or ``/var/tmp``),
-    or inside a git repository. Validates the configured string only; it does not create
-    the file (the parent dir is created at establishment time via ``persistence_ready``).
-    Returns the absolute path string.
+    Requires ``APPA_HOTEL_STATE_PATH``. The value is expanded (``~``) and CANONICALIZED
+    (``..`` and existing symlink components resolved) BEFORE the prohibited-location
+    checks, and the **canonical** path is what is returned and used by the StateStore —
+    so a lexical ``..`` or a symlink cannot smuggle the store into a prohibited location.
+
+    Fails closed (:class:`HotelStateConfigError`) when it is missing (NO fallback to
+    ``StateStore(None)``, a temporary path, or a shared cross-agent path), not absolute,
+    resolves under a temporary/scratch directory (``/tmp``, ``/private/tmp`` — which also
+    covers the Claude scratch dir — or ``/var/tmp``), or resolves inside a git repository.
+    Validates configuration only; it does not create the file (the parent dir is created
+    at establishment time). This is consistent config resolution on a trusted local host,
+    NOT a defence against a malicious filesystem race (no TOCTOU guarantee).
     """
     raw = os.environ.get("APPA_HOTEL_STATE_PATH")
     if not raw:
@@ -105,21 +112,23 @@ def hotel_state_path() -> str:
             "cross-agent path on the supported live path). Set it to a stable PG-owned path, "
             "e.g. ~/.appa/hotel_ops/state.json."
         )
-    path = Path(raw)
-    if not path.is_absolute():
+    # Expand ~ then canonicalize (.. + existing symlinks) so checks see the REAL location.
+    canonical = Path(raw).expanduser().resolve()
+    if not canonical.is_absolute():   # resolve() yields absolute; defensive belt-and-suspenders
         raise HotelStateConfigError(
-            f"APPA_HOTEL_STATE_PATH must be an explicit absolute path; got {raw!r}."
+            f"APPA_HOTEL_STATE_PATH must resolve to an absolute path; got {raw!r}."
         )
-    s = str(path)
+    s = str(canonical)
     for pref in _FORBIDDEN_STATE_PREFIXES:
         if s == pref or s.startswith(pref + "/"):
             raise HotelStateConfigError(
-                f"APPA_HOTEL_STATE_PATH must not be under a temporary/scratch directory "
-                f"({pref}); the authoritative store must survive process restart. Got {raw!r}."
+                f"APPA_HOTEL_STATE_PATH resolves under a temporary/scratch directory "
+                f"({pref}); the authoritative store must survive process restart. "
+                f"Got {raw!r} → {s!r}."
             )
-    if _within_git_repo(path):
+    if _within_git_repo(canonical):
         raise HotelStateConfigError(
-            f"APPA_HOTEL_STATE_PATH must not be inside a git repository; PG operational state "
-            f"lives outside the repo. Got {raw!r}."
+            f"APPA_HOTEL_STATE_PATH resolves inside a git repository; PG operational state "
+            f"lives outside the repo. Got {raw!r} → {s!r}."
         )
     return s

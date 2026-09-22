@@ -154,7 +154,24 @@ explicitly does not add.
 ### B1 — Single writable-field change on one record (§6, §7, §23)
 - **Purpose:** a confirmed change writes ONLY the target record's changed managed
   cell(s); neighbouring human columns and other rows are untouched.
-- **Entrypoint:** `preview_quick_ops(store, instruction)` → `commit(store, state, preview)`.
+- **Entrypoint — the supported operational facade ONLY:** `live_ops.preview(instruction)`
+  → PO confirms the frozen preview artifact → `live_ops.execute_confirmed(confirmed)`
+  (retry/recovery via `live_ops.recover(operation_ref)`). These are the ONLY sanctioned
+  LIVE-1 Path B entrypoints: each resolves BOTH authorities from Hotel Ops config (the
+  Sheet store via `hotel_sheet_config`, the durable StateStore via `hotel_state_path`)
+  and accepts **no** caller-supplied store / StateStore / state path / destination
+  identity — authority cannot be bypassed. The low-level `preview_quick_ops` / `commit` /
+  `execute_confirmed` / `recover` are injectable helpers for tests, **not** the operational
+  entrypoint, and must not be named as such.
+  - **Preview is READ-ONLY** (`for_write=False`): it verifies but never establishes target
+    authority and writes neither the Sheet nor the StateStore.
+  - **Confirmation/execution independently REOPEN the configured authority** (`for_write=True`)
+    — never trusting a StateStore object retained from the preview. The **PO confirms a frozen
+    artifact, not an in-memory store object.**
+  - **State binding + required pre-write intent persist BEFORE any Sheet mutation**; an
+    unbound / mismatched / non-empty-unbound state fails closed with zero business write.
+  - **A partial/uncertain outcome STOPs further scenarios**; no fresh preview may replace an
+    unresolved confirmed operation (recover/reconcile it first).
 - **Starting state:** A1 done. The record, field, OLD and NEW values are **not
   chosen here** — they come from the exact-instance gate (Section 0), produced
   from the fresh preflight and confirmed by the PO. Never invent them before

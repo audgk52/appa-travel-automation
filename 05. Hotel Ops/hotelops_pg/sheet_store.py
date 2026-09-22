@@ -379,7 +379,7 @@ def open_rooming_store_and_state(*, for_write):
     a binding mismatch / unusable path fails closed with zero mutation. ``for_write=False``
     (read-only preview) verifies an existing binding but never writes one.
     """
-    from hotelops_pg.config import hotel_sheet_config, hotel_state_path, HotelStateConfigError
+    from hotelops_pg.config import hotel_state_path, HotelStateConfigError
 
     store = open_rooming_store()                       # hotel_sheet_config, no injection
     identity = store.backend.destination_identity()    # actual spreadsheet/tab/gid (read-only)

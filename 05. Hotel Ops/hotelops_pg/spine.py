@@ -69,6 +69,37 @@ class RenderTargetError(RuntimeError):
     """
 
 
+def _require_bound_authority(store, state, flow):
+    """Defence at the mutating boundary (B2): an operational (identified) store may only
+    mutate/reconcile through a durable StateStore whose target binding EXACTLY matches the
+    store backend's actual destination (spreadsheet_id + tab + numeric sheet_gid).
+
+    Enforced ONLY when the store backend can assert an operational destination identity —
+    i.e. the supported LIVE path (GoogleBackend, or an InMemoryBackend explicitly given an
+    identity). Pure/unit stores with no identity are the injectable test path and are left
+    unchanged, but such a store can never reach the LIVE mutation path (which always has an
+    identity). An unbound / mismatched / non-empty-unbound state fails closed BEFORE any
+    business mutation.
+    """
+    from hotelops_pg.state_store import StateAuthorityError
+    try:
+        identity = store.backend.destination_identity()
+    except Exception:                       # noqa: BLE001 — no operational identity ⇒ pure/test path
+        return
+    _require_durable(state, flow)           # identified store demands durable, bound authority
+    if not hasattr(state, "verify_target"):
+        raise StateAuthorityError(
+            f"operational {flow} requires an authoritative (target-bound) StateStore; the "
+            "supplied state cannot assert a target binding (§0)."
+        )
+    if not state.verify_target(identity):   # False = unbound-and-empty; raises on mismatch/non-empty-unbound
+        raise StateAuthorityError(
+            f"operational {flow} requires the StateStore to be bound to the store's actual "
+            f"destination {identity!r}; it is unbound. Establish authority via the operational "
+            "boundary before any business mutation (§0)."
+        )
+
+
 def _require_durable(state, flow):
     if not getattr(state, "durable", False):
         raise NonDurableStateError(
@@ -519,6 +550,7 @@ def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_con
     EXECUTE step, deliberately distinct from :func:`confirm_preview`.
     """
     _require_durable(state, "commit")                    # B8: fail before any mutation
+    _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     return execute(confirmed, store, state, request_date=request_date,
                    hotel_confirmed=hotel_confirmed)
 
@@ -534,6 +566,7 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
     Requires durable state (B8).
     """
     _require_durable(state, "recover")
+    _require_bound_authority(store, state, "recover")    # B2: bound authority before reconcile
     payload = state.load_operation(operation_ref)
     if payload is None:
         raise ValueError(
@@ -556,6 +589,7 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
     an idempotent no-op — it does NOT mint a second authorization or duplicate history.
     """
     _require_durable(state, "commit")                    # B8: fail before any confirmation
+    _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     confirmed = confirm_preview(
         preview,
         grouping_disposition=grouping_disposition,

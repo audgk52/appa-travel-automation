@@ -62,35 +62,77 @@ class StateStore:
     def target_binding(self):
         return self._data.get("target_binding")
 
+    def has_operational_state(self) -> bool:
+        """True iff ANY durable PG operational authority already exists in this store:
+        confirmed/staged operation artifacts, executed/completed operations, pending or
+        per-record journals, uncertain operations/records, Request History intents,
+        grouping uncertainty/reconciliation, or a yellow baseline. Used so an UNBOUND
+        store that already holds legacy state is never silently bound/attached/migrated
+        to the current Sheet (§0)."""
+        d = self._data
+        return bool(
+            d.get("executed_ops") or d.get("operations") or d.get("uncertain_records")
+            or d.get("grouping_uncertain") or (d.get("baseline") is not None)
+        )
+
+    def _binding_matches(self, ident: dict):
+        """None if unbound; True/False if bound; raise on a malformed binding (fail closed)."""
+        cur = self._data.get("target_binding")
+        if cur is None:
+            return None
+        try:
+            return _norm_identity(cur) == ident
+        except (KeyError, TypeError, ValueError):
+            raise StateAuthorityError(
+                f"malformed target_binding {cur!r}; cannot establish authority — fail closed (§0)."
+            )
+
     def bind_or_verify_target(self, identity: dict) -> dict:
         """Establish (first use) or VERIFY the Hotel destination this state authorizes.
 
-        On first use the binding is persisted durably (before any business mutation).
-        On subsequent use a mismatch fails closed (:class:`StateAuthorityError`); PG
-        NEVER silently resets or rebinds. Returns the effective binding.
+        Decision table (§0): unbound + operationally EMPTY → establish durably (before any
+        business mutation); unbound + ANY operational state → :class:`StateAuthorityError`
+        (never infer/attach/reset/migrate legacy state to the current Sheet); bound + exact
+        match → accepted; bound + mismatch/malformed → fail closed (never silently rebinds).
         """
         ident = _norm_identity(identity)
-        cur = self._data.get("target_binding")
-        if cur is None:
+        matches = self._binding_matches(ident)
+        if matches is None:                      # unbound
+            if self.has_operational_state():
+                raise StateAuthorityError(
+                    "durable state holds operational data but has NO target_binding; refusing "
+                    "to infer/attach/reset/migrate legacy state onto the current Sheet — fail "
+                    "closed (§0). Resolve the legacy state before binding."
+                )
             self._data["target_binding"] = ident
-            self._flush()                       # establish authority durably (§0/§15)
+            self._flush()                        # establish authority durably (§0/§15)
             return ident
-        if _norm_identity(cur) != ident:
+        if not matches:
             raise StateAuthorityError(
-                f"durable state is bound to {cur!r}, not {ident!r}; refusing to authorize a "
-                "different Sheet target and never silently rebinding (§0)."
+                f"durable state is bound to {self._data['target_binding']!r}, not {ident!r}; "
+                "refusing a different Sheet target and never silently rebinding (§0)."
             )
-        return cur
+        return self._data["target_binding"]
 
     def verify_target(self, identity: dict) -> bool:
-        """Read-only authority check (NEVER writes). An existing binding that mismatches
-        fails closed; an absent binding returns ``False`` (nothing is established here)."""
-        cur = self._data.get("target_binding")
-        if cur is not None and _norm_identity(cur) != _norm_identity(identity):
+        """Read-only authority check (NEVER writes). Returns True iff bound to an exactly
+        matching target. Unbound + EMPTY → False (a brand-new store, not yet authoritative).
+        Unbound + NON-EMPTY operational state → :class:`StateAuthorityError` (a non-empty
+        unbound store is NOT usable authority). Bound + mismatch/malformed → fail closed."""
+        ident = _norm_identity(identity)
+        matches = self._binding_matches(ident)
+        if matches is None:                      # unbound
+            if self.has_operational_state():
+                raise StateAuthorityError(
+                    "non-empty unbound durable state is not usable authority; fail closed (§0)."
+                )
+            return False
+        if not matches:
             raise StateAuthorityError(
-                f"durable state is bound to {cur!r}, not the current target; fail closed (§0)."
+                f"durable state is bound to {self._data['target_binding']!r}, not the current "
+                "target; fail closed (§0)."
             )
-        return cur is not None
+        return True
 
     @property
     def durable(self) -> bool:
@@ -100,14 +142,16 @@ class StateStore:
         return self.path is not None
 
     def persistence_ready(self) -> bool:
-        """True iff the configured durable target is actually usable RIGHT NOW (B8).
+        """True iff the configured durable parent location is PRESENTLY accessible and
+        preparable (B8).
 
-        ``durable`` only says a path is configured; a path whose parent is missing or
-        unwritable would still report durable until the first flush fails mid-write.
-        This validates/creates the parent directory (PG owns its runtime-state path,
-        §0) and checks it is writable — a safe, NON-destructive readiness probe (no
-        trial write to the live state file). Lets the operational flow detect an
-        unusable persistence target BEFORE human confirmation / business mutation.
+        ``durable`` only says a path is configured. This creates the parent directory
+        (PG owns its runtime-state path, §0) and checks it is writable — a non-destructive
+        probe (no trial write to the live state file). It proves ONLY current
+        accessibility/preparability at call time; it is **not** a guarantee that a future
+        state write will succeed and does **not** remove TOCTOU or later filesystem
+        failures. Those remaining failures are handled by the fail-closed pre-write
+        persistence contract and the post-mutation uncertain-result contract.
         """
         if not self.path:
             return False

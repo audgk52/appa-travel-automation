@@ -269,7 +269,18 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                                     if has_nights else "skipped"))
 
         # 2. post-write verification (§11/§18) before any history is written (§17).
-        after = {r.record_id: r for r in store.snapshot_records()}
+        #    A business write may already have landed here; a failed post-write read must
+        #    NOT escape as a raw exception — mark uncertain with truthful evidence, do not
+        #    retry the Sheet write and do not rollback the verified business effect (B4).
+        try:
+            after = {r.record_id: r for r in store.snapshot_records()}
+        except Exception as exc:  # noqa: BLE001 — post-mutation read failure ⇒ uncertain
+            effects.append(EffectResult("verification", "uncertain",
+                                        f"post-write read failed after possible mutation: {exc}"))
+            result.overall = "uncertain"
+            _mark_uncertain_safe(state, op, rid, "verification_read_raised", effects)
+            result.per_record[rid] = {"applied": [], "effects": effects}
+            continue
         status, detail = _verify_record(after, rid, business)
         effects.append(EffectResult("verification", status, detail))
         if status != "verified":
@@ -309,7 +320,11 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                         write_detail = ""
                     except Exception as exc:  # noqa: BLE001
                         wrote, write_detail = False, f"history write raised: {exc}"
-                    post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
+                    try:
+                        post = {r.record_id: r for r in store.snapshot_records()}.get(rid)
+                    except Exception as exc:  # noqa: BLE001 — post-mutation read-back ⇒ uncertain
+                        post = None
+                        write_detail = write_detail or f"history read-back failed: {exc}"
                     landed = bool(post and (post.get(fields.REQUEST_HISTORY) or "") == intended)
                     if wrote and landed:
                         effects.append(EffectResult("request_history_append", "verified", line))
@@ -365,7 +380,17 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                          "propose recovery from the new observed state with renewed confirmation (§14)")
 
     applied = {rid: v["applied"] for rid, v in result.per_record.items() if v["applied"]}
-    records_by_id = {r.record_id: r for r in store.snapshot_records()}
+    # Final read for drafts is also post-mutation: a caught failure must not escape raw and
+    # must not report clean success — the business/history effects above stay truthful (B4).
+    try:
+        records_by_id = {r.record_id: r for r in store.snapshot_records()}
+    except Exception as exc:  # noqa: BLE001 — final draft read failed post-mutation ⇒ uncertain
+        if result.overall == "complete":
+            result.overall = "uncertain"
+        result.effects.append(EffectResult("drafts", "uncertain",
+                                            f"final read for drafts failed after mutation: {exc}; "
+                                            "per-record business/history effects above are truthful"))
+        return result
     result.drafts = {
         "kakao": kakao_draft(applied, records_by_id, hotel_confirmed),
         "email": email_draft(applied, records_by_id, hotel_confirmed),
