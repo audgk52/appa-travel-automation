@@ -112,12 +112,16 @@ def hotel_state_path() -> str:
             "cross-agent path on the supported live path). Set it to a stable PG-owned path, "
             "e.g. ~/.appa/hotel_ops/state.json."
         )
-    # Expand ~ then canonicalize (.. + existing symlinks) so checks see the REAL location.
-    canonical = Path(raw).expanduser().resolve()
-    if not canonical.is_absolute():   # resolve() yields absolute; defensive belt-and-suspenders
+    # Order matters: expand ~ → require ABSOLUTE (before resolve(), which would otherwise
+    # silently make a relative path absolute against the cwd) → canonicalize (.. + existing
+    # symlinks) → check the CANONICAL path.
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
         raise HotelStateConfigError(
-            f"APPA_HOTEL_STATE_PATH must resolve to an absolute path; got {raw!r}."
+            f"APPA_HOTEL_STATE_PATH must be an explicit absolute path (after ~ expansion); "
+            f"a relative path is refused rather than resolved against the cwd. Got {raw!r}."
         )
+    canonical = expanded.resolve()
     s = str(canonical)
     for pref in _FORBIDDEN_STATE_PREFIXES:
         if s == pref or s.startswith(pref + "/"):

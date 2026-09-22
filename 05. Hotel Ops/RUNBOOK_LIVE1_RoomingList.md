@@ -154,15 +154,22 @@ explicitly does not add.
 ### B1 — Single writable-field change on one record (§6, §7, §23)
 - **Purpose:** a confirmed change writes ONLY the target record's changed managed
   cell(s); neighbouring human columns and other rows are untouched.
-- **Entrypoint — the supported operational facade ONLY:** `live_ops.preview(instruction)`
-  → PO confirms the frozen preview artifact → `live_ops.execute_confirmed(confirmed)`
-  (retry/recovery via `live_ops.recover(operation_ref)`). These are the ONLY sanctioned
+- **Entrypoint — the supported operational facade ONLY** (`live_ops.preview` → `live_ops.confirm` → `live_ops.execute_confirmed` → `live_ops.recover`):
+  `live_ops.preview(instruction, request_date=…, hotel_confirmed=…)` → (PreviewArtifact +
+  `preview_artifact_digest`) → PO approves that **exact digest** and supplies explicit
+  ApprovalDecisions → `live_ops.confirm(preview_artifact, approved_digest, **decisions)` →
+  (ConfirmedArtifact + `confirmed_artifact_digest`) → `live_ops.execute_confirmed(confirmed_artifact)`
+  → retry/recovery via `live_ops.recover(operation_ref)`. These are the ONLY sanctioned
   LIVE-1 Path B entrypoints: each resolves BOTH authorities from Hotel Ops config (the
   Sheet store via `hotel_sheet_config`, the durable StateStore via `hotel_state_path`)
   and accepts **no** caller-supplied store / StateStore / state path / destination
-  identity — authority cannot be bypassed. The low-level `preview_quick_ops` / `commit` /
-  `execute_confirmed` / `recover` are injectable helpers for tests, **not** the operational
-  entrypoint, and must not be named as such.
+  identity — authority cannot be bypassed. The PO confirms a **frozen artifact**, not an
+  in-memory store object; `request_date`/`hotel_confirmed` are fixed in the artifact and, on
+  recovery, loaded durably. The low-level `spine.preview_quick_ops` / `confirm_preview` /
+  `commit` / `execute_confirmed(store, state, …)` / `recover(store, state, …)` are injectable
+  helpers for tests, **not** the operational entrypoint, and must not be named as such.
+  For the Echo B1 scenario: `request_date=0922`, `hotel_confirmed=False`, ApprovalDecisions
+  empty.
   - **Preview is READ-ONLY** (`for_write=False`): it verifies but never establishes target
     authority and writes neither the Sheet nor the StateStore.
   - **Confirmation/execution independently REOPEN the configured authority** (`for_write=True`)
@@ -200,7 +207,10 @@ explicitly does not add.
 ### B2 — Identity persists across a real row reorder (§3, AC-17)
 - **Purpose:** after a human moves the record's physical row, PG re-resolves by
   `rooming_record_id` and the next change still lands on the correct record.
-- **Entrypoint:** `store.snapshot_records()` / `apply_writes(record_id, …)`.
+- **Entrypoint — supported facade ONLY:** `live_ops.preview(...)` →
+  `live_ops.confirm(preview_artifact, approved_digest, **decisions)` →
+  `live_ops.execute_confirmed(confirmed_artifact)`; the record is re-resolved by
+  `rooming_record_id` at execute (physical row is evidence only).
 - **Starting state:** B1's record adopted; PO manually drags its row to a new
   position (position-only move; identity/values unchanged). Field/OLD/NEW come
   from a fresh exact-instance (Section 0) built AFTER the move — not reused blindly.
@@ -222,7 +232,10 @@ explicitly does not add.
 ### C1 — Dependency changed between preview and execute (§10, §11)
 - **Purpose:** if the target's expected value changed on the Sheet after the
   preview was built, execution **stops rather than overwrites** observed newer state.
-- **Entrypoint:** `preview_*` → (edit Sheet) → `execute_confirmed` / `commit`.
+- **Entrypoint — supported facade ONLY:** `live_ops.preview(...)` →
+  `live_ops.confirm(preview_artifact, approved_digest, **decisions)` → (edit the Sheet to
+  simulate a concurrent human change) → `live_ops.execute_confirmed(confirmed_artifact)`
+  (dependency-aware revalidation stops rather than overwrite observed newer state).
 - **Starting state:** build a confirmed preview for one record; then edit that
   record's relied-upon cell directly in the Sheet (simulating a concurrent human edit).
 - **Target/fields:** the previewed record; the dependency field.
@@ -272,8 +285,11 @@ explicitly does not add.
 ### E1 — Retry idempotency of a confirmed operation (§15, B7-A/B7-D, B8)
 - **Purpose:** re-running the SAME confirmed operation reconciles against the
   durable journal — it never re-authorizes, re-writes, or duplicates history.
-- **Entrypoint:** `commit(...)` twice on the same preview, **or**
-  `execute_confirmed` then `recover(store, state, operation_ref)`.
+- **Entrypoint — supported facade ONLY:** `live_ops.execute_confirmed(confirmed_artifact)`
+  twice on the same ConfirmedArtifact (idempotent), **or** `live_ops.execute_confirmed(...)`
+  then `live_ops.recover(operation_ref)` (a fresh process reopens the configured authority,
+  loads `request_date`/`hotel_confirmed` durably, replays no business/history write, and
+  regenerates the drafts).
 - **Starting state:** B1-style change confirmed and executed once (durable state present).
 - **Expected effect:** second run is an idempotent no-op — the cell is not written
   twice and Request History is not duplicated; `recover` reconstructs the exact

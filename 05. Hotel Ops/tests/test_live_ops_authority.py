@@ -47,14 +47,14 @@ def test_boundary_signature_accepts_no_injection():
     assert set(ps) == {"for_write"}
 
 
-def test_facade_preview_then_execute_resolves_own_authorities(monkeypatch, tmp_path):
+def test_facade_preview_confirm_execute_resolves_own_authorities(monkeypatch, tmp_path):
     store, backend, p = _live_env(
         monkeypatch, tmp_path, [record(name="James", record_id="rl-a", stay_id="STAY-1")])
-    prev = live_ops.preview("James remark VIP")
-    assert prev.status == "ready"
+    prev, art = live_ops.preview("James remark VIP", request_date="0922")
+    assert prev.status == "ready" and art is not None
     assert not p.exists()                                  # preview read-only: no state write
-    confirmed = confirm_preview(prev)
-    res = live_ops.execute_confirmed(confirmed)
+    confirmed_art = live_ops.confirm(art, art["preview_artifact_digest"])
+    res = live_ops.execute_confirmed(confirmed_art)
     assert res.overall == "complete"
     assert p.exists()                                      # authority established at execution
     assert StateStore(p).target_binding == IDENT           # bound to the ACTUAL destination
@@ -98,10 +98,24 @@ def test_commit_rejects_binding_mismatch(monkeypatch, tmp_path):
     assert backend.read_grid() == before
 
 
-def test_runbook_names_the_operational_facade():
+def test_runbook_names_only_the_operational_facade():
     rb = (Path(__file__).resolve().parent.parent / "RUNBOOK_LIVE1_RoomingList.md").read_text(encoding="utf-8")
-    assert "live_ops" in rb
-    assert "live_ops.preview" in rb and "live_ops.execute_confirmed" in rb
+    # facade named across the confirmation flow
+    for fn in ("live_ops.preview", "live_ops.confirm", "live_ops.execute_confirmed", "live_ops.recover"):
+        assert fn in rb, f"runbook must name {fn}"
+    # every Path B / failure / recovery Entrypoint bullet routes through the facade — no bullet
+    # PRESCRIBES a low-level operational call as the entrypoint (A1 adoption + F1 yellow excepted).
+    for line in rb.splitlines():
+        s = line.strip()
+        if not s.startswith("- **Entrypoint"):
+            continue
+        if "read_validated" in s or "yellow_reset" in s:   # A1 bound-adoption / F1 yellow scenarios
+            continue
+        assert "live_ops." in s, f"Entrypoint must use the facade: {s!r}"
+    # the specific low-level operational prescriptions were removed
+    assert "`preview_*` →" not in rb
+    assert "`commit(...)` twice on the same preview" not in rb
+    assert "**Entrypoint:** `store.snapshot_records()`" not in rb
 
 
 # --- B3 (section 3): unbound-legacy decision table -------------------------------
@@ -223,13 +237,20 @@ def test_history_readback_failure_is_uncertain(make_store, durable_state, monkey
                for e in res.per_record["rl-a"]["effects"])
 
 
-def test_drafts_snapshot_failure_is_uncertain(make_store, durable_state, monkeypatch):
+def test_draft_generation_failure_is_structured_uncertain(make_store, durable_state, monkeypatch):
+    import hotelops_pg.execution as ex
     store, backend = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     confirmed = _confirmed_remark(store)
-    monkeypatch.setattr(store, "snapshot_records", _flaky_snapshot(store, 3))   # final drafts read
+    monkeypatch.setattr(ex, "kakao_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("draft boom")))
     res = execute(confirmed, store, durable_state)
-    assert res.overall == "uncertain"
+    assert res.overall == "uncertain"                       # do not report clean success
     assert any(e.name == "drafts" and e.status == "uncertain" for e in res.effects)
+    # verified business/history effects stay verified and are not replayed
+    assert any(e.name == "business_write" and e.status == "verified"
+               for e in res.per_record["rl-a"]["effects"])
+    hdr = backend.read_grid()[0]
+    assert backend.read_grid()[1][hdr.index(fields.REMARK)] == "VIP"
 
 
 def test_uncertain_persistence_failure_no_success_no_second_write(make_store, durable_state, monkeypatch):

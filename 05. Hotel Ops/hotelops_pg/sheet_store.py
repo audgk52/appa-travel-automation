@@ -34,7 +34,10 @@ class InMemoryBackend:
         self.writes = []  # (row_index, col_index, value) — audit that writes are targeted
         # Deterministic destination identity for A1 binding tests (mirrors the fields a
         # live GoogleBackend resolves): {"spreadsheet_id", "tab", "sheet_gid"} or None.
+        # ``operational`` is EXPLICIT (True only when an identity is supplied) — a backend is
+        # never classified pure/test by inferring it from a destination_identity() failure.
         self._identity = dict(identity) if identity else None
+        self.operational = identity is not None
 
     def destination_identity(self):
         """The ACTUAL identity an A1 write would target (§ blocker 1).
@@ -225,6 +228,8 @@ class GoogleBackend:
     contract as :class:`InMemoryBackend`, using single-range ``values().update`` so
     writes stay targeted and neighbouring cells (human columns) are preserved.
     """
+
+    operational = True   # a live Sheets backend is ALWAYS operational (never a test backend)
 
     def __init__(self, service, spreadsheet_id, tab="01. Rooming List"):
         self.service = service

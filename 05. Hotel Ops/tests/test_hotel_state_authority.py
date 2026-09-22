@@ -13,6 +13,7 @@ import pytest
 
 from conftest import record
 from hotelops_pg import fields, sheet_store
+import hotelops_pg.config as config_mod
 from hotelops_pg.config import hotel_state_path, HotelStateConfigError
 from hotelops_pg.state_store import StateStore, StateAuthorityError
 from hotelops_pg.spine import preview_quick_ops, confirm_preview, execute_confirmed
@@ -136,7 +137,9 @@ def test_boundary_missing_state_config_fails_closed(monkeypatch):
 def test_boundary_read_only_verifies_without_writing(monkeypatch, tmp_path):
     _patch_store(monkeypatch)
     p = tmp_path / "st.json"
-    monkeypatch.setenv(STATE, str(p))
+    # Mock the ALREADY-VALIDATED resolver (do not assume tmp_path is valid production config;
+    # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
+    monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
     store, state, ident = sheet_store.open_rooming_store_and_state(for_write=False)
     assert ident == IDENT and state.durable and state.target_binding is None
     assert not p.exists()                              # read-only preview wrote nothing
@@ -145,7 +148,9 @@ def test_boundary_read_only_verifies_without_writing(monkeypatch, tmp_path):
 def test_boundary_for_write_establishes_and_persists_binding(monkeypatch, tmp_path):
     _patch_store(monkeypatch)
     p = tmp_path / "st.json"
-    monkeypatch.setenv(STATE, str(p))
+    # Mock the ALREADY-VALIDATED resolver (do not assume tmp_path is valid production config;
+    # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
+    monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
     _s, state, ident = sheet_store.open_rooming_store_and_state(for_write=True)
     assert ident == IDENT and state.target_binding == IDENT and p.exists()
     # reopen via the boundary (simulated restart) → recognizes binding, no silent rebind
@@ -155,7 +160,9 @@ def test_boundary_for_write_establishes_and_persists_binding(monkeypatch, tmp_pa
 
 def test_boundary_for_write_rejects_target_mismatch(monkeypatch, tmp_path):
     p = tmp_path / "st.json"
-    monkeypatch.setenv(STATE, str(p))
+    # Mock the ALREADY-VALIDATED resolver (do not assume tmp_path is valid production config;
+    # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
+    monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
     _patch_store(monkeypatch, IDENT)
     sheet_store.open_rooming_store_and_state(for_write=True)          # binds to IDENT
     _patch_store(monkeypatch, OTHER)                                 # backend now a different target

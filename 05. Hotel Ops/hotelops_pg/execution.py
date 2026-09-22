@@ -102,6 +102,25 @@ def _mark_uncertain_safe(state, op, rid, reason, effects):
                                     f"evidence preserved (stays blocked): {exc}"))
 
 
+def _render_drafts(change, applied_rids, hotel_confirmed):
+    """Render Kakao + email drafts from the confirmed change's OWN snapshots/deltas — PURE,
+    no Sheet read (§18/§19). Drafts describe the historical requested operation, so they
+    never depend on (or overwrite) a later human Sheet edit and can be regenerated during a
+    fresh-process recovery without replaying any business/history write. Returns
+    ``(drafts_dict, ok, detail)``; a draft-generation exception is caught (structured, not
+    raw) and is recoverable."""
+    from hotelops_pg.records import RoomingRecord
+    applied = {rid: change.field_deltas.get(rid, []) for rid in applied_rids
+               if change.field_deltas.get(rid)}
+    records_by_id = {rid: RoomingRecord(0, rid, "", dict(change.snapshots.get(rid, {})), True)
+                     for rid in applied}
+    try:
+        return ({"kakao": kakao_draft(applied, records_by_id, hotel_confirmed),
+                 "email": email_draft(applied, records_by_id, hotel_confirmed)}, True, "")
+    except Exception as exc:  # noqa: BLE001 — draft generation failure ⇒ structured, recoverable
+        return ({}, False, f"draft generation failed: {exc}")
+
+
 def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     """Execute a confirmed ``change`` against ``store``; persist idempotency in ``state``."""
     op = change.operation_ref
@@ -151,10 +170,19 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
 
     # Idempotency short-circuit (§15): whole op already verified complete.
     if state.is_executed(op):
-        return ExecutionResult(op, "noop_already_done",
-                               effects=[EffectResult("idempotency", "already_done",
-                                                     "operation already verified complete")],
-                               detail="idempotent no-op (§15)")
+        result = ExecutionResult(op, "noop_already_done",
+                                 effects=[EffectResult("idempotency", "already_done",
+                                                       "operation already verified complete")],
+                                 detail="idempotent no-op (§15); business/history NOT replayed")
+        # Fresh-process recovery of PURE draft output only — regenerated from the confirmed
+        # change's snapshots/deltas (no Sheet read, no business/history/write replay). Safe
+        # even after a later human Sheet edit (drafts describe the historical operation).
+        result.drafts, drafts_ok, ddetail = _render_drafts(change, change.target_record_ids,
+                                                           hotel_confirmed)
+        result.effects.append(EffectResult(
+            "drafts", "verified" if drafts_ok else "uncertain",
+            "regenerated from confirmed artifact" if drafts_ok else ddetail))
+        return result
 
     # (B7-C) Record-global unresolved state: a NEW operation must not run over a record
     # left PENDING or UNCERTAIN by a DIFFERENT prior operation — reconcile/recover first,
@@ -210,7 +238,11 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     # (B7-A) Stage the confirmed artifact so a restart can reconstruct THIS exact
     # operation. In-memory only here; the first begin_record flush persists it (no extra
     # flush → durable idempotency ordering unchanged).
-    state.stage_operation(op, to_payload(change))
+    # Stage the confirmed artifact WITH its fixed semantic inputs (request_date +
+    # hotel_confirmed), so a restart/recovery loads them durably rather than accepting new
+    # caller values (§17/§19).
+    state.stage_operation(op, {**to_payload(change),
+                               "request_date": request_date, "hotel_confirmed": hotel_confirmed})
 
     for rid in change.target_record_ids:
         deltas = change.field_deltas.get(rid, [])
@@ -379,21 +411,19 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
         result.detail = ("partial/uncertain multi-record execution: not silently compensated; "
                          "propose recovery from the new observed state with renewed confirmation (§14)")
 
-    applied = {rid: v["applied"] for rid, v in result.per_record.items() if v["applied"]}
-    # Final read for drafts is also post-mutation: a caught failure must not escape raw and
-    # must not report clean success — the business/history effects above stay truthful (B4).
-    try:
-        records_by_id = {r.record_id: r for r in store.snapshot_records()}
-    except Exception as exc:  # noqa: BLE001 — final draft read failed post-mutation ⇒ uncertain
+    # Drafts render from the confirmed change's OWN snapshots/deltas (no post-mutation Sheet
+    # read): a draft-generation failure is structured (never raw), verified business/history
+    # effects stay verified and are NOT replayed, and the same render is reproducible during
+    # a fresh-process recovery (§18/§19, B4/round-3 §10).
+    verified_rids = [rid for rid, v in result.per_record.items() if v.get("applied")]
+    result.drafts, drafts_ok, ddetail = _render_drafts(change, verified_rids, hotel_confirmed)
+    if drafts_ok:
+        result.effects.append(EffectResult("drafts", "verified", "rendered from confirmed deltas"))
+    else:
         if result.overall == "complete":
-            result.overall = "uncertain"
-        result.effects.append(EffectResult("drafts", "uncertain",
-                                            f"final read for drafts failed after mutation: {exc}; "
-                                            "per-record business/history effects above are truthful"))
-        return result
-    result.drafts = {
-        "kakao": kakao_draft(applied, records_by_id, hotel_confirmed),
-        "email": email_draft(applied, records_by_id, hotel_confirmed),
-    }
-    result.effects.append(EffectResult("drafts", "verified", "rendered from verified applied deltas"))
+            result.overall = "uncertain"       # do not report clean success when output failed
+        result.effects.append(EffectResult(
+            "drafts", "uncertain",
+            ddetail + "; verified business/history effects are truthful and NOT replayed — "
+            "drafts are recoverable"))
     return result

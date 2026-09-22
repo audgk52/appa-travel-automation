@@ -69,24 +69,38 @@ class RenderTargetError(RuntimeError):
     """
 
 
-def _require_bound_authority(store, state, flow):
-    """Defence at the mutating boundary (B2): an operational (identified) store may only
-    mutate/reconcile through a durable StateStore whose target binding EXACTLY matches the
-    store backend's actual destination (spreadsheet_id + tab + numeric sheet_gid).
+_IDENTITY_KEYS = ("spreadsheet_id", "tab", "sheet_gid")
 
-    Enforced ONLY when the store backend can assert an operational destination identity —
-    i.e. the supported LIVE path (GoogleBackend, or an InMemoryBackend explicitly given an
-    identity). Pure/unit stores with no identity are the injectable test path and are left
-    unchanged, but such a store can never reach the LIVE mutation path (which always has an
-    identity). An unbound / mismatched / non-empty-unbound state fails closed BEFORE any
-    business mutation.
+
+def _require_bound_authority(store, state, flow):
+    """Defence at the mutating boundary (B2): an OPERATIONAL store may only mutate/reconcile
+    through a durable StateStore whose target binding EXACTLY matches the store backend's
+    actual destination (spreadsheet_id + tab + numeric sheet_gid).
+
+    Whether a backend is operational is read from an EXPLICIT ``backend.operational`` flag —
+    NEVER inferred from a ``destination_identity()`` failure. For an operational backend the
+    identity must resolve to a complete triple, the state must be durable and bound, and the
+    binding must match exactly; any failure (identity raises / missing / malformed, or
+    unbound / mismatched / non-empty-unbound state) fails closed BEFORE any business
+    mutation. A backend explicitly marked non-operational is the injectable pure/test path
+    and is left unchanged (it can never reach the LIVE path, which is always operational).
     """
     from hotelops_pg.state_store import StateAuthorityError
+    if not getattr(store.backend, "operational", False):
+        return                              # EXPLICIT pure/test backend — injectable, unchanged
     try:
         identity = store.backend.destination_identity()
-    except Exception:                       # noqa: BLE001 — no operational identity ⇒ pure/test path
-        return
-    _require_durable(state, flow)           # identified store demands durable, bound authority
+    except Exception as exc:                # noqa: BLE001 — operational identity MUST resolve
+        raise StateAuthorityError(
+            f"operational {flow}: the store's destination identity failed to resolve "
+            f"({exc!r}); fail closed before any business mutation (§0)."
+        )
+    if not isinstance(identity, dict) or any(not identity.get(k) for k in _IDENTITY_KEYS):
+        raise StateAuthorityError(
+            f"operational {flow}: destination identity {identity!r} is missing/malformed; "
+            "fail closed (§0)."
+        )
+    _require_durable(state, flow)           # operational store demands durable, bound authority
     if not hasattr(state, "verify_target"):
         raise StateAuthorityError(
             f"operational {flow} requires an authoritative (target-bound) StateStore; the "
@@ -573,9 +587,13 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
             f"no persisted confirmed operation {operation_ref!r} to recover; nothing was "
             "durably staged (§15, B7-A)."
         )
+    # request_date / hotel_confirmed are fixed at confirmation and loaded from the DURABLE
+    # artifact — a retry/recovery can never change their meaning with new caller values
+    # (§17/§19). Legacy payloads without them fall back to the caller defaults.
+    rd = payload.get("request_date", request_date)
+    hc = payload.get("hotel_confirmed", hotel_confirmed)
     confirmed = from_payload(payload)
-    return execute(confirmed, store, state, request_date=request_date,
-                   hotel_confirmed=hotel_confirmed)
+    return execute(confirmed, store, state, request_date=rd, hotel_confirmed=hc)
 
 
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,

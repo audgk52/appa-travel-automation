@@ -63,16 +63,20 @@ class StateStore:
         return self._data.get("target_binding")
 
     def has_operational_state(self) -> bool:
-        """True iff ANY durable PG operational authority already exists in this store:
-        confirmed/staged operation artifacts, executed/completed operations, pending or
-        per-record journals, uncertain operations/records, Request History intents,
-        grouping uncertainty/reconciliation, or a yellow baseline. Used so an UNBOUND
-        store that already holds legacy state is never silently bound/attached/migrated
-        to the current Sheet (§0)."""
+        """True iff ANY durable PG operational authority already exists in this store,
+        across EVERY serialized category (reviewed once): confirmed/staged operation
+        artifacts (``operations``), executed/completed operations + their pending/uncertain
+        per-record journals and Request History intents (``executed_ops``), record-global
+        uncertain markers (``uncertain_records``), grouping uncertainty/reconciliation
+        (``grouping_uncertain``), the yellow ``baseline``, AND a non-default
+        ``baseline_authority`` (e.g. ``uncertain``). ``target_binding`` is the authority
+        record itself, not operational state. Used so an UNBOUND store that already holds
+        legacy state is never silently bound/attached/migrated to the current Sheet (§0)."""
         d = self._data
         return bool(
             d.get("executed_ops") or d.get("operations") or d.get("uncertain_records")
             or d.get("grouping_uncertain") or (d.get("baseline") is not None)
+            or d.get("baseline_authority", AUTHORITY_ACTIVE) != AUTHORITY_ACTIVE
         )
 
     def _binding_matches(self, ident: dict):
