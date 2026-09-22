@@ -61,6 +61,19 @@ class InMemoryBackend:
             out[name] = len(header) - 1
         return out
 
+    def atomic_write_cells(self, sheet_gid, cells):
+        """Write every ``(row_index, col_index, value)`` as ONE all-or-none unit.
+
+        Models the atomic Sheets ``batchUpdate`` the :class:`GoogleBackend` uses for
+        A1 id adoption (§4): either every cell lands or none does. ``sheet_gid`` is
+        unused in-memory (there is a single grid)."""
+        prepared = [(int(r), int(c), str(v)) for r, c, v in cells]
+        for row_index, col_index, _ in prepared:
+            self._ensure(row_index, col_index)
+        for row_index, col_index, value in prepared:
+            self.grid[row_index][col_index] = value
+            self.writes.append((row_index, col_index, value))
+
 
 class RoomingSheetStore:
     def __init__(self, backend):
@@ -252,6 +265,31 @@ class GoogleBackend:
             out[name] = col
         return out
 
+    def atomic_write_cells(self, sheet_gid, cells):
+        """Write ALL of ``cells`` (each ``(row_index, col_index, value)``, absolute
+        0-based grid coords) in ONE atomic ``spreadsheets().batchUpdate`` request.
+
+        Google documents this method as all-or-none: *"Each request is validated
+        before being applied. If any request is not valid then the entire request
+        will fail and nothing will be applied."* (Sheets API v4
+        ``spreadsheets.batchUpdate``). We therefore use it — NOT ``values().update``
+        per cell nor ``values().batchUpdate`` (whose docs do not promise atomicity) —
+        so A1 id adoption lands completely or not at all (§4). Ids are written as
+        string values so Sheets never reinterprets them as a formula/number/date.
+        """
+        requests = [{
+            "updateCells": {
+                "range": {"sheetId": sheet_gid,
+                          "startRowIndex": int(r), "endRowIndex": int(r) + 1,
+                          "startColumnIndex": int(c), "endColumnIndex": int(c) + 1},
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": str(v)}}]}],
+                "fields": "userEnteredValue",
+            }
+        } for (r, c, v) in cells]
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=self.spreadsheet_id, body={"requests": requests}
+        ).execute()
+
 
 def build_sheets_service(key_path):
     """Construct a Sheets v4 service from a service-account key (lazy google import)."""
@@ -264,17 +302,24 @@ def build_sheets_service(key_path):
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def open_rooming_store(config=None):
+def open_rooming_store():
     """The ONE live Hotel Ops entrypoint: build a store for the configured target.
 
-    Resolves :func:`hotelops_pg.config.hotel_sheet_config` FIRST, so a missing or
-    unsafe Hotel target (e.g. inheriting the Dispatch ``APPA_GSHEET_ID``) fails
-    closed before a Google service is ever constructed or a cell is ever touched.
-    Pass ``config`` to inject an already-resolved target (tests / session-scoped id).
+    Resolves :func:`hotelops_pg.config.hotel_sheet_config` FIRST and ALWAYS, so a
+    missing or unsafe Hotel target (e.g. inheriting the Dispatch ``APPA_GSHEET_ID``)
+    fails closed before a Google service is ever constructed or a cell is ever
+    touched.
+
+    There is deliberately **no caller-supplied ``config`` override**: an operational
+    entrypoint must never let a caller silently substitute the authorized destination
+    (that was the target-isolation bypass — a caller could inject an arbitrary or the
+    Dispatch id past :func:`hotel_sheet_config`). Tests and other pure callers that
+    need an explicit target construct :class:`RoomingSheetStore` over an explicit
+    backend directly — a pure adapter that never reaches a live Google service.
     """
     from hotelops_pg.config import hotel_sheet_config
 
-    cfg = config or hotel_sheet_config()
+    cfg = hotel_sheet_config()
     service = build_sheets_service(cfg["key_path"])
     backend = GoogleBackend(service, cfg["spreadsheet_id"], tab=cfg["tab"])
     return RoomingSheetStore(backend)

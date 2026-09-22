@@ -34,6 +34,12 @@ layout proof; a mismatch means the target or the sheet changed.
 
 ### The exact-instance gate (mandatory before ANY mutation)
 
+**Concurrency precondition (§11):** LIVE-1 runs with **no concurrent human edits** to
+the throwaway during the window. PG is optimistic best-effort — it never locks and
+makes no zero-lost-update promise; an edit landing between the final revalidation read
+and the write is the accepted residual race (§11) and must simply be excluded
+operationally for LIVE-1.
+
 No business change (B1/B2/C1/E1/F1) may be invented from memory or chosen "at
 execution time." Every mutating scenario runs ONLY through this sequence:
 
@@ -59,27 +65,75 @@ are observation evidence, never durable target identity.**
 ### A1 — Adopt ids into eligible blank-id rows (§2, AC-1/1b/2/3)
 - **Purpose:** system-maintenance adoption assigns a `rooming_record_id` to each
   eligible blank-id operational row, only after whole-sheet schema + dup-id pass.
-- **Entrypoint:** `store.read_validated()` (via `open_rooming_store()`).
+- **Entrypoint — bound two-phase (NOT `read_validated`):**
+  `plan = live_adoption.preview_adoption(store, destination)` then
+  `live_adoption.execute_adoption(store, plan, destination)`. The store is built by
+  `open_rooming_store()` (Hotel-isolated config, no injection); `destination`
+  (`AdoptionDestination(spreadsheet_id, tab, sheet_gid)`) is resolved fresh from the
+  config + the P3 metadata read and passed to **both** calls. This IS the exact-
+  instance gate: `preview_adoption` produces the explicit, destination-anchored plan
+  (Section 0 step 2), the PO confirms **that plan**, and `execute_adoption`
+  re-validates and executes **that same plan** — never a re-discovered set.
+  > **Do NOT use `store.read_validated()` for LIVE-1 A1.** That reader re-plans
+  > adoption for whatever blanks exist at call time and would also auto-create the
+  > system columns — both forbidden here (§4).
 - **Starting state:** P1–P8 pass; rows 8/9/13 (last-known) have blank
-  `rooming_record_id`; SECTION BREAK / heading rows blank-and-ineligible.
-- **Target records/fields:** the eligible blank-id rows only; field written =
-  hidden `rooming_record_id` cell (one per row). No business field touched.
-- **Expected old values:** `rooming_record_id` blank on each target.
-- **Proposed new values:** a fresh UUID per target (`identity.new_record_id`).
-- **Expected derived effects:** none (no nights recompute; no `stay_id` — grouping
-  stays unestablished, §5).
-- **Request History:** unchanged (adoption is not a business effect).
-- **Yellow:** unchanged.
-- **Draft:** none.
+  `rooming_record_id`; SECTION BREAK / heading rows blank-and-ineligible. **Both
+  system columns (`rooming_record_id`, `stay_id`) must already exist** — a missing
+  system header STOPs A1 (`SchemaError`); A1 never appends a header.
+- **Target records/fields:** exactly the eligible blank-id rows frozen in the plan;
+  field written = hidden `rooming_record_id` cell (one per target). No business
+  field, no `stay_id`, no Request History, no yellow, no draft.
+- **Expected old values:** `rooming_record_id` blank on each planned target.
+- **Proposed new values:** the plan's **frozen** minted ids (`identity.new_record_id`,
+  one per target, minted once at preview and never regenerated).
+- **Plan-binding revalidation (execute, before any write):** `execute_adoption`
+  fails closed with **zero writes** if the destination changed, or if the fresh
+  eligible target set differs from the plan in any way — added / removed /
+  substituted / **reordered** / already-id-assigned target (`AdoptionPlanInvalidated`);
+  or on any schema / duplicate-id fault (`SchemaError` / `DuplicateRecordIdError`).
+  Pre-id NAME/row are not durable identity (§3), so a reorder is **safely
+  invalidated**, not guessed — take a fresh preview and re-confirm.
+- **Write primitive:** one atomic `spreadsheets().batchUpdate` of exactly the frozen
+  id cells (documented all-or-none — "if any request is not valid … nothing will be
+  applied"). Three targets ⇒ one API call, three `updateCells` requests. No per-cell
+  `values().update`.
+- **Read-back outcome (§4 A/B/C) — reported truthfully, never inferred from the API
+  ack:**
+  - **A / `verified`** — every frozen id observed on its correctly-resolved approved
+    record (id cell holds the frozen id AND NAME still matches): applied.
+  - **B / `not_observed`** — all target id cells read blank: application **not
+    observed at this read**. This is **not** proof the write cannot land later — do
+    **not** auto-retry.
+  - **C / `uncertain`** — partial / different id / changed-ambiguous target /
+    unreadable: **stop**, no further writes, **ids not regenerated**.
 - **Durable state:** none required (adoption is a store write, not a confirmed op).
-- **Failure condition:** any duplicate id → `DuplicateRecordIdError`, **zero**
-  adoption writes (all-or-nothing, AC-2); any schema fault → `SchemaError`.
-- **Cleanup/restoration:** record each written id; to restore, clear those exact
-  `rooming_record_id` cells (throwaway only). *Adoption is normally kept* — restore
-  only to re-run A1 from a blank baseline.
-- **Post-cleanup verify:** re-read; targets blank again (if restored) or hold the
-  recorded ids (if kept).
+- **Failure condition:** as "Plan-binding revalidation" above — all zero-write.
+- **Cleanup/restoration (manual; adoption is normally KEPT for B1/B2):** restoration
+  requires **separate explicit PO authorization**. To restore: for each id recorded
+  from this A1, **resolve it to its CURRENT unique location by `rooming_record_id`**
+  (never by original row 8/9/13 — a row may have moved), **confirm the cell still
+  holds exactly that minted id**, then clear **only** that cell (throwaway only).
+  **Stop** if any recorded id is missing, duplicated, changed, or resolves
+  ambiguously — do not clear on uncertain evidence, and never clear a cell merely
+  because it was originally R8/R9/R13.
+- **Post-cleanup verify:** re-read; each restored id resolves to zero rows (cleared)
+  or the kept ids each resolve to exactly one row.
 - **Classification:** ordinary success (authorized system-maintenance write).
+
+#### A1 outstanding-attempt reconciliation (§4 process-restart stop)
+After any `not_observed` or `uncertain` A1 outcome, an adoption request may still be
+in flight. **Do not run a fresh A1 preview/execute** until the PO has reconciled: open
+the throwaway in the Sheets UI, confirm whether the frozen ids from the recorded
+attempt did or did not land, and only then decide (keep the applied ids, or clear per
+the cleanup procedure above). `execute_adoption`'s in-session outcome stops auto-retry,
+and a fresh preview after a partial land is caught by plan-binding revalidation
+(already-id-assigned target → invalidate). **Known gap (no durable journal — out of
+scope here, §4):** across a *process restart* with **all** target cells still blank,
+code alone cannot distinguish "nothing landed" from "an outstanding request may yet
+land," so this restart-reconciliation is a **manual PO gate**, not an automated gate.
+Closing it fully would require a durable operation journal, which this handoff
+explicitly does not add.
 
 ---
 

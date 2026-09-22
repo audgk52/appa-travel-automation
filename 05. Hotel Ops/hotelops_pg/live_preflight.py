@@ -63,9 +63,18 @@ def run(expect_gid=None, expect_header_a1_row=4):
     except fields.SchemaError as e:
         print("SCHEMA FAIL-CLOSED:", e)
         return 2
-    print(f"managed header physical A1 row: {header_row + 1} "
-          f"({'OK' if header_row + 1 == expect_header_a1_row else '!! expected %d' % expect_header_a1_row})")
-    print("Request History header resolved:", fields.REQUEST_HISTORY in headers)
+    # P4 — header physical row is an ASSERTED mandatory precondition: a mismatch is an
+    # automatic FAIL (fail closed with nonzero), never a warning that returns success.
+    if header_row + 1 != expect_header_a1_row:
+        print(f"LAYOUT FAIL-CLOSED: managed header at physical A1 row {header_row + 1}, "
+              f"expected {expect_header_a1_row}")
+        return 7
+    print(f"managed header physical A1 row: {header_row + 1} (OK, == expected)")
+    # P7 — Request History header must resolve; its absence is a schema fail-close.
+    if fields.REQUEST_HISTORY not in headers:
+        print("SCHEMA FAIL-CLOSED: 'Request History' header did not resolve")
+        return 2
+    print("Request History header resolved: True")
 
     # 3. Records / duplicate-id / adoption plan (pure — no writes).
     try:
@@ -115,7 +124,28 @@ def run(expect_gid=None, expect_header_a1_row=4):
     print("total data records       :", len(records))
     print("eligible (operational)   :", sum(1 for r in records if r.eligible))
     print("would-adopt (blank id)   :", len(result.assignments))
-    print("READ-ONLY PREFLIGHT COMPLETE — 0 writes issued")
+
+    print("\n=== AUTOMATIC MANDATORY CHECKS (all PASS — exit 0) ===")
+    print("  [PASS] config resolves to the Hotel-isolated target (never Dispatch)")
+    print("  [PASS] spreadsheet + managed tab reachable")
+    print("  [PASS] managed schema resolves; header at expected A1 row", expect_header_a1_row)
+    print("  [PASS] Request History header resolves")
+    print("  [PASS] no duplicate rooming_record_id")
+    print("  [PASS] all nonblank Payment values canonical")
+    print(f"  [{'PASS' if expect_gid is not None else 'NOT ASSERTED'}] managed tab gid"
+          f" == {expect_gid} (throwaway-identity proof)")
+
+    print("\n=== CONDITIONS REQUIRING HUMAN REVIEW (not decided by this exit code) ===")
+    if expect_gid is None:
+        print("  [!] --expect-gid was NOT supplied: the throwaway-identity proof (runbook")
+        print("      P3) was NOT automatically checked — supply the PO evidence gid.")
+    print("  [ ] the eligible blank-id target list above IS the PO-approved A1 set")
+    print("  [ ] no concurrent human edits will occur during the LIVE-1 window (§11)")
+
+    print("\nREAD-ONLY PREFLIGHT COMPLETE — 0 writes issued.")
+    print("NOTE: exit 0 means the AUTOMATIC checks passed on THIS read only. It does")
+    print("NOT imply PO approval, and it is NOT the execution-time revalidation — the")
+    print("bound A1 plan is revalidated again at execute (live_adoption.execute_adoption).")
     return 0
 
 

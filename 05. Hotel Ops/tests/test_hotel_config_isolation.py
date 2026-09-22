@@ -86,3 +86,18 @@ def test_open_rooming_store_fails_closed_before_google(clean_env, monkeypatch):
     monkeypatch.setattr(sheet_store, "build_sheets_service", boom)
     with pytest.raises(HotelSheetConfigError):
         sheet_store.open_rooming_store()
+
+
+def test_open_rooming_store_has_no_config_injection_bypass(clean_env, monkeypatch):
+    # Target-isolation bypass (Codex finding): a caller must NOT be able to hand the
+    # operational entrypoint an arbitrary/Dispatch target that skips hotel_sheet_config().
+    import inspect
+
+    def boom(*a, **k):
+        raise AssertionError("build_sheets_service must never be reached via injection")
+    monkeypatch.setattr(sheet_store, "build_sheets_service", boom)
+
+    assert "config" not in inspect.signature(sheet_store.open_rooming_store).parameters
+    with pytest.raises(TypeError):                 # no injection surface at all
+        sheet_store.open_rooming_store(config={
+            "spreadsheet_id": "DISPATCH_MASTER_SCHEDULE", "tab": "x", "key_path": "/k"})
