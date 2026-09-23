@@ -6,6 +6,7 @@ APPA_Notes_Compiled.md
 05. Hotel Ops/*
 !05. Hotel Ops/.gitignore
 !05. Hotel Ops/PRD_HotelOps_PG_RoomingList.md
+!05. Hotel Ops/RUNBOOK_LIVE1_RoomingList.md
 !05. Hotel Ops/conftest.py
 !05. Hotel Ops/hotelops_pg/
 !05. Hotel Ops/tests/

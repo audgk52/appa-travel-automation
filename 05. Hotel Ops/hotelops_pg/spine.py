@@ -69,6 +69,51 @@ class RenderTargetError(RuntimeError):
     """
 
 
+_IDENTITY_KEYS = ("spreadsheet_id", "tab", "sheet_gid")
+
+
+def _require_bound_authority(store, state, flow):
+    """Defence at the mutating boundary (B2): an OPERATIONAL store may only mutate/reconcile
+    through a durable StateStore whose target binding EXACTLY matches the store backend's
+    actual destination (spreadsheet_id + tab + numeric sheet_gid).
+
+    Whether a backend is operational is read from an EXPLICIT ``backend.operational`` flag —
+    NEVER inferred from a ``destination_identity()`` failure. For an operational backend the
+    identity must resolve to a complete triple, the state must be durable and bound, and the
+    binding must match exactly; any failure (identity raises / missing / malformed, or
+    unbound / mismatched / non-empty-unbound state) fails closed BEFORE any business
+    mutation. A backend explicitly marked non-operational is the injectable pure/test path
+    and is left unchanged (it can never reach the LIVE path, which is always operational).
+    """
+    from hotelops_pg.state_store import StateAuthorityError
+    if not getattr(store.backend, "operational", False):
+        return                              # EXPLICIT pure/test backend — injectable, unchanged
+    try:
+        identity = store.backend.destination_identity()
+    except Exception as exc:                # noqa: BLE001 — operational identity MUST resolve
+        raise StateAuthorityError(
+            f"operational {flow}: the store's destination identity failed to resolve "
+            f"({exc!r}); fail closed before any business mutation (§0)."
+        )
+    if not isinstance(identity, dict) or any(not identity.get(k) for k in _IDENTITY_KEYS):
+        raise StateAuthorityError(
+            f"operational {flow}: destination identity {identity!r} is missing/malformed; "
+            "fail closed (§0)."
+        )
+    _require_durable(state, flow)           # operational store demands durable, bound authority
+    if not hasattr(state, "verify_target"):
+        raise StateAuthorityError(
+            f"operational {flow} requires an authoritative (target-bound) StateStore; the "
+            "supplied state cannot assert a target binding (§0)."
+        )
+    if not state.verify_target(identity):   # False = unbound-and-empty; raises on mismatch/non-empty-unbound
+        raise StateAuthorityError(
+            f"operational {flow} requires the StateStore to be bound to the store's actual "
+            f"destination {identity!r}; it is unbound. Establish authority via the operational "
+            "boundary before any business mutation (§0)."
+        )
+
+
 def _require_durable(state, flow):
     if not getattr(state, "durable", False):
         raise NonDurableStateError(
@@ -519,6 +564,7 @@ def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_con
     EXECUTE step, deliberately distinct from :func:`confirm_preview`.
     """
     _require_durable(state, "commit")                    # B8: fail before any mutation
+    _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     return execute(confirmed, store, state, request_date=request_date,
                    hotel_confirmed=hotel_confirmed)
 
@@ -534,15 +580,20 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
     Requires durable state (B8).
     """
     _require_durable(state, "recover")
+    _require_bound_authority(store, state, "recover")    # B2: bound authority before reconcile
     payload = state.load_operation(operation_ref)
     if payload is None:
         raise ValueError(
             f"no persisted confirmed operation {operation_ref!r} to recover; nothing was "
             "durably staged (§15, B7-A)."
         )
+    # request_date / hotel_confirmed are fixed at confirmation and loaded from the DURABLE
+    # artifact — a retry/recovery can never change their meaning with new caller values
+    # (§17/§19). Legacy payloads without them fall back to the caller defaults.
+    rd = payload.get("request_date", request_date)
+    hc = payload.get("hotel_confirmed", hotel_confirmed)
     confirmed = from_payload(payload)
-    return execute(confirmed, store, state, request_date=request_date,
-                   hotel_confirmed=hotel_confirmed)
+    return execute(confirmed, store, state, request_date=rd, hotel_confirmed=hc)
 
 
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,
@@ -556,6 +607,7 @@ def commit(store, state, preview, *, grouping_disposition="", impact_disposition
     an idempotent no-op — it does NOT mint a second authorization or duplicate history.
     """
     _require_durable(state, "commit")                    # B8: fail before any confirmation
+    _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     confirmed = confirm_preview(
         preview,
         grouping_disposition=grouping_disposition,

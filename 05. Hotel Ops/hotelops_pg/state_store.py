@@ -23,6 +23,21 @@ class GroupingScopeError(ValueError):
     together — the state-transition primitive refuses an unchecked subset clear."""
 
 
+class StateAuthorityError(ValueError):
+    """The durable state's Hotel target binding is missing/mismatched — fail closed.
+
+    A state file bound to one Sheet target (spreadsheet_id + tab + numeric sheet_gid)
+    must never authorize or suppress operations on a DIFFERENT target, and PG never
+    silently resets or rebinds an existing binding (target isolation, §0)."""
+
+
+def _norm_identity(identity: dict) -> dict:
+    """Normalize a Hotel destination identity to the exact bound triple."""
+    return {"spreadsheet_id": str(identity["spreadsheet_id"]),
+            "tab": str(identity["tab"]),
+            "sheet_gid": int(identity["sheet_gid"])}
+
+
 class StateStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else None
@@ -33,12 +48,95 @@ class StateStore:
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
             "grouping_uncertain": {},       # record_id -> {"stay_id":..., "reason":...} (B4)
             "operations": {},               # operation_ref -> confirmed-artifact payload (B7-A)
+            "target_binding": None,         # {"spreadsheet_id","tab","sheet_gid"} authority (§0)
         }
         if self.path and self.path.exists():
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
         self._data.setdefault("grouping_uncertain", {})
         self._data.setdefault("operations", {})
+        self._data.setdefault("target_binding", None)
+
+    # --- Hotel target authority (§0; target isolation) -----------------------
+    @property
+    def target_binding(self):
+        return self._data.get("target_binding")
+
+    def has_operational_state(self) -> bool:
+        """True iff ANY durable PG operational authority already exists in this store,
+        across EVERY serialized category (reviewed once): confirmed/staged operation
+        artifacts (``operations``), executed/completed operations + their pending/uncertain
+        per-record journals and Request History intents (``executed_ops``), record-global
+        uncertain markers (``uncertain_records``), grouping uncertainty/reconciliation
+        (``grouping_uncertain``), the yellow ``baseline``, AND a non-default
+        ``baseline_authority`` (e.g. ``uncertain``). ``target_binding`` is the authority
+        record itself, not operational state. Used so an UNBOUND store that already holds
+        legacy state is never silently bound/attached/migrated to the current Sheet (§0)."""
+        d = self._data
+        return bool(
+            d.get("executed_ops") or d.get("operations") or d.get("uncertain_records")
+            or d.get("grouping_uncertain") or (d.get("baseline") is not None)
+            or d.get("baseline_authority", AUTHORITY_ACTIVE) != AUTHORITY_ACTIVE
+        )
+
+    def _binding_matches(self, ident: dict):
+        """None if unbound; True/False if bound; raise on a malformed binding (fail closed)."""
+        cur = self._data.get("target_binding")
+        if cur is None:
+            return None
+        try:
+            return _norm_identity(cur) == ident
+        except (KeyError, TypeError, ValueError):
+            raise StateAuthorityError(
+                f"malformed target_binding {cur!r}; cannot establish authority — fail closed (§0)."
+            )
+
+    def bind_or_verify_target(self, identity: dict) -> dict:
+        """Establish (first use) or VERIFY the Hotel destination this state authorizes.
+
+        Decision table (§0): unbound + operationally EMPTY → establish durably (before any
+        business mutation); unbound + ANY operational state → :class:`StateAuthorityError`
+        (never infer/attach/reset/migrate legacy state to the current Sheet); bound + exact
+        match → accepted; bound + mismatch/malformed → fail closed (never silently rebinds).
+        """
+        ident = _norm_identity(identity)
+        matches = self._binding_matches(ident)
+        if matches is None:                      # unbound
+            if self.has_operational_state():
+                raise StateAuthorityError(
+                    "durable state holds operational data but has NO target_binding; refusing "
+                    "to infer/attach/reset/migrate legacy state onto the current Sheet — fail "
+                    "closed (§0). Resolve the legacy state before binding."
+                )
+            self._data["target_binding"] = ident
+            self._flush()                        # establish authority durably (§0/§15)
+            return ident
+        if not matches:
+            raise StateAuthorityError(
+                f"durable state is bound to {self._data['target_binding']!r}, not {ident!r}; "
+                "refusing a different Sheet target and never silently rebinding (§0)."
+            )
+        return self._data["target_binding"]
+
+    def verify_target(self, identity: dict) -> bool:
+        """Read-only authority check (NEVER writes). Returns True iff bound to an exactly
+        matching target. Unbound + EMPTY → False (a brand-new store, not yet authoritative).
+        Unbound + NON-EMPTY operational state → :class:`StateAuthorityError` (a non-empty
+        unbound store is NOT usable authority). Bound + mismatch/malformed → fail closed."""
+        ident = _norm_identity(identity)
+        matches = self._binding_matches(ident)
+        if matches is None:                      # unbound
+            if self.has_operational_state():
+                raise StateAuthorityError(
+                    "non-empty unbound durable state is not usable authority; fail closed (§0)."
+                )
+            return False
+        if not matches:
+            raise StateAuthorityError(
+                f"durable state is bound to {self._data['target_binding']!r}, not the current "
+                "target; fail closed (§0)."
+            )
+        return True
 
     @property
     def durable(self) -> bool:
@@ -48,14 +146,16 @@ class StateStore:
         return self.path is not None
 
     def persistence_ready(self) -> bool:
-        """True iff the configured durable target is actually usable RIGHT NOW (B8).
+        """True iff the configured durable parent location is PRESENTLY accessible and
+        preparable (B8).
 
-        ``durable`` only says a path is configured; a path whose parent is missing or
-        unwritable would still report durable until the first flush fails mid-write.
-        This validates/creates the parent directory (PG owns its runtime-state path,
-        §0) and checks it is writable — a safe, NON-destructive readiness probe (no
-        trial write to the live state file). Lets the operational flow detect an
-        unusable persistence target BEFORE human confirmation / business mutation.
+        ``durable`` only says a path is configured. This creates the parent directory
+        (PG owns its runtime-state path, §0) and checks it is writable — a non-destructive
+        probe (no trial write to the live state file). It proves ONLY current
+        accessibility/preparability at call time; it is **not** a guarantee that a future
+        state write will succeed and does **not** remove TOCTOU or later filesystem
+        failures. Those remaining failures are handled by the fail-closed pre-write
+        persistence contract and the post-mutation uncertain-result contract.
         """
         if not self.path:
             return False

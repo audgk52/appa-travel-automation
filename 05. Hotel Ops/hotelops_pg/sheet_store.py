@@ -17,6 +17,7 @@ wrap real Sheets via a lazy import.
 from hotelops_pg import fields
 from hotelops_pg.adoption import DuplicateRecordIdError, plan_adoption
 from hotelops_pg.records import read_records
+from hotelops_pg.state_store import StateStore
 
 # Fields written with Sheets USER_ENTERED so date/number semantics are preserved
 # (audit B10); all other managed fields are written RAW to keep text literal.
@@ -28,9 +29,26 @@ class InMemoryBackend:
     preamble rows above the managed header, and unmanaged leading columns like column A).
     Targeted, neighbour-preserving writes by ABSOLUTE physical (row, col)."""
 
-    def __init__(self, grid=None):
+    def __init__(self, grid=None, identity=None):
         self.grid = [list(r) for r in (grid or [])]
         self.writes = []  # (row_index, col_index, value) — audit that writes are targeted
+        # Deterministic destination identity for A1 binding tests (mirrors the fields a
+        # live GoogleBackend resolves): {"spreadsheet_id", "tab", "sheet_gid"} or None.
+        # ``operational`` is EXPLICIT (True only when an identity is supplied) — a backend is
+        # never classified pure/test by inferring it from a destination_identity() failure.
+        self._identity = dict(identity) if identity else None
+        self.operational = identity is not None
+
+    def destination_identity(self):
+        """The ACTUAL identity an A1 write would target (§ blocker 1).
+
+        In-memory backends expose deterministic metadata only when configured; an
+        unconfigured backend has no live destination and refuses to be used as one."""
+        if self._identity is None:
+            raise RuntimeError(
+                "InMemoryBackend has no destination identity; pass identity={'spreadsheet_id',"
+                "'tab','sheet_gid'} to use it as an A1 execution target.")
+        return dict(self._identity)
 
     def read_grid(self):
         return [list(r) for r in self.grid]
@@ -60,6 +78,19 @@ class InMemoryBackend:
             header.append(name)
             out[name] = len(header) - 1
         return out
+
+    def atomic_write_cells(self, sheet_gid, cells):
+        """Write every ``(row_index, col_index, value)`` as ONE all-or-none unit.
+
+        Models the atomic Sheets ``batchUpdate`` the :class:`GoogleBackend` uses for
+        A1 id adoption (§4): either every cell lands or none does. ``sheet_gid`` is
+        unused in-memory (there is a single grid)."""
+        prepared = [(int(r), int(c), str(v)) for r, c, v in cells]
+        for row_index, col_index, _ in prepared:
+            self._ensure(row_index, col_index)
+        for row_index, col_index, value in prepared:
+            self.grid[row_index][col_index] = value
+            self.writes.append((row_index, col_index, value))
 
 
 class RoomingSheetStore:
@@ -198,6 +229,8 @@ class GoogleBackend:
     writes stay targeted and neighbouring cells (human columns) are preserved.
     """
 
+    operational = True   # a live Sheets backend is ALWAYS operational (never a test backend)
+
     def __init__(self, service, spreadsheet_id, tab="01. Rooming List"):
         self.service = service
         self.spreadsheet_id = spreadsheet_id
@@ -205,6 +238,26 @@ class GoogleBackend:
 
     def _values(self):
         return self.service.spreadsheets().values()
+
+    def destination_identity(self):
+        """Read (NO write) the ACTUAL identity this backend will write to: its
+        spreadsheet id, its tab title, and the numeric ``sheetId`` ``updateCells``
+        requires (§ blocker 1). The gid is resolved from live metadata for THIS
+        backend's own tab, so the A1 plan is bound to the real API destination —
+        never a caller-supplied value that could name a different backend.
+
+        Fails closed (:class:`fields.SchemaError`) if the tab is absent — the gid
+        cannot be resolved, so no A1 write may proceed.
+        """
+        meta = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        for sh in meta.get("sheets", []):
+            p = sh.get("properties", {})
+            if p.get("title") == self.tab:
+                return {"spreadsheet_id": self.spreadsheet_id, "tab": self.tab,
+                        "sheet_gid": p.get("sheetId")}
+        raise fields.SchemaError(
+            f"tab {self.tab!r} not found in spreadsheet {self.spreadsheet_id!r}; cannot "
+            "resolve its sheetId — fail closed before any A1 write.")
 
     @staticmethod
     def _a1_col(n):  # 0-based index -> A1 letters
@@ -252,6 +305,31 @@ class GoogleBackend:
             out[name] = col
         return out
 
+    def atomic_write_cells(self, sheet_gid, cells):
+        """Write ALL of ``cells`` (each ``(row_index, col_index, value)``, absolute
+        0-based grid coords) in ONE atomic ``spreadsheets().batchUpdate`` request.
+
+        Google documents this method as all-or-none: *"Each request is validated
+        before being applied. If any request is not valid then the entire request
+        will fail and nothing will be applied."* (Sheets API v4
+        ``spreadsheets.batchUpdate``). We therefore use it — NOT ``values().update``
+        per cell nor ``values().batchUpdate`` (whose docs do not promise atomicity) —
+        so A1 id adoption lands completely or not at all (§4). Ids are written as
+        string values so Sheets never reinterprets them as a formula/number/date.
+        """
+        requests = [{
+            "updateCells": {
+                "range": {"sheetId": sheet_gid,
+                          "startRowIndex": int(r), "endRowIndex": int(r) + 1,
+                          "startColumnIndex": int(c), "endColumnIndex": int(c) + 1},
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": str(v)}}]}],
+                "fields": "userEnteredValue",
+            }
+        } for (r, c, v) in cells]
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=self.spreadsheet_id, body={"requests": requests}
+        ).execute()
+
 
 def build_sheets_service(key_path):
     """Construct a Sheets v4 service from a service-account key (lazy google import)."""
@@ -262,3 +340,61 @@ def build_sheets_service(key_path):
         key_path, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def open_rooming_store():
+    """The ONE live Hotel Ops entrypoint: build a store for the configured target.
+
+    Resolves :func:`hotelops_pg.config.hotel_sheet_config` FIRST and ALWAYS, so a
+    missing or unsafe Hotel target (e.g. inheriting the Dispatch ``APPA_GSHEET_ID``)
+    fails closed before a Google service is ever constructed or a cell is ever
+    touched.
+
+    There is deliberately **no caller-supplied ``config`` override**: an operational
+    entrypoint must never let a caller silently substitute the authorized destination
+    (that was the target-isolation bypass — a caller could inject an arbitrary or the
+    Dispatch id past :func:`hotel_sheet_config`). Tests and other pure callers that
+    need an explicit target construct :class:`RoomingSheetStore` over an explicit
+    backend directly — a pure adapter that never reaches a live Google service.
+    """
+    from hotelops_pg.config import hotel_sheet_config
+
+    cfg = hotel_sheet_config()
+    service = build_sheets_service(cfg["key_path"])
+    backend = GoogleBackend(service, cfg["spreadsheet_id"], tab=cfg["tab"])
+    return RoomingSheetStore(backend)
+
+
+def open_rooming_store_and_state(*, for_write):
+    """The supported LIVE operational boundary: the authoritative ``(store, state, identity)``.
+
+    This is the ONLY sanctioned way to obtain the operational store together with its
+    durable StateStore. Both are resolved from Hotel Ops configuration — the Sheet target
+    via :func:`hotelops_pg.config.hotel_sheet_config` and the durable state via
+    :func:`hotelops_pg.config.hotel_state_path` — and the state is bound to the ACTUAL
+    backend destination identity (spreadsheet id + tab + numeric sheetId).
+
+    It accepts **no caller-supplied store or state**, so a fresh / empty / in-memory /
+    arbitrary-path StateStore cannot bypass this authority on the supported live path.
+    Pure helpers and tests may still inject a StateStore into the lower-level functions.
+
+    ``for_write=True`` (confirmation / execution / recovery) establishes-or-verifies the
+    target binding and requires the durable path to be usable NOW — so the authoritative
+    path + target authority are established BEFORE the first business Sheet mutation, and
+    a binding mismatch / unusable path fails closed with zero mutation. ``for_write=False``
+    (read-only preview) verifies an existing binding but never writes one.
+    """
+    from hotelops_pg.config import hotel_state_path, HotelStateConfigError
+
+    store = open_rooming_store()                       # hotel_sheet_config, no injection
+    identity = store.backend.destination_identity()    # actual spreadsheet/tab/gid (read-only)
+    state = StateStore(hotel_state_path())             # required, safe, durable path
+    if for_write:
+        if not state.persistence_ready():              # non-destructive readiness (creates parent dir)
+            raise HotelStateConfigError(
+                "APPA_HOTEL_STATE_PATH parent directory is not usable/writable; refusing "
+                "before any confirmation or business mutation.")
+        state.bind_or_verify_target(identity)          # establish/verify authority before mutation
+    else:
+        state.verify_target(identity)                  # read-only authority check
+    return store, state, identity
