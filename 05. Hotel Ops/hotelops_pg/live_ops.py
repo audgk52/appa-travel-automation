@@ -93,7 +93,8 @@ def execute_confirmed(confirmed_art):
             "fail closed.")
     return spine.execute_confirmed(store, state, change,
                                    request_date=confirmed_art["request_date"],
-                                   hotel_confirmed=confirmed_art["hotel_confirmed"])
+                                   hotel_confirmed=confirmed_art["hotel_confirmed"],
+                                   confirmed_envelope=confirmed_art)   # FULL artifact persisted durably
 
 
 def recover(operation_ref):

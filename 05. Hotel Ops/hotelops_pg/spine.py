@@ -95,7 +95,10 @@ def _require_bound_authority(store, state, flow):
             f"operational {flow}: the store's destination identity failed to resolve "
             f"({exc!r}); fail closed before any business mutation (§0)."
         )
-    if not isinstance(identity, dict) or any(not identity.get(k) for k in _IDENTITY_KEYS):
+    sid, tab, gid = (identity.get("spreadsheet_id"), identity.get("tab"),
+                     identity.get("sheet_gid")) if isinstance(identity, dict) else (None, None, None)
+    if not (isinstance(sid, str) and sid.strip() and isinstance(tab, str) and tab.strip()
+            and isinstance(gid, int) and not isinstance(gid, bool)):   # gid=0 is VALID; None/str/bool are not
         raise StateAuthorityError(
             f"operational {flow}: destination identity {identity!r} is missing/malformed; "
             "fail closed (§0)."
@@ -555,18 +558,20 @@ def confirm_preview(preview, *, grouping_disposition="", impact_dispositions=Non
     )
 
 
-def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_confirmed=False):
+def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_confirmed=False,
+                      confirmed_envelope=None):
     """Execute (or safely retry/recover) ONE already-confirmed operation artifact (B7-A).
 
     Requires durable state (B8). Re-runnable by contract: a retry of the SAME confirmed
     artifact reconciles against the durable journal via ``execute`` and never
-    re-authorizes, re-applies, or duplicates history (§15). This is the operational
-    EXECUTE step, deliberately distinct from :func:`confirm_preview`.
+    re-authorizes, re-applies, or duplicates history (§15). ``confirmed_envelope`` (the
+    supported live path) is the FULL canonical ConfirmedArtifact staged durably before the
+    first business mutation. This is the operational EXECUTE step, distinct from ``confirm_preview``.
     """
     _require_durable(state, "commit")                    # B8: fail before any mutation
     _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     return execute(confirmed, store, state, request_date=request_date,
-                   hotel_confirmed=hotel_confirmed)
+                   hotel_confirmed=hotel_confirmed, confirmed_envelope=confirmed_envelope)
 
 
 def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed=False):
@@ -587,13 +592,23 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
             f"no persisted confirmed operation {operation_ref!r} to recover; nothing was "
             "durably staged (§15, B7-A)."
         )
-    # request_date / hotel_confirmed are fixed at confirmation and loaded from the DURABLE
-    # artifact — a retry/recovery can never change their meaning with new caller values
-    # (§17/§19). Legacy payloads without them fall back to the caller defaults.
-    rd = payload.get("request_date", request_date)
-    hc = payload.get("hotel_confirmed", hotel_confirmed)
-    confirmed = from_payload(payload)
-    return execute(confirmed, store, state, request_date=rd, hotel_confirmed=hc)
+    # request_date / hotel_confirmed are FIXED at confirmation and loaded ONLY from the
+    # durable artifact — the caller ``request_date``/``hotel_confirmed`` args are ignored so a
+    # retry can never change their meaning (§17/§19, round-4 §5). NO invented defaults.
+    if payload.get("kind") == "confirmed":
+        from hotelops_pg.change import verify_durable_confirmed
+        identity = store.backend.destination_identity()  # operational (guard already passed)
+        confirmed = verify_durable_confirmed(payload, operation_ref, identity, state.target_binding)
+        return execute(confirmed, store, state, request_date=payload["request_date"],
+                       hotel_confirmed=payload["hotel_confirmed"], confirmed_envelope=payload)
+    if "request_date" in payload and "hotel_confirmed" in payload:   # minimal (pure/unit) envelope
+        confirmed = from_payload(payload)
+        return execute(confirmed, store, state, request_date=payload["request_date"],
+                       hotel_confirmed=payload["hotel_confirmed"])
+    # Legacy artifact missing recoverable semantic evidence → incompatible; never invent
+    # request_date="MMDD"/hotel_confirmed=False, never migrate/rebind, zero writes (round-4 §6).
+    from hotelops_pg.execution import incompatible_legacy_result
+    return incompatible_legacy_result(operation_ref, state.is_executed(operation_ref))
 
 
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,

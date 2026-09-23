@@ -170,6 +170,21 @@ explicitly does not add.
   helpers for tests, **not** the operational entrypoint, and must not be named as such.
   For the Echo B1 scenario: `request_date=0922`, `hotel_confirmed=False`, ApprovalDecisions
   empty.
+  - **Deterministic confirmation:** confirming the SAME approved preview instance + the SAME
+    ApprovalDecisions always yields the SAME `operation_ref` and ConfirmedArtifact (no random
+    id on retry). Different valid decisions, or a separate preview instance, yield a distinct
+    identity. Every ApprovalDecision must select only a **presented** canonical option.
+  - **Durable recovery:** the FULL ConfirmedArtifact is persisted before the first Sheet
+    mutation; `recover` loads it, requires the durable key == the artifact's internal
+    `operation_ref`, verifies the confirmed digest, and requires artifact destination ==
+    backend destination == StateStore binding — else fails closed with zero writes.
+    `request_date`/`hotel_confirmed` are loaded durably and cannot be changed on retry.
+  - **Legacy:** a durable artifact lacking recoverable `request_date`/`hotel_confirmed` is
+    reported **incompatible** (no invented defaults, no migration/rebind, zero writes); a
+    historically-complete op reports output-recovery unsupported rather than inventing output.
+  - **Draft recovery** regenerates Kakao/email purely from the confirmed artifact and never
+    replays a business/history write; if regeneration fails, the result is uncertain (not a
+    clean no-op) and retryable.
   - **Preview is READ-ONLY** (`for_write=False`): it verifies but never establishes target
     authority and writes neither the Sheet nor the StateStore.
   - **Confirmation/execution independently REOPEN the configured authority** (`for_write=True`)

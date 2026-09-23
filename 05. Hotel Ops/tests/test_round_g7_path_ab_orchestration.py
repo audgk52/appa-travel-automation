@@ -576,7 +576,8 @@ def test_b2_restart_recover_from_payload_accepts_observed_new(make_store, durabl
     op = confirmed.operation_ref
     # Stage the confirmed artifact durably + record same-op pre-write intent; the business
     # write already landed; the operation was left unfinished (pending).
-    durable_state.stage_operation(op, to_payload(confirmed))
+    durable_state.stage_operation(op, {**to_payload(confirmed),
+                                       "request_date": "MMDD", "hotel_confirmed": False})
     durable_state.begin_record(op, "rl-a", {fields.PAYMENT: "Personal"})   # flushes stage + intent
     store.apply_writes("rl-a", {fields.PAYMENT: "Personal"})
 
@@ -622,6 +623,10 @@ _LEGACY_PAYLOAD = {
     "limited_check_authorized": False,
     "authorized_decisions": {},
     "confirmed_scope": {"record_ids": ["rl-a"], "intentional_exceptions": []},
+    # round-4: real execute() stages the fixed semantic inputs; a durable op carries them
+    # (their absence is what marks a truly-incompatible legacy artifact — tested separately).
+    "request_date": "0610",
+    "hotel_confirmed": False,
 }
 
 

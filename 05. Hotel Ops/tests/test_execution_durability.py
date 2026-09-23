@@ -61,7 +61,7 @@ def test_history_write_failure_is_not_reported_verified(make_store):
     state = StateStore()
     res = execute(_confirmed(store), HistoryFailStore(store, "fail_return"), state)
     assert res.overall == "uncertain"
-    assert res.record_status("rl-a")["request_history_append"] == "failed"
+    assert res.record_status("rl-a")["request_history_append"] == "uncertain"
     assert state.is_executed(res.operation_ref) is False        # never falsely complete
     assert state.record_status(res.operation_ref, "rl-a") == "uncertain"
 
@@ -71,7 +71,7 @@ def test_history_write_claiming_success_but_not_persisted_is_caught(make_store):
     store, _ = make_store([record(name="James", record_id="rl-a", stay_id="STAY-1")])
     res = execute(_confirmed(store), HistoryFailStore(store, "silent"), StateStore())
     assert res.overall == "uncertain"
-    assert res.record_status("rl-a")["request_history_append"] == "failed"
+    assert res.record_status("rl-a")["request_history_append"] == "uncertain"
     assert _req_history(store, "rl-a") == ""                            # nothing actually written
 
 
