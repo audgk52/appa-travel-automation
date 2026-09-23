@@ -173,10 +173,18 @@ def test_reset_reload_exception_becomes_uncertain(tmp_path, monkeypatch):
 
 
 def test_reset_verification_mismatch_still_uncertain(tmp_path, monkeypatch):
-    # Existing mismatch branch must keep behaving (reload succeeds but reads a different value).
+    # Mismatch branch (reload succeeds but the DURABLE pending reads a different value) with no
+    # prior active baseline → uncertain.
     state = StateStore(tmp_path / "s.json")
     recs = [rr("rl-a", check_out="2026-06-12")]
-    monkeypatch.setattr(state, "get_baseline", lambda: {"rl-a": {"tampered": "x"}})
+    real_reload = state.reload
+
+    def tampering_reload():
+        real_reload()
+        state._data["baseline"]["pending"]["values"] = {"rl-a": {"tampered": "x"}}
+        return state
+
+    monkeypatch.setattr(state, "reload", tampering_reload)
     res = baseline.reset(lambda: recs, state)
     assert res.status == "uncertain" and res.authoritative == "indeterminate"
     assert state.authority == "uncertain"

@@ -11,10 +11,48 @@ JSON file, or pure in-memory when ``path`` is None) is implementation-owned (§9
 """
 import json
 import os
+import uuid
 from pathlib import Path
 
 AUTHORITY_ACTIVE = "active"
 AUTHORITY_UNCERTAIN = "uncertain"       # R3-C: which baseline is authoritative is unknown
+
+# Yellow baseline durable lifecycle (R3 §9, verified-before-activation). The durable
+# baseline is a normalized container ``{"active": …, "pending": …}`` where:
+#   active  = the currently authoritative baseline that already passed verify-before-activate:
+#             {"generation": int, "attempt_id": str, "target_binding": dict|None, "values": {...}}
+#   pending = at most ONE frozen reset attempt awaiting verification/promotion:
+#             {"attempt_id": str, "expected_predecessor": int|None, "target_binding": dict|None,
+#              "values": {...}}   (expected_predecessor None == initial creation, no active predecessor)
+# Restart safety is STRUCTURAL: an unverified/un-promoted candidate lives only in ``pending``
+# and is never used as a comparison baseline nor auto-promoted on load — it does NOT depend on
+# having successfully written the ``uncertain`` marker.
+LEGACY_ATTEMPT = "legacy-migrated"      # attempt_id stamped on a pre-lifecycle (flat-schema) active
+
+
+class BaselineStateError(ValueError):
+    """The durable baseline is malformed / torn / ambiguous and cannot be trusted as
+    authority — yellow refresh/reset fail closed (R3 §9). Business idempotency evidence
+    (``executed_ops``) is unaffected and stays readable."""
+
+
+# Outcome of a durable baseline establishment attempt (state_store owns the transition,
+# baseline.py maps it onto the domain ResetResult).
+ACT_ACTIVATED = "activated"             # the exact verified candidate B is now authoritative
+ACT_PREVIOUS = "previous"               # not activated; a prior established active remains authoritative
+ACT_UNCERTAIN = "uncertain"             # authority cannot be established → block yellow ops
+
+
+def _validate_slot(slot, kind):
+    """Fail closed (:class:`BaselineStateError`) on a malformed active/pending baseline slot.
+    ``None`` (empty slot) is valid; an active slot additionally requires an integer generation."""
+    if slot is None:
+        return
+    if not (isinstance(slot, dict) and isinstance(slot.get("values"), dict)):
+        raise BaselineStateError(f"malformed {kind} baseline slot {slot!r}; fail closed (R3 §9).")
+    if kind == "active" and not isinstance(slot.get("generation"), int):
+        raise BaselineStateError(
+            f"active baseline slot has no integer generation {slot!r}; fail closed (R3 §9).")
 
 
 class GroupingScopeError(ValueError):
@@ -42,7 +80,7 @@ class StateStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._data = {
-            "baseline": None,               # {"values": {record_id: {field: value}}}
+            "baseline": None,               # {"active": {...}|None, "pending": {...}|None} (R3 §9 lifecycle)
             "baseline_authority": AUTHORITY_ACTIVE,
             "executed_ops": {},             # operation_ref -> {"records": {...}, "complete": bool}
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
@@ -73,9 +111,14 @@ class StateStore:
         record itself, not operational state. Used so an UNBOUND store that already holds
         legacy state is never silently bound/attached/migrated to the current Sheet (§0)."""
         d = self._data
+        try:
+            bl = self._baseline()
+            baseline_present = bl["active"] is not None or bl["pending"] is not None
+        except BaselineStateError:
+            baseline_present = True          # a corrupt baseline still counts as operational state
         return bool(
             d.get("executed_ops") or d.get("operations") or d.get("uncertain_records")
-            or d.get("grouping_uncertain") or (d.get("baseline") is not None)
+            or d.get("grouping_uncertain") or baseline_present
             or d.get("baseline_authority", AUTHORITY_ACTIVE) != AUTHORITY_ACTIVE
         )
 
@@ -186,42 +229,235 @@ class StateStore:
             self._data = json.loads(self.path.read_text(encoding="utf-8"))
         return self
 
-    # --- baseline (R3 §9) ----------------------------------------------------
+    # --- baseline durable lifecycle (R3 §9, verified-before-activation) -------
+    def _baseline(self):
+        """Return the normalized durable baseline container ``{"active","pending"}``.
+
+        Fails closed (:class:`BaselineStateError`) on a malformed/torn shape. The pre-lifecycle
+        FLAT schema (``{"values": …}``) is migrated to a new-schema ``active`` (generation 0,
+        attempt_id :data:`LEGACY_ATTEMPT`) as a READ VIEW: the exact durable snapshot already
+        believed active is carried forward — no NEW trust is manufactured (it never asserts the
+        snapshot passed the new verified-before-activation lifecycle) and disk is NOT rewritten
+        until a real lifecycle write flushes. An empty store (``None``) → both slots ``None``."""
+        b = self._data.get("baseline")
+        if b is None:
+            return {"active": None, "pending": None}
+        if isinstance(b, dict):
+            if "active" in b or "pending" in b:                  # new-schema container
+                active, pending = b.get("active"), b.get("pending")
+                _validate_slot(active, "active")
+                _validate_slot(pending, "pending")
+                return {"active": active, "pending": pending}
+            if isinstance(b.get("values"), dict):                # legacy flat active → migrate view
+                return {"active": {"generation": 0, "attempt_id": LEGACY_ATTEMPT,
+                                   "target_binding": self._data.get("target_binding"),
+                                   "values": b["values"]},
+                        "pending": None}
+        raise BaselineStateError(f"malformed durable baseline {b!r}; fail closed (R3 §9).")
+
+    def _write_baseline(self, active, pending, authority):
+        """Durably replace the WHOLE baseline container + authority in ONE atomic ``_flush``
+        (crash-safe temp-write + replace). Rolls back in memory on a flush failure so an
+        in-memory mutation never outlives a failed durable write (B8)."""
+        prev = (self._data.get("baseline"), self._data.get("baseline_authority"))
+        self._data["baseline"] = {"active": active, "pending": pending}
+        self._data["baseline_authority"] = authority
+        try:
+            self._flush()
+        except Exception:
+            self._data["baseline"], self._data["baseline_authority"] = prev
+            raise
+
     @property
     def has_baseline(self) -> bool:
-        return self._data["baseline"] is not None
+        """True iff an ACTIVE (authoritative) baseline exists. A staged ``pending`` alone is
+        NEVER a baseline (an unverified candidate is not authoritative)."""
+        return self._baseline()["active"] is not None
 
     @property
     def authority(self) -> str:
         return self._data["baseline_authority"]
 
     def get_baseline(self) -> dict:
-        b = self._data["baseline"]
-        return dict(b["values"]) if b else {}
+        """The ACTIVE comparison baseline values — never the unverified ``pending``."""
+        active = self._baseline()["active"]
+        return dict(active["values"]) if active else {}
+
+    def active_generation(self):
+        """The active baseline's generation, or ``None`` when there is no active baseline
+        (initial-creation predecessor). Used as the promotion predecessor guard."""
+        active = self._baseline()["active"]
+        return active["generation"] if active else None
+
+    def pending_attempt(self):
+        """The staged pending reset attempt (or ``None``). Read-only; never authoritative."""
+        return self._baseline()["pending"]
 
     def persist_baseline(self, values: dict):
-        """Persist + ACTIVATE a new baseline (steps 2–4 of §9), durable-first (B8).
+        """DIRECT-ACTIVATE a baseline (legacy/injectable activation seam), durable-first (B8).
 
-        The new baseline becomes authoritative only if it is durably written. If the
-        durable write fails, the previous baseline/authority is ROLLED BACK in memory
-        so an in-memory mutation can never make a new baseline active before it is
-        durable — the caller sees the failure and treats it as pre-activation (R3-A).
-        """
-        prev_baseline = self._data["baseline"]
-        prev_authority = self._data["baseline_authority"]
-        self._data["baseline"] = {"values": {rid: dict(v) for rid, v in values.items()}}
-        self._data["baseline_authority"] = AUTHORITY_ACTIVE
+        Bumps the active generation, stamps a fresh attempt id, clears any pending, and rolls
+        back in memory on a durable-write failure so an unverified in-memory mutation never
+        becomes active. The DEFAULT operational reset uses the full verified
+        :meth:`establish_baseline` lifecycle instead of this direct activation."""
+        cur = self._baseline()["active"]
+        new_gen = 0 if cur is None else cur["generation"] + 1
+        active = {"generation": new_gen, "attempt_id": uuid.uuid4().hex,
+                  "target_binding": self._data.get("target_binding"),
+                  "values": {rid: dict(v) for rid, v in values.items()}}
+        self._write_baseline(active, None, AUTHORITY_ACTIVE)
+
+    def resolve_pending(self, attempt_id=None):
+        """Durably resolve (discard) the staged pending attempt, preserving the active
+        baseline. With ``attempt_id`` given, only a matching pending is discarded (a
+        different in-flight attempt is left untouched). Never promotes."""
+        bl = self._baseline()
+        p = bl["pending"]
+        if p is None or (attempt_id is not None and p.get("attempt_id") != attempt_id):
+            return
+        self._write_baseline(bl["active"], None, self._data["baseline_authority"])
+
+    def reconcile_baseline(self):
+        """Restart/entry reconcile — STRUCTURALLY never auto-promotes a pending (R3 §9).
+
+        * active + pending → the pending is an ABANDONED prior attempt: discard it, active
+          remains authoritative (a new reset must resolve it before staging another).
+        * pending only (no active) → a crashed INITIAL attempt: left in place, but it is NOT a
+          baseline (``has_baseline`` stays False → refresh blocked) and requires an explicit
+          initialization recovery/reset — never silently promoted.
+        * active only / empty → no-op.
+        Returns the post-reconcile container."""
+        bl = self._baseline()
+        if bl["pending"] is not None and bl["active"] is not None:
+            self._write_baseline(bl["active"], None, self._data["baseline_authority"])
+            return self._baseline()
+        return bl
+
+    def establish_baseline(self, values, *, attempt_id, expected_predecessor, target_binding):
+        """Verified-before-activation durable establishment (R3 §9 steps 5–8).
+
+        Only the EXACT verified pending candidate, conditional on the ``expected_predecessor``
+        active generation, is atomically promoted to active (active-replace + pending-remove in
+        ONE ``_flush``). Returns :data:`ACT_ACTIVATED` / :data:`ACT_PREVIOUS` /
+        :data:`ACT_UNCERTAIN`. Idempotent for a repeated attempt id (already-activated retry and
+        same-attempt mid-flight retry). Restart safety is structural: an un-promoted candidate
+        lives only in ``pending`` and is never trusted, independent of the ``uncertain`` marker.
+        Any unexpected failure (e.g. a best-effort pending discard that cannot be written, or a
+        malformed durable baseline) is classified, never raised: A remains → previous, else
+        uncertain."""
+        try:
+            return self._establish(values, attempt_id, expected_predecessor, target_binding)
+        except Exception:                                        # noqa: BLE001 — never escape as success
+            return self._authority_after_verify_failure()
+
+    def _establish(self, values, attempt_id, expected_predecessor, target_binding):
+        norm_binding = _norm_identity(target_binding) if target_binding else None
+        frozen = {rid: dict(v) for rid, v in values.items()}
+        bl = self._baseline()
+
+        # Already-activated retry (idempotent): this exact attempt is the current active.
+        a = bl["active"]
+        if a is not None and a.get("attempt_id") == attempt_id and a.get("values") == frozen:
+            return ACT_ACTIVATED
+
+        # Same-attempt mid-flight pending → reuse it; otherwise resolve an ABANDONED (different)
+        # pending while preserving the active baseline (never auto-promote either one).
+        p = bl["pending"]
+        same_attempt_pending = (p is not None and p.get("attempt_id") == attempt_id
+                                and p.get("values") == frozen
+                                and p.get("expected_predecessor") == expected_predecessor)
+        if p is not None and not same_attempt_pending:
+            self.resolve_pending()                               # discard abandoned attempt (durable)
+
+        if self.active_generation() != expected_predecessor:
+            return ACT_PREVIOUS                                  # predecessor moved → do not activate
+
+        # 5. Persist candidate as pending, PRESERVING active. Failure here = before activation.
+        if not same_attempt_pending:
+            active_before = self._baseline()["active"]
+            try:
+                self._write_baseline(active_before,
+                                     {"attempt_id": attempt_id, "values": frozen,
+                                      "expected_predecessor": expected_predecessor,
+                                      "target_binding": norm_binding},
+                                     self._data["baseline_authority"])
+            except Exception:
+                try:
+                    self.reload()                                # determine whether pending landed
+                except Exception:
+                    pass
+                self.reconcile_baseline()                        # active A remains authoritative
+                return ACT_PREVIOUS
+
+        # 6. Reload + verify the DURABLE pending (identity / content / binding / predecessor).
+        try:
+            self.reload()
+            pend = self._baseline()["pending"]
+            verified = (pend is not None and pend.get("attempt_id") == attempt_id
+                        and pend.get("values") == frozen
+                        and pend.get("expected_predecessor") == expected_predecessor
+                        and (pend.get("target_binding") or None) == norm_binding)
+        except Exception:
+            return self._authority_after_verify_failure()        # A remains if established, else uncertain
+        if not verified:
+            self.resolve_pending(attempt_id)                     # mismatch → resolve, keep A
+            return self._authority_after_verify_failure()
+        if self.active_generation() != expected_predecessor:     # predecessor moved under us
+            self.resolve_pending(attempt_id)
+            return ACT_PREVIOUS
+
+        # 7. Atomically promote the verified candidate (active-replace + pending-remove, one flush).
+        new_gen = 0 if expected_predecessor is None else expected_predecessor + 1
+        promoted = {"generation": new_gen, "attempt_id": attempt_id,
+                    "target_binding": norm_binding, "values": frozen}
+        try:
+            self._write_baseline(promoted, None, AUTHORITY_ACTIVE)
+        except Exception:
+            # 8. Ambiguous durable outcome → reconcile by READING durable state, never assume.
+            return self._reconcile_activation(attempt_id, frozen)
+        return ACT_ACTIVATED
+
+    def _reconcile_activation(self, attempt_id, frozen):
+        """Resolve an AMBIGUOUS activation write (step 8) by inspecting durable state, never
+        assuming success or failure from the write call's outcome."""
+        try:
+            self.reload()
+            bl = self._baseline()
+        except Exception:                                        # unreadable / malformed → cannot trust
+            self.mark_uncertain()                                # cannot read/trust state → block
+            return ACT_UNCERTAIN
+        a = bl["active"]
+        if a is not None and a.get("attempt_id") == attempt_id and a.get("values") == frozen:
+            return ACT_ACTIVATED                                 # promotion DID land durably
+        if a is not None and bl["pending"] is not None:
+            return ACT_PREVIOUS                                  # promotion did NOT land; A remains
+        self.mark_uncertain()
+        return ACT_UNCERTAIN
+
+    def _authority_after_verify_failure(self):
+        """After a pending verification READ failure or MISMATCH: never activate. A prior
+        ESTABLISHED active baseline REMAINS authoritative (do NOT classify uncertain merely
+        because the pending verification failed). Only when no valid active can be established
+        is authority uncertain (yellow ops blocked)."""
+        try:
+            if self._baseline()["active"] is not None:
+                return ACT_PREVIOUS
+        except BaselineStateError:
+            pass
+        self.mark_uncertain()
+        return ACT_UNCERTAIN
+
+    def mark_uncertain(self):
+        """R3-C: authority indeterminate → block further yellow ops until re-verified.
+
+        Best-effort durable: restart safety does NOT depend on this marker landing. The
+        structural active/pending lifecycle already prevents an unverified candidate from being
+        trusted, so a marker-persist failure must NOT fail open (the exception is swallowed)."""
+        self._data["baseline_authority"] = AUTHORITY_UNCERTAIN
         try:
             self._flush()
         except Exception:
-            self._data["baseline"] = prev_baseline           # not durable → not authoritative
-            self._data["baseline_authority"] = prev_authority
-            raise
-
-    def mark_uncertain(self):
-        """R3-C: authority indeterminate → block further yellow ops until re-verified."""
-        self._data["baseline_authority"] = AUTHORITY_UNCERTAIN
-        self._flush()
+            pass
 
     # --- idempotency + durable effect journal (§15; audit B7) ----------------
     # executed_ops[op]["records"][rid] = {
