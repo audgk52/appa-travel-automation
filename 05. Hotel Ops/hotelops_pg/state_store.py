@@ -179,6 +179,9 @@ class StateStore:
         self._loaded_id = None
         if self.path and self.path.exists():
             self._loaded_id = _file_id(self.path)
+            # An EXISTING durable document must carry its own authority: never manufacture
+            # "active" from the constructor default (missing → fail closed in _baseline()).
+            del self._data["baseline_authority"]
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
         self._data.setdefault("grouping_uncertain", {})

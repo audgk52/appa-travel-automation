@@ -117,6 +117,29 @@ def test_malformed_authority_fails_closed_after_reopen(tmp_path, authority):
     assert p.read_bytes() == before                      # never repaired / never rewritten
 
 
+def test_missing_authority_key_fails_closed_after_reopen(monkeypatch, tmp_path):
+    """R3: a durable doc with baseline + target_binding but NO baseline_authority key must
+    never be manufactured as "active" by the constructor default."""
+    store, backend, p = _live(monkeypatch, tmp_path)
+    p.write_text(json.dumps({"baseline": {"schema": 1, "active": _active(), "pending": None},
+                             "target_binding": IDENT}), encoding="utf-8")
+    before, grid, fake = p.read_bytes(), [list(r) for r in backend.grid], FakeSheets()
+    s = StateStore(p)
+    with pytest.raises(BaselineStateError):
+        s.authority
+    with pytest.raises(BaselineStateError):
+        refresh(lambda: [rr("rl-a")], s)
+    with pytest.raises(BaselineStateError):
+        StateStore(p).reload().validate()
+    for for_write in (True, False):
+        with pytest.raises(BaselineStateError):
+            with sheet_store.open_rooming_store_and_state(for_write=for_write) as (st, state, _):
+                yellow_reset(st, state, service=fake, sheet_id=GID)
+    assert p.read_bytes() == before and fake.batch_bodies == []
+    assert backend.grid == grid and backend.writes == []
+    assert StateStore(tmp_path / "new.json").authority == "active"   # brand-new store still OK
+
+
 @pytest.mark.parametrize("attempt", [None, "", "   ", 7, ["x"]])
 def test_invalid_attempt_id_fails_closed(tmp_path, attempt):
     p = tmp_path / "s.json"
