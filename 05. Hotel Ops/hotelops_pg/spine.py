@@ -185,6 +185,7 @@ def _require_operational_render(store, state, service, sheet_id, flow):
             f"destination gid {identity['sheet_gid']!r}; refusing to format a different tab "
             "(B9/§0)."
         )
+    return identity
 
 
 # Payment vocabulary is PRD-enumerated (§20). Recognizing a trailing payment token
@@ -701,7 +702,7 @@ def yellow_refresh(store, state, service, sheet_id):
     return result
 
 
-def yellow_reset(store, state, service, sheet_id, persist=None):
+def yellow_reset(store, state, service, sheet_id):
     """Operational yellow reset — DURABLE state (B8) + validated observation + real render.
 
     Preserves the R3 §9 sequence: capture candidate → persist → verify/activate → NEW
@@ -709,9 +710,11 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     and the numeric ``sheet_id`` are BOTH required with no default and validated up front
     (``RenderTargetError``, before ``_require_durable`` and before any capture/persist), so
     there is no ``render=None``/``sheet_id=0`` call form that returns a successful reset
-    without delivering the formatting to a verified target. ``persist`` stays
-    injectable for durability tests; the real Sheets render is supplied by the operational
-    entry (distinct from any test-injected domain render).
+    without delivering the formatting to a verified target. There is NO persist injection:
+    the reset always runs the verified pending → durable verify → promotion lifecycle
+    (failure injection lives only in the domain seam ``baseline.reset``). On an operational
+    backend the state MUST come from the exclusive write session
+    (``open_rooming_store_and_state(for_write=True)``), so the lock is held for the whole reset.
 
     Authority guard (R3-C, §9/AC-12c): while baseline authority is indeterminate, further
     yellow refresh/reset are blocked and NO formatting request is issued. Failure semantics
@@ -720,14 +723,19 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     activation → new baseline retained, ``activated_render_incomplete`` (no rollback).
     """
     from hotelops_pg.baseline import AUTHORITY_UNCERTAIN, UncertainBaselineError, _diff, reset
+    from hotelops_pg.state_store import StateAuthorityError
     from hotelops_pg.yellow_sheets import apply_yellow
 
-    _require_operational_render(store, state, service, sheet_id, "yellow reset")
+    identity = _require_operational_render(store, state, service, sheet_id, "yellow reset")
 
     if state.authority == AUTHORITY_UNCERTAIN:
         raise UncertainBaselineError(
             "baseline authority uncertain; yellow reset blocked until re-verified (R3-C, §9)"
         )
+    if identity is not None and not state.lock_held:
+        raise StateAuthorityError(
+            "operational yellow reset requires the exclusive StateStore write session "
+            "(open_rooming_store_and_state(for_write=True)); refusing an unlocked state.")
 
     obs = {}
 
@@ -744,4 +752,4 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
                      result, obs["records"], obs["headers"], sheet_id, obs["header_row"])
         return result
 
-    return reset(observe, state, persist=persist, render=render)
+    return reset(observe, state, render=render)

@@ -14,10 +14,12 @@ A pluggable ``backend`` models the grid (``read_grid`` / ``write_cells`` /
 Dispatch's FakeSheetsService); :func:`build_sheets_service` + :class:`GoogleBackend`
 wrap real Sheets via a lazy import.
 """
+from contextlib import contextmanager
+
 from hotelops_pg import fields
 from hotelops_pg.adoption import DuplicateRecordIdError, plan_adoption
 from hotelops_pg.records import read_records
-from hotelops_pg.state_store import StateStore
+from hotelops_pg.state_store import StateStore, path_ready
 
 # Fields written with Sheets USER_ENTERED so date/number semantics are preserved
 # (audit B10); all other managed fields are written RAW to keep text literal.
@@ -365,8 +367,9 @@ def open_rooming_store():
     return RoomingSheetStore(backend)
 
 
+@contextmanager
 def open_rooming_store_and_state(*, for_write):
-    """The supported LIVE operational boundary: the authoritative ``(store, state, identity)``.
+    """The supported LIVE operational boundary: ``with … as (store, state, identity)``.
 
     This is the ONLY sanctioned way to obtain the operational store together with its
     durable StateStore. Both are resolved from Hotel Ops configuration — the Sheet target
@@ -378,23 +381,31 @@ def open_rooming_store_and_state(*, for_write):
     arbitrary-path StateStore cannot bypass this authority on the supported live path.
     Pure helpers and tests may still inject a StateStore into the lower-level functions.
 
-    ``for_write=True`` (confirmation / execution / recovery) establishes-or-verifies the
-    target binding and requires the durable path to be usable NOW — so the authoritative
-    path + target authority are established BEFORE the first business Sheet mutation, and
-    a binding mismatch / unusable path fails closed with zero mutation. ``for_write=False``
-    (read-only preview) verifies an existing binding but never writes one.
+    ``for_write=True`` (confirmation / execution / recovery / yellow reset) acquires the
+    single-host EXCLUSIVE StateStore lock BEFORE loading state, loads fresh durable state,
+    establishes-or-verifies the target binding and validates baseline authority, and holds the
+    lock for the whole ``with`` body; a competing writer gets :class:`StateBusyError` with zero
+    mutation. The durable path must be usable NOW, so a binding mismatch / unusable path /
+    malformed authority fails closed before the first business Sheet mutation.
+    ``for_write=False`` (read-only preview / refresh) takes no lock, verifies an existing binding
+    and validates authority, but never writes.
     """
     from hotelops_pg.config import hotel_state_path, HotelStateConfigError
 
     store = open_rooming_store()                       # hotel_sheet_config, no injection
     identity = store.backend.destination_identity()    # actual spreadsheet/tab/gid (read-only)
-    state = StateStore(hotel_state_path())             # required, safe, durable path
-    if for_write:
-        if not state.persistence_ready():              # non-destructive readiness (creates parent dir)
-            raise HotelStateConfigError(
-                "APPA_HOTEL_STATE_PATH parent directory is not usable/writable; refusing "
-                "before any confirmation or business mutation.")
-        state.bind_or_verify_target(identity)          # establish/verify authority before mutation
-    else:
+    path = hotel_state_path()                          # required, safe, durable path
+    if not for_write:
+        state = StateStore(path)
         state.verify_target(identity)                  # read-only authority check
-    return store, state, identity
+        state.validate()
+        yield store, state, identity
+        return
+    if not path_ready(path):                           # non-destructive readiness (creates parent dir)
+        raise HotelStateConfigError(
+            "APPA_HOTEL_STATE_PATH parent directory is not usable/writable; refusing "
+            "before any confirmation or business mutation.")
+    with StateStore.locked(path) as state:             # lock FIRST, then fresh durable load
+        state.bind_or_verify_target(identity)          # establish/verify authority before mutation
+        state.validate()
+        yield store, state, identity

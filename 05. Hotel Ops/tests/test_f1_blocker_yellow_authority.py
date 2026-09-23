@@ -139,10 +139,11 @@ def test_op_reset_wrong_sheet_id_rejected_before_persist_or_format(tmp_path):
 def test_gid_zero_is_a_valid_destination(tmp_path):
     zero_ident = {**IDENT, "sheet_gid": 0}
     store, _ = op_store(ROWS, identity=zero_ident)
-    state = bound_state(tmp_path, identity=zero_ident)
+    bound_state(tmp_path, identity=zero_ident)
     fake = FakeSheets()
-    res = yellow_reset(store, state, service=fake, sheet_id=0)          # 0 is a real gid
-    assert res.status == "ok" and state.has_baseline
+    with StateStore.locked(tmp_path / "state.json") as state:          # operational write session
+        res = yellow_reset(store, state, service=fake, sheet_id=0)      # 0 is a real gid
+        assert res.status == "ok" and state.has_baseline
     assert fake.batch_bodies                                            # render actually ran
 
 

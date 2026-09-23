@@ -65,7 +65,8 @@ def test_facade_preview_confirm_execute_resolves_own_authorities(monkeypatch, tm
 def test_unbound_preview_state_cannot_mutate_via_commit(monkeypatch, tmp_path):
     store, backend, p = _live_env(
         monkeypatch, tmp_path, [record(name="James", record_id="rl-a", stay_id="STAY-1")])
-    _s, state, _id = sheet_store.open_rooming_store_and_state(for_write=False)   # read-only → unbound
+    with sheet_store.open_rooming_store_and_state(for_write=False) as (_s, state, _id):  # read-only → unbound
+        pass
     assert state.target_binding is None
     prev = preview_quick_ops(store, "James remark VIP", state=state)
     before = backend.read_grid()

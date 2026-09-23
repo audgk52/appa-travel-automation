@@ -124,10 +124,12 @@ def reset(read, state, persist=None, render=None) -> ResetResult:
 
     if persist is None:
         # 2. freeze attempt identity + promotion predecessor before any durable write.
+        # Malformed/ambiguous authority fails closed from the durable structure itself —
+        # nothing is written (no repair, no dependence on persisting 'uncertain').
         try:
+            state.validate()
             predecessor = state.active_generation()
         except BaselineStateError as exc:
-            state.mark_uncertain()
             return ResetResult("uncertain", "indeterminate",
                                detail=f"durable baseline malformed: {exc}; authority uncertain (R3-C)")
         outcome = state.establish_baseline(candidate, attempt_id=uuid.uuid4().hex,

@@ -131,7 +131,8 @@ def test_boundary_missing_state_config_fails_closed(monkeypatch):
     _patch_store(monkeypatch)
     monkeypatch.delenv(STATE, raising=False)
     with pytest.raises(HotelStateConfigError):
-        sheet_store.open_rooming_store_and_state(for_write=False)
+        with sheet_store.open_rooming_store_and_state(for_write=False):
+            pass
 
 
 def test_boundary_read_only_verifies_without_writing(monkeypatch, tmp_path):
@@ -140,8 +141,8 @@ def test_boundary_read_only_verifies_without_writing(monkeypatch, tmp_path):
     # Mock the ALREADY-VALIDATED resolver (do not assume tmp_path is valid production config;
     # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
     monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
-    store, state, ident = sheet_store.open_rooming_store_and_state(for_write=False)
-    assert ident == IDENT and state.durable and state.target_binding is None
+    with sheet_store.open_rooming_store_and_state(for_write=False) as (store, state, ident):
+        assert ident == IDENT and state.durable and state.target_binding is None
     assert not p.exists()                              # read-only preview wrote nothing
 
 
@@ -151,11 +152,11 @@ def test_boundary_for_write_establishes_and_persists_binding(monkeypatch, tmp_pa
     # Mock the ALREADY-VALIDATED resolver (do not assume tmp_path is valid production config;
     # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
     monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
-    _s, state, ident = sheet_store.open_rooming_store_and_state(for_write=True)
-    assert ident == IDENT and state.target_binding == IDENT and p.exists()
+    with sheet_store.open_rooming_store_and_state(for_write=True) as (_s, state, ident):
+        assert ident == IDENT and state.target_binding == IDENT and p.exists()
     # reopen via the boundary (simulated restart) → recognizes binding, no silent rebind
-    _s2, state2, _ = sheet_store.open_rooming_store_and_state(for_write=True)
-    assert state2.target_binding == IDENT
+    with sheet_store.open_rooming_store_and_state(for_write=True) as (_s2, state2, _):
+        assert state2.target_binding == IDENT
 
 
 def test_boundary_for_write_rejects_target_mismatch(monkeypatch, tmp_path):
@@ -164,10 +165,12 @@ def test_boundary_for_write_rejects_target_mismatch(monkeypatch, tmp_path):
     # keeps the suite portable when TMPDIR=/private/tmp) while exercising the real boundary.
     monkeypatch.setattr(config_mod, "hotel_state_path", lambda: str(p))
     _patch_store(monkeypatch, IDENT)
-    sheet_store.open_rooming_store_and_state(for_write=True)          # binds to IDENT
+    with sheet_store.open_rooming_store_and_state(for_write=True):   # binds to IDENT
+        pass
     _patch_store(monkeypatch, OTHER)                                 # backend now a different target
     with pytest.raises(StateAuthorityError):
-        sheet_store.open_rooming_store_and_state(for_write=True)
+        with sheet_store.open_rooming_store_and_state(for_write=True):
+            pass
 
 
 # --- persistence ordering + restart ----------------------------------------------

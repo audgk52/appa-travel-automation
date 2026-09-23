@@ -9,16 +9,18 @@ durable state elsewhere (§0). This store holds:
 Ownership/persistence semantics are architecture; the storage mechanism (here a
 JSON file, or pure in-memory when ``path`` is None) is implementation-owned (§9/§15).
 """
+import fcntl
 import json
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 AUTHORITY_ACTIVE = "active"
 AUTHORITY_UNCERTAIN = "uncertain"       # R3-C: which baseline is authoritative is unknown
 
 # Yellow baseline durable lifecycle (R3 §9, verified-before-activation). The durable
-# baseline is a normalized container ``{"active": …, "pending": …}`` where:
+# baseline is a versioned container ``{"schema": 1, "active": …, "pending": …}`` where:
 #   active  = the currently authoritative baseline that already passed verify-before-activate:
 #             {"generation": int, "attempt_id": str, "target_binding": dict|None, "values": {...}}
 #   pending = at most ONE frozen reset attempt awaiting verification/promotion:
@@ -28,6 +30,10 @@ AUTHORITY_UNCERTAIN = "uncertain"       # R3-C: which baseline is authoritative 
 # and is never used as a comparison baseline nor auto-promoted on load — it does NOT depend on
 # having successfully written the ``uncertain`` marker.
 LEGACY_ATTEMPT = "legacy-migrated"      # attempt_id stamped on a pre-lifecycle (flat-schema) active
+BASELINE_SCHEMA = 1                     # container version: {"schema": 1, "active": …, "pending": …}
+_AUTHORITIES = (AUTHORITY_ACTIVE, AUTHORITY_UNCERTAIN)
+_ACTIVE_KEYS = {"generation", "attempt_id", "target_binding", "values"}
+_PENDING_KEYS = {"attempt_id", "expected_predecessor", "target_binding", "values"}
 
 
 class BaselineStateError(ValueError):
@@ -43,16 +49,96 @@ ACT_PREVIOUS = "previous"               # not activated; a prior established act
 ACT_UNCERTAIN = "uncertain"             # authority cannot be established → block yellow ops
 
 
-def _validate_slot(slot, kind):
-    """Fail closed (:class:`BaselineStateError`) on a malformed active/pending baseline slot.
-    ``None`` (empty slot) is valid; an active slot additionally requires an integer generation."""
+class StateBusyError(RuntimeError):
+    """Another process/session holds the exclusive StateStore lock, or this StateStore is a
+    stale snapshot (its session ended / the durable file changed since it was loaded) — the
+    mutation is refused with zero writes."""
+
+
+def _bad(msg):
+    raise BaselineStateError(f"{msg}; fail closed (R3 §9).")
+
+
+def _is_gen(g):
+    """A generation / gid: a non-negative int (bool excluded)."""
+    return isinstance(g, int) and not isinstance(g, bool) and g >= 0
+
+
+def _valid_binding(b):
+    return (isinstance(b, dict) and set(b) == {"spreadsheet_id", "tab", "sheet_gid"}
+            and isinstance(b["spreadsheet_id"], str) and bool(b["spreadsheet_id"])
+            and isinstance(b["tab"], str) and bool(b["tab"]) and _is_gen(b["sheet_gid"]))
+
+
+def _valid_values(v):
+    return isinstance(v, dict) and all(
+        isinstance(rid, str) and rid and isinstance(rec, dict)
+        and all(isinstance(f, str) and isinstance(x, str) for f, x in rec.items())
+        for rid, rec in v.items())
+
+
+def _validate_slot(slot, kind, binding):
+    """Fail closed (:class:`BaselineStateError`) on an incomplete/mistyped active/pending slot.
+    ``None`` (empty slot) is valid. The slot's ``target_binding`` must EQUAL the store's
+    top-level binding (``None`` only for an unbound domain/test store, which the operational
+    path rejects before any yellow op)."""
     if slot is None:
         return
-    if not (isinstance(slot, dict) and isinstance(slot.get("values"), dict)):
-        raise BaselineStateError(f"malformed {kind} baseline slot {slot!r}; fail closed (R3 §9).")
-    if kind == "active" and not isinstance(slot.get("generation"), int):
-        raise BaselineStateError(
-            f"active baseline slot has no integer generation {slot!r}; fail closed (R3 §9).")
+    if not isinstance(slot, dict) or set(slot) != (_ACTIVE_KEYS if kind == "active" else _PENDING_KEYS):
+        _bad(f"incomplete {kind} baseline slot {slot!r}")
+    if not (isinstance(slot["attempt_id"], str) and slot["attempt_id"].strip()):
+        _bad(f"{kind} baseline has no valid attempt_id")
+    if not _valid_values(slot["values"]):
+        _bad(f"{kind} baseline values malformed")
+    if slot["target_binding"] != binding:
+        _bad(f"{kind} baseline target_binding {slot['target_binding']!r} != store binding {binding!r}")
+    if kind == "active" and not _is_gen(slot["generation"]):
+        _bad(f"active baseline generation {slot['generation']!r} is not a non-negative int")
+    if kind == "pending" and not (slot["expected_predecessor"] is None
+                                  or _is_gen(slot["expected_predecessor"])):
+        _bad(f"pending expected_predecessor {slot['expected_predecessor']!r} invalid")
+
+
+def _lock_path(path):
+    """Lock identity = the CANONICAL state path's sidecar ``.lock`` (never replaced by the
+    atomic ``os.replace`` of ``state.json``, so it stays stable across flushes)."""
+    p = Path(os.path.realpath(path))
+    return p.with_name(p.name + ".lock")
+
+
+@contextmanager
+def _exclusive(path):
+    """Single-host exclusive interprocess lock (``flock``). Non-blocking: a competing holder
+    → :class:`StateBusyError`. Ownership is OS-managed — closing the fd or process exit/crash
+    releases it; the lock file's mere existence means nothing."""
+    fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise StateBusyError(f"StateStore {path} is locked by another writer; busy, "
+                                 "zero mutation.") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def _file_id(path):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_mtime_ns)
+
+
+def path_ready(path) -> bool:
+    """Create the state's parent directory (PG owns it, §0) and report whether it is writable."""
+    parent = Path(path).parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    return os.access(parent, os.W_OK)
 
 
 class GroupingScopeError(ValueError):
@@ -80,7 +166,7 @@ class StateStore:
     def __init__(self, path=None):
         self.path = Path(path) if path else None
         self._data = {
-            "baseline": None,               # {"active": {...}|None, "pending": {...}|None} (R3 §9 lifecycle)
+            "baseline": None,               # {"schema": 1, "active": {...}|None, "pending": {...}|None} (R3 §9)
             "baseline_authority": AUTHORITY_ACTIVE,
             "executed_ops": {},             # operation_ref -> {"records": {...}, "complete": bool}
             "uncertain_records": {},        # record_id -> {"op": ref, "reason": ...} (record-global, B7-C)
@@ -88,7 +174,11 @@ class StateStore:
             "operations": {},               # operation_ref -> confirmed-artifact payload (B7-A)
             "target_binding": None,         # {"spreadsheet_id","tab","sheet_gid"} authority (§0)
         }
+        self._lock_held = False             # True only inside StateStore.locked()
+        self._closed = False                # a finished locked session can never flush again
+        self._loaded_id = None
         if self.path and self.path.exists():
+            self._loaded_id = _file_id(self.path)
             self._data.update(json.loads(self.path.read_text(encoding="utf-8")))
         self._data.setdefault("uncertain_records", {})
         self._data.setdefault("grouping_uncertain", {})
@@ -200,14 +290,26 @@ class StateStore:
         failures. Those remaining failures are handled by the fail-closed pre-write
         persistence contract and the post-mutation uncertain-result contract.
         """
-        if not self.path:
-            return False
-        parent = self.path.parent
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return False
-        return os.access(parent, os.W_OK)
+        return bool(self.path) and path_ready(self.path)
+
+    # --- single-writer exclusion (single host) -------------------------------
+    @classmethod
+    @contextmanager
+    def locked(cls, path):
+        """Acquire the exclusive StateStore lock FIRST, then load fresh durable state, and hold
+        the lock for the whole ``with`` body (the mutating operational action)."""
+        with _exclusive(path):
+            st = cls(path)
+            st._lock_held = True
+            try:
+                yield st
+            finally:
+                st._lock_held = False
+                st._closed = True
+
+    @property
+    def lock_held(self) -> bool:
+        return self._lock_held
 
     # --- persistence ---------------------------------------------------------
     def _flush(self):
@@ -219,13 +321,27 @@ class StateStore:
         """
         if not self.path:
             return
+        if self._closed:
+            raise StateBusyError("StateStore session already ended; reopen before mutating.")
+        if self._lock_held:
+            self._write()
+        else:
+            with _exclusive(self.path):       # unlocked writers still take the SAME lock
+                self._write()
+
+    def _write(self):
+        if _file_id(self.path) != self._loaded_id:
+            raise StateBusyError("StateStore snapshot is stale (durable state changed since "
+                                 "load); refusing to overwrite — reopen.")
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self.path)
+        self._loaded_id = _file_id(self.path)
 
     def reload(self):
         """Re-read from disk (used to prove idempotency survives a restart)."""
         if self.path and self.path.exists():
+            self._loaded_id = _file_id(self.path)
             self._data = json.loads(self.path.read_text(encoding="utf-8"))
         return self
 
@@ -239,28 +355,48 @@ class StateStore:
         believed active is carried forward — no NEW trust is manufactured (it never asserts the
         snapshot passed the new verified-before-activation lifecycle) and disk is NOT rewritten
         until a real lifecycle write flushes. An empty store (``None``) → both slots ``None``."""
+        authority = self._data.get("baseline_authority")
+        if authority not in _AUTHORITIES:
+            _bad(f"baseline_authority {authority!r} not in {_AUTHORITIES}")
+        binding = self._data.get("target_binding")
+        if binding is not None and not _valid_binding(binding):
+            _bad(f"target_binding {binding!r} malformed")
         b = self._data.get("baseline")
         if b is None:
             return {"active": None, "pending": None}
-        if isinstance(b, dict):
-            if "active" in b or "pending" in b:                  # new-schema container
-                active, pending = b.get("active"), b.get("pending")
-                _validate_slot(active, "active")
-                _validate_slot(pending, "pending")
-                return {"active": active, "pending": pending}
-            if isinstance(b.get("values"), dict):                # legacy flat active → migrate view
-                return {"active": {"generation": 0, "attempt_id": LEGACY_ATTEMPT,
-                                   "target_binding": self._data.get("target_binding"),
-                                   "values": b["values"]},
-                        "pending": None}
-        raise BaselineStateError(f"malformed durable baseline {b!r}; fail closed (R3 §9).")
+        if isinstance(b, dict) and set(b) == {"schema", "active", "pending"}:
+            if b["schema"] != BASELINE_SCHEMA or isinstance(b["schema"], bool):
+                _bad(f"unsupported baseline schema {b['schema']!r}")
+            active, pending = b["active"], b["pending"]
+            _validate_slot(active, "active", binding)
+            _validate_slot(pending, "pending", binding)
+            if pending is not None:              # cross-field lifecycle consistency
+                if pending["expected_predecessor"] != (active["generation"] if active else None):
+                    _bad("pending expected_predecessor does not match the active generation")
+                if active and pending["attempt_id"] == active["attempt_id"]:
+                    _bad("pending and active share an attempt_id")
+            return {"active": active, "pending": pending}
+        # Explicit legacy compatibility path: EXACTLY the pre-lifecycle flat shape, under a
+        # valid top-level target binding. Anything else legacy-looking is not trusted.
+        if isinstance(b, dict) and set(b) == {"values"} and _valid_values(b["values"]):
+            if binding is None:
+                _bad("legacy baseline has no target_binding; unverified authority not trusted")
+            return {"active": {"generation": 0, "attempt_id": LEGACY_ATTEMPT,
+                               "target_binding": binding, "values": b["values"]},
+                    "pending": None}
+        _bad(f"malformed/unsupported durable baseline {b!r}")
+
+    def validate(self):
+        """Validate the durable baseline authority (enum, schema, slots, binding, lifecycle
+        cross-fields) — raises :class:`BaselineStateError`; never repairs."""
+        self._baseline()
 
     def _write_baseline(self, active, pending, authority):
         """Durably replace the WHOLE baseline container + authority in ONE atomic ``_flush``
         (crash-safe temp-write + replace). Rolls back in memory on a flush failure so an
         in-memory mutation never outlives a failed durable write (B8)."""
         prev = (self._data.get("baseline"), self._data.get("baseline_authority"))
-        self._data["baseline"] = {"active": active, "pending": pending}
+        self._data["baseline"] = {"schema": BASELINE_SCHEMA, "active": active, "pending": pending}
         self._data["baseline_authority"] = authority
         try:
             self._flush()
@@ -276,7 +412,10 @@ class StateStore:
 
     @property
     def authority(self) -> str:
-        return self._data["baseline_authority"]
+        a = self._data.get("baseline_authority")
+        if a not in _AUTHORITIES:
+            _bad(f"baseline_authority {a!r} not in {_AUTHORITIES}")
+        return a
 
     def get_baseline(self) -> dict:
         """The ACTIVE comparison baseline values — never the unverified ``pending``."""

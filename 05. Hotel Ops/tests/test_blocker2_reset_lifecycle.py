@@ -12,6 +12,8 @@ from hotelops_pg.baseline import NoBaselineError, refresh, reset
 from hotelops_pg.state_store import (ACT_ACTIVATED, ACT_PREVIOUS, AUTHORITY_UNCERTAIN,
                                      BaselineStateError, StateStore)
 
+IDENT = {"spreadsheet_id": "hotel-throwaway", "tab": "01. Rooming List", "sheet_gid": 655539279}
+
 
 def _v(value):
     return [rr("rl-a", **{fields.REMARK: value})]
@@ -120,9 +122,11 @@ def test_predecessor_mismatch_not_activated(with_a, path, monkeypatch):
 
 # ── restart states ───────────────────────────────────────────────────────────────────
 
-def _write_disk(path, baseline, authority="active"):
-    path.write_text(json.dumps({"baseline": baseline, "baseline_authority": authority}),
-                    encoding="utf-8")
+def _write_disk(path, baseline, authority="active", binding=None):
+    if isinstance(baseline, dict) and {"active", "pending"} <= set(baseline):
+        baseline = {"schema": 1, **baseline}
+    path.write_text(json.dumps({"baseline": baseline, "baseline_authority": authority,
+                                "target_binding": binding}), encoding="utf-8")
 
 
 def _snap(remark):
@@ -139,7 +143,7 @@ def _slot(remark, gen=None, attempt="x", pred=None):
 
 
 def test_restart_active_plus_pending_uses_a_then_reset_promotes(path):
-    _write_disk(path, {"active": _slot("A", gen=0), "pending": _slot("Z", pred=0)})
+    _write_disk(path, {"active": _slot("A", gen=0), "pending": _slot("Z", attempt="z", pred=0)})
     state = StateStore(path)
     assert _remark(state) == "A"                                # pending Z never compared
     assert refresh(lambda: _v("A"), state).yellow == []
@@ -223,25 +227,24 @@ def test_uncertain_marker_persist_failure_not_fail_open(path, monkeypatch):
 ])
 def test_malformed_baseline_reset_fails_closed(path, baseline):
     _write_disk(path, baseline)
-    state = StateStore(path)
-    res = reset(lambda: _v("B"), state)
+    before = path.read_bytes()
+    res = reset(lambda: _v("B"), StateStore(path))
     assert (res.status, res.authoritative) == ("uncertain", "indeterminate")
-    assert state.authority == AUTHORITY_UNCERTAIN
-    assert StateStore(path).authority == AUTHORITY_UNCERTAIN
+    assert path.read_bytes() == before                         # nothing written, never repaired
     with pytest.raises(BaselineStateError):
-        StateStore(path).get_baseline()                        # never silently repaired
+        StateStore(path).get_baseline()                        # fails closed from structure alone
 
 
 # ── legacy flat schema end-to-end through reset ──────────────────────────────────────
 
 def test_legacy_flat_schema_through_reset(path):
-    _write_disk(path, {"values": _snap("A")})
+    _write_disk(path, {"values": _snap("A")}, binding=IDENT)
     state = StateStore(path)
     assert refresh(lambda: _v("A"), state).yellow == []         # legacy active carried forward
     assert reset(lambda: _v("B"), state).status == "ok"
     fresh = StateStore(path)
     raw = json.loads(path.read_text(encoding="utf-8"))["baseline"]
-    assert set(raw) == {"active", "pending"} and raw["pending"] is None
+    assert set(raw) == {"schema", "active", "pending"} and raw["pending"] is None
     assert _remark(fresh) == "B" and fresh.active_generation() == 1
 
 

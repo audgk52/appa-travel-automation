@@ -41,8 +41,8 @@ def preview(instruction: str, *, request_date: str, hotel_confirmed: bool = Fals
     injected store/state/path/identity. Returns ``(Preview, preview_artifact | None)`` —
     the artifact (with its ``preview_artifact_digest``) is produced only for a confirmable
     proposal; unresolved interrupts carry no artifact."""
-    store, state, identity = open_rooming_store_and_state(for_write=False)
-    prev = spine.preview_quick_ops(store, instruction, state=state)
+    with open_rooming_store_and_state(for_write=False) as (store, state, identity):
+        prev = spine.preview_quick_ops(store, instruction, state=state)
     art = None
     if prev.status in _CONFIRMABLE and prev.change is not None:
         art = preview_artifact(prev.change, identity,
@@ -52,8 +52,8 @@ def preview(instruction: str, *, request_date: str, hotel_confirmed: bool = Fals
 
 def preview_path_a(itinerary_fact, *, request_date: str, hotel_confirmed: bool = False):
     """Supported LIVE-1 Path A preview (READ-ONLY). Same authority resolution as :func:`preview`."""
-    store, state, identity = open_rooming_store_and_state(for_write=False)
-    prev = spine.preview_path_a(store, itinerary_fact, state=state)
+    with open_rooming_store_and_state(for_write=False) as (store, state, identity):
+        prev = spine.preview_path_a(store, itinerary_fact, state=state)
     art = None
     if prev.status in _CONFIRMABLE and prev.change is not None:
         art = preview_artifact(prev.change, identity,
@@ -80,26 +80,26 @@ def execute_confirmed(confirmed_art):
     artifact (digest + confirmed-proposal identity) and requires the artifact destination to
     equal BOTH the actual backend destination and the StateStore target binding before
     mutating. request_date / hotel_confirmed come from the artifact, not a caller."""
-    store, state, identity = open_rooming_store_and_state(for_write=True)
-    change = verify_confirmed_artifact(confirmed_art)          # digest + identity (raises on tamper)
-    actual = _dest(identity)
-    if confirmed_art["destination"] != actual:
-        raise ArtifactError(
-            f"confirmed artifact destination {confirmed_art['destination']!r} != actual backend "
-            f"{actual!r}; an artifact for one Sheet/tab/gid must not execute against another.")
-    if state.target_binding != actual:      # StateStore/backend match alone can't authorize a foreign artifact
-        raise ArtifactError(
-            f"StateStore binding {state.target_binding!r} != artifact destination {actual!r}; "
-            "fail closed.")
-    return spine.execute_confirmed(store, state, change,
-                                   request_date=confirmed_art["request_date"],
-                                   hotel_confirmed=confirmed_art["hotel_confirmed"],
-                                   confirmed_envelope=confirmed_art)   # FULL artifact persisted durably
+    with open_rooming_store_and_state(for_write=True) as (store, state, identity):   # exclusive lock
+        change = verify_confirmed_artifact(confirmed_art)      # digest + identity (raises on tamper)
+        actual = _dest(identity)
+        if confirmed_art["destination"] != actual:
+            raise ArtifactError(
+                f"confirmed artifact destination {confirmed_art['destination']!r} != actual backend "
+                f"{actual!r}; an artifact for one Sheet/tab/gid must not execute against another.")
+        if state.target_binding != actual:  # StateStore/backend match alone can't authorize a foreign artifact
+            raise ArtifactError(
+                f"StateStore binding {state.target_binding!r} != artifact destination {actual!r}; "
+                "fail closed.")
+        return spine.execute_confirmed(store, state, change,
+                                       request_date=confirmed_art["request_date"],
+                                       hotel_confirmed=confirmed_art["hotel_confirmed"],
+                                       confirmed_envelope=confirmed_art)   # FULL artifact persisted durably
 
 
 def recover(operation_ref):
     """Supported LIVE-1 restart-safe recovery. REOPENS the configured authorities and
     reconciles the persisted confirmed operation (request_date / hotel_confirmed loaded
     durably); accepts no injected store/state/path and no new semantic values."""
-    store, state, _identity = open_rooming_store_and_state(for_write=True)
-    return spine.recover(store, state, operation_ref)
+    with open_rooming_store_and_state(for_write=True) as (store, state, _identity):   # exclusive lock
+        return spine.recover(store, state, operation_ref)

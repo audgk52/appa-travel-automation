@@ -342,9 +342,11 @@ explicitly does not add.
 ### F1 — Baseline activation → refresh diff → reset (§8, §9, B9)
 - **Purpose:** yellow is an on-demand, id-keyed baseline diff — never a commit-time
   output; refresh highlights changes vs an explicitly-activated baseline; reset clears.
-- **Entrypoint:** `yellow_reset(store, state, service, sheet_id, persist=…)` to
-  activate a baseline → make a B1-style change → `yellow_refresh(store, state,
-  service, sheet_id)` → `yellow_reset` to clear.
+- **Entrypoint:** `yellow_reset(store, state, service, sheet_id)` inside
+  `with open_rooming_store_and_state(for_write=True) as (store, state, _):` (exclusive StateStore lock held for the
+  reset; no `persist` injection) to activate a baseline → make a B1-style change →
+  `yellow_refresh(store, state, service, sheet_id)` (read-only session) → `yellow_reset`
+  to clear. A competing writer gets `StateBusyError` with zero mutation.
 - **Starting state:** A1 done; **no baseline yet** (a refresh with no baseline must
   STOP and ask — no automatic first baseline, §8).
 - **Target/fields:** highlighting applies to the changed record's comparison cells
@@ -353,7 +355,8 @@ explicitly does not add.
   changed record's changed comparison cells; reset clears all highlight.
 - **This step mutates cell FORMATTING** (`batchUpdate` background) — reversible.
 - **Request History / Draft:** none from yellow.
-- **Durable state:** baseline snapshot persisted per `persist`.
+- **Durable state:** baseline staged as `pending`, durably verified, then atomically
+  promoted to `active` (schema 1 container).
 - **Failure condition:** refresh with no activated baseline → STOP/ask (no silent
   first baseline); highlight that cannot be tied to a record id → stop.
 - **Cleanup/restoration:** `yellow_reset` to clear all highlighting; discard the
