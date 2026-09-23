@@ -118,8 +118,18 @@ def reset(read, state, persist=None, render=None) -> ResetResult:
                            detail=f"persist failed before activation: {exc}")
     # Verify DURABLE activation by reloading from storage (not merely inspecting the
     # already-mutated in-memory copy) — proves the new baseline is really persisted (B8).
-    state.reload()
-    if not state.has_baseline or state.get_baseline() != candidate:
+    # A reload/verification READ that itself raises must NOT let reset escape as success with
+    # authority still 'active' — any failure to establish post-persist authority is R3-C
+    # indeterminate (same as a verification mismatch), so subsequent yellow ops stay blocked.
+    try:
+        state.reload()
+        verified = state.has_baseline and state.get_baseline() == candidate
+    except Exception as exc:  # noqa: BLE001 — post-persist verification read failed
+        state.mark_uncertain()
+        return ResetResult("uncertain", "indeterminate",
+                           detail=f"post-persist baseline verification read failed: {exc}; "
+                                  "authority uncertain (R3-C)")
+    if not verified:
         state.mark_uncertain()
         return ResetResult("uncertain", "indeterminate",
                            detail="could not verify persisted baseline; authority uncertain (R3-C)")

@@ -72,6 +72,13 @@ class RenderTargetError(RuntimeError):
 _IDENTITY_KEYS = ("spreadsheet_id", "tab", "sheet_gid")
 
 
+def _is_numeric_gid(value):
+    """A valid numeric Sheets gid is an ``int`` (``0`` IS valid) but NOT a ``bool``,
+    ``str`` (e.g. ``"0"``), or ``None`` — the single authority for "is this a real gid"
+    reused by both the mutating-boundary identity check and the render-target check."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _require_bound_authority(store, state, flow):
     """Defence at the mutating boundary (B2): an OPERATIONAL store may only mutate/reconcile
     through a durable StateStore whose target binding EXACTLY matches the store backend's
@@ -87,7 +94,7 @@ def _require_bound_authority(store, state, flow):
     """
     from hotelops_pg.state_store import StateAuthorityError
     if not getattr(store.backend, "operational", False):
-        return                              # EXPLICIT pure/test backend — injectable, unchanged
+        return None                         # EXPLICIT pure/test backend — injectable, unchanged
     try:
         identity = store.backend.destination_identity()
     except Exception as exc:                # noqa: BLE001 — operational identity MUST resolve
@@ -98,7 +105,7 @@ def _require_bound_authority(store, state, flow):
     sid, tab, gid = (identity.get("spreadsheet_id"), identity.get("tab"),
                      identity.get("sheet_gid")) if isinstance(identity, dict) else (None, None, None)
     if not (isinstance(sid, str) and sid.strip() and isinstance(tab, str) and tab.strip()
-            and isinstance(gid, int) and not isinstance(gid, bool)):   # gid=0 is VALID; None/str/bool are not
+            and _is_numeric_gid(gid)):      # gid=0 is VALID; None/str/bool are not
         raise StateAuthorityError(
             f"operational {flow}: destination identity {identity!r} is missing/malformed; "
             "fail closed (§0)."
@@ -115,6 +122,7 @@ def _require_bound_authority(store, state, flow):
             f"destination {identity!r}; it is unbound. Establish authority via the operational "
             "boundary before any business mutation (§0)."
         )
+    return identity                         # verified operational destination (for render-target matching)
 
 
 def _require_durable(state, flow):
@@ -147,10 +155,35 @@ def _require_render_target(service, sheet_id, flow):
             f"operational {flow} requires a Sheets render service; a diff-only / "
             "renderer-less call must not report success (§8/§9, B9)."
         )
-    if sheet_id is None:
+    if not _is_numeric_gid(sheet_id):
         raise RenderTargetError(
             f"operational {flow} requires an explicit numeric target sheet id (the verified "
-            "'01. Rooming List' gid); it must not assume 0 (B9)."
+            f"'01. Rooming List' gid); {sheet_id!r} is not a valid integer gid (0 is valid; "
+            "None / str such as '0' / bool are not) and it must not assume 0 (B9)."
+        )
+
+
+def _require_operational_render(store, state, service, sheet_id, flow):
+    """Full operational precondition for a yellow render (B9 + §0 authority), BEFORE any
+    read / persist / render.
+
+    Fails closed if the durable authoritative state is missing, unbound, or target-mismatched;
+    the backend destination identity is missing/malformed; the supplied ``sheet_id`` is not a
+    valid integer gid; or ``sheet_id`` does not EXACTLY equal the backend destination's actual
+    ``sheet_gid`` (so a wrong gid can never be formatted). Reuses the established mutating-
+    boundary authority (``_require_bound_authority``) rather than a parallel target notion; the
+    pure/injectable (non-operational) backend path is unchanged — durability, a present renderer
+    and a valid-gid still apply, but identity is ``None`` there so the binding and the
+    ``sheet_id``↔destination match are not enforced (that path can never reach the LIVE Sheet).
+    """
+    _require_durable(state, flow)                            # durable authoritative state (both flows, B8)
+    identity = _require_bound_authority(store, state, flow)   # bound authority; None = pure/test path
+    _require_render_target(service, sheet_id, flow)           # renderer present + valid numeric gid
+    if identity is not None and sheet_id != identity["sheet_gid"]:
+        raise RenderTargetError(
+            f"operational {flow}: supplied sheet_id {sheet_id!r} does not match the backend "
+            f"destination gid {identity['sheet_gid']!r}; refusing to format a different tab "
+            "(B9/§0)."
         )
 
 
@@ -653,7 +686,7 @@ def yellow_refresh(store, state, service, sheet_id):
     from hotelops_pg.baseline import refresh
     from hotelops_pg.yellow_sheets import apply_yellow
 
-    _require_render_target(service, sheet_id, "yellow refresh")
+    _require_operational_render(store, state, service, sheet_id, "yellow refresh")
 
     obs = {}
 
@@ -689,8 +722,7 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     from hotelops_pg.baseline import AUTHORITY_UNCERTAIN, UncertainBaselineError, _diff, reset
     from hotelops_pg.yellow_sheets import apply_yellow
 
-    _require_render_target(service, sheet_id, "yellow reset")
-    _require_durable(state, "yellow reset")
+    _require_operational_render(store, state, service, sheet_id, "yellow reset")
 
     if state.authority == AUTHORITY_UNCERTAIN:
         raise UncertainBaselineError(
