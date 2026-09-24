@@ -7,8 +7,9 @@
 - **Active agent:** ⑤ Hotel Ops · PG — live verification closing out
 - **Current gate:** remaining LIVE-1 fail-fast scenarios → Myungha UAT → v1 tag
 - **Latest verified commit:** `db71d01` (F1 R3 closure) — Codex closure audit PASS, 0 BLOCKER
-- **Regression:** Hotel Ops 586 passed
-- **Branch / pushed:** `hotel-ops-round4-b1-readiness` · pushed to origin (includes `db71d01`)
+- **Regression:** Hotel Ops 586 passed (re-run at EOD 9/24) · Dispatch not touched today
+- **Branch / pushed:** `hotel-ops-round4-b1-readiness` · pushed to origin (HEAD = EOD docs commit on top of `0d9d59c`)
+- **9/24 result:** F1 BLOCKER 2 closed + minimal live gate passed; repo rules/docs aligned. No slip.
 
 ## Hotel Ops LIVE-1 (runbook order)
 
@@ -31,6 +32,7 @@
 
 | Date | Plan | Done when |
 |---|---|---|
+| 9/24 Wed | F1 BLOCKER 2 closure · minimal live gate · docs alignment | ✅ done (`db71d01`, Codex PASS) |
 | 9/25 Thu | Hotel Ops closure: C1/D1/D2 live · entry point · Path B E2E · UAT | **Hotel Ops v1 tagged. Hard stop.** |
 | 9/26 Fri | Doc Agent (PA Travel Memo): Astra checkpoint (1 pass) · real sample + field mapping · itinerary extraction | PRD approved, extraction runs on 1 sample |
 | 9/27 Sat | First Travel Memo generated · memo validation + confirmed-data reuse contract | TMO from real-shape sample, validated |
