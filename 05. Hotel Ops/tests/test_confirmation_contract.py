@@ -12,8 +12,11 @@ from hotelops_pg.state_store import StateStore, StateAuthorityError
 from hotelops_pg.sheet_store import InMemoryBackend, RoomingSheetStore, GoogleBackend
 from hotelops_pg.spine import preview_quick_ops, confirm_preview, execute_confirmed, recover
 from hotelops_pg.execution import execute
+import json
+
 from hotelops_pg.change import (
     propose, preview_artifact, confirmed_artifact, verify_confirmed_artifact, ArtifactError,
+    require_decision, _dest, to_payload, ARTIFACT_SCHEMA,
 )
 
 IDENT = {"spreadsheet_id": "hotel-throwaway", "tab": "01. Rooming List", "sheet_gid": 655539279}
@@ -292,3 +295,230 @@ def test_recover_preserves_operation_ref_no_regeneration(make_store, tmp_path):
     fresh = StateStore(tmp_path / "st.json")
     r2 = recover(store, fresh, op)
     assert r2.operation_ref == op and fresh.is_executed(op)        # same ref, recognized, not regenerated
+
+
+# ============================ ROUND 4 ============================
+
+def _art_with_decision():
+    ch = _change()
+    require_decision(ch, "payer", options=["Production", "Personal"], required=True, context="payer")
+    return preview_artifact(ch, IDENT, request_date="0922", hotel_confirmed=False)
+
+
+def _live_confirmed(monkeypatch, tmp_path, identity=IDENT):
+    store, backend, p = _live_env(monkeypatch, tmp_path,
+                                  [record(name="James", record_id="rl-a", stay_id="S1")], identity)
+    prev, art = live_ops.preview("James remark VIP", request_date="0922")
+    conf = live_ops.confirm(art, art["preview_artifact_digest"])
+    return store, backend, p, conf
+
+
+# --- B1: deterministic confirmation identity -------------------------------------
+
+def test_same_preview_same_decisions_same_operation_ref():
+    art = _art()
+    c1 = confirmed_artifact(art, art["preview_artifact_digest"])
+    c2 = confirmed_artifact(art, art["preview_artifact_digest"])
+    assert c1["operation_ref"] == c2["operation_ref"]
+    assert c1["confirmed_artifact_digest"] == c2["confirmed_artifact_digest"]
+    assert c1 == c2                                            # byte/value-equivalent
+
+
+def test_different_valid_decisions_different_operation_ref():
+    art = _art_with_decision()
+    c1 = confirmed_artifact(art, art["preview_artifact_digest"], decisions={"payer": "Production"})
+    c2 = confirmed_artifact(art, art["preview_artifact_digest"], decisions={"payer": "Personal"})
+    assert c1["operation_ref"] != c2["operation_ref"]
+
+
+def test_distinct_preview_instances_distinct_identity():
+    a1, a2 = _art(), _art()                                   # identical business, separate cycles
+    assert a1["preview_instance_id"] != a2["preview_instance_id"]
+    c1 = confirmed_artifact(a1, a1["preview_artifact_digest"])
+    c2 = confirmed_artifact(a2, a2["preview_artifact_digest"])
+    assert c1["operation_ref"] != c2["operation_ref"]
+
+
+def test_reconstruction_preserves_identity_without_preview_object():
+    art = _art()
+    art2 = json.loads(json.dumps(art))                        # value round-trip, no original object
+    c = confirmed_artifact(art2, art2["preview_artifact_digest"])
+    assert c["preview_instance_id"] == art["preview_instance_id"]
+    # confirming the reconstructed instance yields the same ref as confirming the original
+    assert c["operation_ref"] == confirmed_artifact(art, art["preview_artifact_digest"])["operation_ref"]
+
+
+# --- B2: presented option / value validation -------------------------------------
+
+def test_reject_non_presented_value_banana():
+    art = _art_with_decision()
+    with pytest.raises(ArtifactError):
+        confirmed_artifact(art, art["preview_artifact_digest"], decisions={"payer": "banana"})
+
+
+def test_accept_presented_value():
+    art = _art_with_decision()
+    c = confirmed_artifact(art, art["preview_artifact_digest"], decisions={"payer": "Production"})
+    assert c["selected_decisions"]["decisions"]["payer"] == "Production"
+
+
+def test_reject_missing_required_decision():
+    art = _art_with_decision()
+    with pytest.raises(ArtifactError):
+        confirmed_artifact(art, art["preview_artifact_digest"])   # payer required, omitted
+
+
+def test_reject_extraneous_decision():
+    art = _art()
+    with pytest.raises(ArtifactError):
+        confirmed_artifact(art, art["preview_artifact_digest"], decisions={"payer": "Production"})
+
+
+def test_reject_limited_check_without_presented_gate():
+    art = _art()
+    with pytest.raises(ArtifactError):
+        confirmed_artifact(art, art["preview_artifact_digest"], limited_check_authorized=True)
+
+
+def test_reject_conflicting_reserved_key():
+    art = _art()
+    with pytest.raises(ArtifactError):
+        confirmed_artifact(art, art["preview_artifact_digest"], decisions={"grouping_disposition": "B"})
+
+
+# --- B3: confirmed artifact binds preview identity -------------------------------
+
+def test_confirmed_artifact_binds_preview_identity():
+    art = _art()
+    c = confirmed_artifact(art, art["preview_artifact_digest"])
+    assert c["schema"] == ARTIFACT_SCHEMA
+    assert c["preview_instance_id"] == art["preview_instance_id"]
+    assert c["preview_artifact_digest"] == art["preview_artifact_digest"]
+    verify_confirmed_artifact(c)                              # round-trips
+
+
+def test_mutating_preview_identity_invalidates_confirmed():
+    art = _art()
+    c = confirmed_artifact(art, art["preview_artifact_digest"])
+    c["preview_instance_id"] = "tampered"
+    with pytest.raises(ArtifactError):
+        verify_confirmed_artifact(c)
+
+
+def test_confirmed_missing_required_field_rejected():
+    art = _art()
+    c = confirmed_artifact(art, art["preview_artifact_digest"])
+    del c["preview_artifact_digest"]
+    with pytest.raises(ArtifactError):
+        verify_confirmed_artifact(c)
+
+
+# --- B4: durable full ConfirmedArtifact + recovery verification ------------------
+
+def test_full_confirmed_artifact_persisted_and_recovered(monkeypatch, tmp_path):
+    store, backend, p, conf = _live_confirmed(monkeypatch, tmp_path)
+    assert live_ops.execute_confirmed(conf).overall == "complete"
+    payload = StateStore(p).load_operation(conf["operation_ref"])
+    assert payload.get("kind") == "confirmed" and payload.get("confirmed_artifact_digest")
+    assert payload["preview_instance_id"] and payload["selected_decisions"] is not None
+    writes = len(backend.writes)
+    r2 = live_ops.recover(conf["operation_ref"])              # fresh reopen + full verify
+    assert r2.overall == "noop_already_done"
+    assert len(backend.writes) == writes                      # zero replay
+
+
+def test_recover_key_operation_ref_mismatch_rejected(monkeypatch, tmp_path):
+    store, backend, p, conf = _live_confirmed(monkeypatch, tmp_path)
+    live_ops.execute_confirmed(conf)
+    st = StateStore(p)
+    st._data["operations"]["op-wrong-key"] = st.load_operation(conf["operation_ref"])
+    st._flush()
+    writes = len(backend.writes)
+    with pytest.raises(ArtifactError):
+        live_ops.recover("op-wrong-key")                      # internal op_ref != requested key
+    assert len(backend.writes) == writes
+
+
+@pytest.mark.parametrize("field", ["request_date", "destination", "selected_decisions",
+                                    "preview_artifact_digest"])
+def test_recover_digest_tamper_rejected(monkeypatch, tmp_path, field):
+    store, backend, p, conf = _live_confirmed(monkeypatch, tmp_path)
+    live_ops.execute_confirmed(conf)
+    st = StateStore(p)
+    payload = st.load_operation(conf["operation_ref"])
+    payload[field] = "TAMPERED" if field != "selected_decisions" else {"x": 1}
+    st._data["operations"][conf["operation_ref"]] = payload
+    st._flush()
+    writes = len(backend.writes)
+    with pytest.raises(ArtifactError):
+        live_ops.recover(conf["operation_ref"])
+    assert len(backend.writes) == writes
+
+
+# --- B5/6: legacy incompatibility (no invented defaults) -------------------------
+
+def test_legacy_missing_semantics_incompatible_no_side_effects(make_store, tmp_path):
+    store, backend = make_store([record(name="James", record_id="rl-a", stay_id="S1")])
+    state = StateStore(tmp_path / "st.json")
+    confirmed = _confirmed_remark(store)
+    op = confirmed.operation_ref
+    state.stage_operation(op, to_payload(confirmed))          # NO request_date/hotel_confirmed
+    state._data["executed_ops"][op] = {"records": {"rl-a": {"status": "done"}}, "complete": True}
+    state._flush()
+    before = backend.read_grid()
+    res = recover(store, state, op, request_date="9999", hotel_confirmed=True)  # caller values ignored
+    assert res.overall == "incompatible_artifact"
+    assert backend.read_grid() == before                      # zero Sheet/history side effect
+    assert StateStore(tmp_path / "st.json").load_operation(op)["operation_ref"] == op  # preserved
+
+
+# --- draft-recovery top-level status ---------------------------------------------
+
+def test_repeated_draft_failure_recovery_is_uncertain_not_noop(make_store, tmp_path, monkeypatch):
+    store, backend = make_store([record(name="James", record_id="rl-a", stay_id="S1")])
+    state = StateStore(tmp_path / "st.json")
+    confirmed = _confirmed_remark(store)
+    monkeypatch.setattr(ex, "kakao_draft",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    execute(confirmed, store, state, request_date="0922")     # business/history complete; draft fails
+    op = confirmed.operation_ref
+    fresh = StateStore(tmp_path / "st.json")
+    r = recover(store, fresh, op)                             # draft STILL failing
+    assert r.overall == "uncertain" and r.overall != "noop_already_done"
+    assert any(e.name == "drafts" and e.status == "uncertain" for e in r.effects)
+
+
+# --- B7: history ambiguity strictly uncertain ------------------------------------
+
+def test_history_readback_ambiguity_is_uncertain_not_failed(make_store, durable_state, monkeypatch):
+    store, backend = make_store([record(name="James", record_id="rl-a", stay_id="S1")])
+    confirmed = _confirmed_remark(store)
+    real = store.snapshot_records
+    box = {"n": 0}
+
+    def flaky():                                              # fail the history read-back (2nd call)
+        box["n"] += 1
+        if box["n"] == 2:
+            raise RuntimeError("history read-back blip")
+        return real()
+    monkeypatch.setattr(store, "snapshot_records", flaky)
+    res = execute(confirmed, store, durable_state)
+    assert res.record_status("rl-a")["request_history_append"] == "uncertain"   # NOT "failed"
+
+
+# --- B9: gid zero ----------------------------------------------------------------
+
+def test_gid_zero_is_valid_operational_identity(monkeypatch, tmp_path):
+    ident0 = {"spreadsheet_id": "s", "tab": "01. Rooming List", "sheet_gid": 0}
+    store, backend, p = _live_env(monkeypatch, tmp_path,
+                                  [record(name="James", record_id="rl-a", stay_id="S1")], ident0)
+    prev, art = live_ops.preview("James remark VIP", request_date="0922")
+    assert art["destination"]["sheet_gid"] == 0
+    conf = live_ops.confirm(art, art["preview_artifact_digest"])
+    assert live_ops.execute_confirmed(conf).overall == "complete"
+
+
+@pytest.mark.parametrize("bad", [None, "0", True])
+def test_missing_or_malformed_gid_rejected(bad):
+    with pytest.raises(ArtifactError):
+        _dest({"spreadsheet_id": "s", "tab": "t", "sheet_gid": bad})

@@ -46,15 +46,21 @@ class GroupingReconciliationRequired(Exception):
     reconciliation clears the uncertainty."""
 
 
-def require_decision(change, key, kind="policy_decision", detail=""):
+def require_decision(change, key, kind="policy_decision", detail="", *, options=None,
+                     required=True, context=""):
     """Attach an authorization-bearing human decision to ``change`` (§16/§19).
 
     Distinct from a display-only warning: this carries ``needs_confirmation=True`` and
     a ``key`` that :func:`confirm` must see resolved before producing an executable
-    proposal, and whose resolved value binds ``operation_ref`` (B6).
+    proposal, and whose resolved value binds ``operation_ref`` (B6). ``options`` (canonical
+    allowed values), ``required`` and ``context`` are the STRUCTURED presented schema the
+    PreviewArtifact carries so the artifact-confirmation path can validate a supplied value
+    against the presented options — never against an invented global enum. ``detail`` is
+    presentational prose only and is deliberately NOT part of the authoritative digest.
     """
     change.policy_flags.append(
-        {"kind": kind, "key": key, "needs_confirmation": True, "detail": detail}
+        {"kind": kind, "key": key, "needs_confirmation": True, "detail": detail,
+         "options": list(options or []), "required": bool(required), "context": context or kind}
     )
     return change
 
@@ -464,10 +470,13 @@ def confirm(change: RoomingChange, grouping_disposition="", impact_dispositions=
         ],
     }
     change.target_record_ids = record_ids
-    # Each human confirmation is a distinct authorization instance (B7-A): mint a fresh
-    # confirmation id so re-confirming identical content later is NOT mistaken for a
-    # retry of a historically-completed operation.
-    change.confirmation_id = uuid.uuid4().hex
+    # Confirmation-instance identity. The low-level path (no preset) mints a fresh random id
+    # so each distinct human approval is its own authorization (B7-A). The supported ARTIFACT
+    # path presets a DETERMINISTIC confirmation_id (from the frozen preview-instance id +
+    # canonical decisions) BEFORE calling confirm(), so re-confirming the SAME approved
+    # preview instance + decisions yields the SAME operation_ref (round-4 identity contract).
+    if not change.confirmation_id:
+        change.confirmation_id = uuid.uuid4().hex
     change.operation_ref = compute_operation_ref(change)
     return change
 
@@ -477,12 +486,31 @@ class Cancelled(Exception):
 
 
 class ArtifactError(ValueError):
-    """A Preview/Confirmed artifact failed value-reconstruction, digest, destination, or
-    presented-option validation (confirmation contract). Fail closed — never execute."""
+    """A Preview/Confirmed artifact failed value-reconstruction, digest, destination,
+    identity, or presented-option validation (confirmation contract). Fail closed."""
+
+
+ARTIFACT_SCHEMA = "hotelops.b1.v1"
+
+
+def _valid_dest(d) -> bool:
+    """A destination triple is valid iff spreadsheet_id/tab are non-empty strings and
+    sheet_gid is an int (``0`` IS valid; ``None``/str/bool are not)."""
+    if not isinstance(d, dict):
+        return False
+    sid, tab, gid = d.get("spreadsheet_id"), d.get("tab"), d.get("sheet_gid")
+    return (isinstance(sid, str) and sid.strip() != ""
+            and isinstance(tab, str) and tab.strip() != ""
+            and isinstance(gid, int) and not isinstance(gid, bool))
 
 
 def _dest(identity: dict) -> dict:
-    """The authoritative destination triple, normalized (numeric sheet_gid)."""
+    """The authoritative destination triple (numeric ``sheet_gid``; 0 valid).
+
+    Validates the RAW types first (so ``sheet_gid`` given as ``None``/``"0"``/``True`` is
+    rejected, not silently coerced) before normalizing."""
+    if not _valid_dest(identity):
+        raise ArtifactError(f"invalid destination identity {identity!r}.")
     return {"spreadsheet_id": str(identity["spreadsheet_id"]),
             "tab": str(identity["tab"]),
             "sheet_gid": int(identity["sheet_gid"])}
@@ -494,13 +522,65 @@ def _sha(payload: dict) -> str:
     ).hexdigest()[:24]
 
 
-# The authoritative-semantic keys a preview/confirmed artifact digest protects (§ digest
-# scope): everything that can affect approval, Sheet/history behavior, or factual draft
-# meaning. Presentation prose / labels / draft wording are deliberately excluded — but the
-# ``change`` payload carries the factual draft semantics (traveler, dates, deltas, snapshots).
-_PREVIEW_DIGEST_KEYS = ("change", "destination", "request_date", "hotel_confirmed",
-                        "available_impacts", "available_decisions",
-                        "requires_grouping_disposition")
+def _semantic_change(change: RoomingChange) -> dict:
+    """Prose-free authoritative projection used for artifact hashing (§ digest scope).
+
+    Excludes purely presentational strings (policy ``detail``, impact ``description``,
+    labels/draft wording). ``proposal_digest`` already covers targets/deltas/impacts (field,
+    new, disposition — no prose)/grouping/decisions/matching-evidence; we add the snapshots
+    and positions (revalidation evidence) and the operation_ref (empty for a preview)."""
+    return {
+        "proposal": proposal_digest(change),
+        "snapshots": {rid: {k: change.snapshots[rid][k] for k in sorted(change.snapshots[rid])}
+                      for rid in sorted(change.snapshots)},
+        "positions": {rid: change.positions[rid] for rid in sorted(change.positions)},
+        "operation_ref": change.operation_ref,
+    }
+
+
+def _decision_options(change: RoomingChange) -> list:
+    """Structured presented decisions: ``{key, options(canonical values), required, context}``
+    — canonical values only, no prose. A decision carries no global enum; its ``options`` are
+    whatever the policy layer presented for THIS context."""
+    out = []
+    for f in change.policy_flags:
+        if not f.get("needs_confirmation"):
+            continue
+        out.append({
+            "key": f["key"],
+            "options": list(f.get("options", [])),
+            "required": bool(f.get("required", True)),
+            "context": str(f.get("context", f.get("kind", f["key"]))),
+        })
+    return sorted(out, key=lambda d: d["key"])
+
+
+def _available_impacts(change: RoomingChange) -> list:
+    return [{"index": i, "target_record_id": imp.target_record_id,
+             "field": imp.suggested.field, "new": imp.suggested.new}
+            for i, imp in enumerate(change.detected_related_impacts)]
+
+
+def _canonical_decisions(grouping_disposition, impact_dispositions, limited_check_authorized,
+                         decisions) -> dict:
+    """One canonical, deterministic representation of the selected ApprovalDecisions."""
+    return {
+        "grouping_disposition": grouping_disposition or "",
+        "limited_check_authorized": bool(limited_check_authorized),
+        "impact_dispositions": {str(k): v for k, v in sorted((impact_dispositions or {}).items())},
+        "decisions": {k: (decisions or {})[k] for k in sorted(decisions or {})},
+    }
+
+
+def _confirmation_id(preview_instance_id: str, canonical_decisions: dict) -> str:
+    """DETERMINISTIC confirmation-instance id: same preview instance + same canonical
+    decisions ⇒ same id ⇒ same operation_ref (never a random UUID on repeated confirmation)."""
+    return _sha({"pid": preview_instance_id, "decisions": canonical_decisions})
+
+
+_PREVIEW_DIGEST_KEYS = ("schema", "preview_instance_id", "semantic_change", "destination",
+                        "request_date", "hotel_confirmed", "available_impacts",
+                        "available_decisions", "requires_grouping_disposition")
 
 
 def _preview_digest(art: dict) -> str:
@@ -509,31 +589,73 @@ def _preview_digest(art: dict) -> str:
 
 def preview_artifact(change: RoomingChange, identity: dict, *, request_date: str,
                      hotel_confirmed: bool) -> dict:
-    """Serialize a value-owned PreviewArtifact + deterministic ``preview_artifact_digest``.
+    """Serialize a value-owned PreviewArtifact + ``preview_artifact_digest``.
 
-    Carries the proposed (unconfirmed) change, its ACTUAL Sheet destination triple, the
-    fixed ``request_date`` / ``hotel_confirmed`` semantic inputs, and the exact options
-    presented for decision (available related-impact dispositions + policy-decision keys +
-    whether an R1 grouping disposition is required). Reconstructable by value.
+    Carries a frozen opaque ``preview_instance_id`` (one per preview instance, digest-
+    protected, preserved through reconstruction, never reminted at confirmation), the
+    proposed change, the ACTUAL destination triple, the fixed request_date/hotel_confirmed,
+    and the STRUCTURED presented options (impact dispositions + decision key/options/required/
+    context + whether an R1 grouping disposition is required). The digest is taken over a
+    prose-free semantic projection (:func:`_semantic_change`), not raw presentation strings.
     """
     art = {
+        "schema": ARTIFACT_SCHEMA,
         "kind": "preview",
+        "preview_instance_id": uuid.uuid4().hex,              # frozen per preview instance
         "change": to_payload(change),                         # unconfirmed (operation_ref="")
+        "semantic_change": _semantic_change(change),
         "destination": _dest(identity),
         "request_date": str(request_date),
         "hotel_confirmed": bool(hotel_confirmed),
-        "available_impacts": [[i.target_record_id, i.suggested.field, i.suggested.new]
-                              for i in change.detected_related_impacts],
-        "available_decisions": sorted(f["key"] for f in change.policy_flags
-                                      if f.get("needs_confirmation")),
+        "available_impacts": _available_impacts(change),
+        "available_decisions": _decision_options(change),
         "requires_grouping_disposition": bool(change.requires_grouping_disposition),
     }
     art["preview_artifact_digest"] = _preview_digest(art)
     return art
 
 
-_CONFIRMED_DIGEST_KEYS = ("change", "destination", "request_date", "hotel_confirmed",
-                          "operation_ref", "selected_decisions")
+def _validate_decisions(preview_art, grouping_disposition, impact_dispositions,
+                        limited_check_authorized, decisions):
+    """Every ApprovalDecision must select ONLY a PRESENTED canonical option (§ decisions)."""
+    presented = {d["key"]: d for d in preview_art["available_decisions"]}
+    n_impacts = len(preview_art["available_impacts"])
+    for idx, disp in impact_dispositions.items():
+        if not (isinstance(idx, int) and 0 <= idx < n_impacts):
+            raise ArtifactError(f"impact disposition #{idx} was not presented.")
+        if disp not in ("A", "B", "C"):
+            raise ArtifactError(f"impact disposition #{idx}={disp!r} is not A/B/C.")
+    if grouping_disposition:
+        if not preview_art["requires_grouping_disposition"]:
+            raise ArtifactError("a grouping disposition was supplied but none was presented.")
+        if grouping_disposition not in ("A", "B", "C"):
+            raise ArtifactError("grouping disposition must be A/B/C.")
+    # limited_check is meaningful ONLY with a presented R1 gate resolved 'B'; else extraneous.
+    if limited_check_authorized and not (preview_art["requires_grouping_disposition"]
+                                         and grouping_disposition == "B"):
+        raise ArtifactError("limited_check_authorized is extraneous (no presented limited-check decision).")
+    # generic policy decisions: reserved-key collisions, non-presented keys, non-option values.
+    for reserved in ("grouping_disposition", "limited_check_authorized", "impact_dispositions"):
+        if reserved in decisions:
+            raise ArtifactError(f"decision key {reserved!r} conflicts with a structured field.")
+    for key, val in decisions.items():
+        if key not in presented:
+            raise ArtifactError(f"decision {key!r} was not presented (extraneous).")
+        options = presented[key]["options"]
+        if not options:
+            raise ArtifactError(f"decision {key!r} has no presented option schema; non-executable "
+                                "(arbitrary values are not accepted).")
+        if val not in options:
+            raise ArtifactError(f"decision {key!r}={val!r} is not a presented option {options!r}.")
+    missing = [d["key"] for d in preview_art["available_decisions"]
+               if d["required"] and d["key"] not in decisions]
+    if missing:
+        raise ArtifactError(f"missing required decision(s) {missing!r}.")
+
+
+_CONFIRMED_DIGEST_KEYS = ("schema", "preview_instance_id", "preview_artifact_digest",
+                          "selected_decisions", "semantic_change", "destination",
+                          "request_date", "hotel_confirmed", "operation_ref")
 
 
 def _confirmed_digest(art: dict) -> str:
@@ -543,68 +665,98 @@ def _confirmed_digest(art: dict) -> str:
 def confirmed_artifact(preview_art: dict, approved_digest: str, *, grouping_disposition="",
                        impact_dispositions=None, limited_check_authorized=False,
                        decisions=None) -> dict:
-    """Deterministic confirmation transition: verify the PreviewArtifact by value + digest,
-    validate that every ApprovalDecision selects only a PRESENTED option, apply them, and
-    produce a ConfirmedArtifact + ``confirmed_artifact_digest`` (§ confirmation contract).
+    """Deterministic confirmation transition (§ confirmation identity contract).
 
-    Does NOT rerun preview and does NOT trust a mutable Preview object — it reconstructs the
-    change from the artifact payload by value. A non-presented decision, a digest mismatch,
-    or an approved-digest mismatch fails closed (:class:`ArtifactError`).
+    Verifies the PreviewArtifact by value + digest and the PO-approved digest, validates that
+    every ApprovalDecision selects only a PRESENTED canonical option, then reconstructs the
+    change BY VALUE (never a mutable object) and applies the decisions under a DETERMINISTIC
+    confirmation id derived from the frozen preview-instance id + canonical decisions — so the
+    same approved input always yields the same ``operation_ref`` and ConfirmedArtifact.
     """
     if _preview_digest(preview_art) != preview_art.get("preview_artifact_digest"):
         raise ArtifactError("preview artifact failed value-reconstruction/digest check (tampered).")
     if approved_digest != preview_art["preview_artifact_digest"]:
         raise ArtifactError(
-            "approved digest does not match the reviewed preview artifact; a changed target / "
-            "delta / value / option requires a NEW preview.")
+            "approved digest does not match the reviewed preview; a changed target / delta / "
+            "value / option requires a NEW preview.")
     impact_dispositions = dict(impact_dispositions or {})
     decisions = dict(decisions or {})
-    n_impacts = len(preview_art["available_impacts"])
-    for idx in impact_dispositions:
-        if not (isinstance(idx, int) and 0 <= idx < n_impacts):
-            raise ArtifactError(f"impact disposition #{idx} was not presented in the preview.")
-    for key in decisions:
-        if key not in preview_art["available_decisions"]:
-            raise ArtifactError(f"decision {key!r} was not a presented option in the preview.")
-    if grouping_disposition and not preview_art["requires_grouping_disposition"]:
-        raise ArtifactError("a grouping disposition was supplied but none was presented.")
+    _validate_decisions(preview_art, grouping_disposition, impact_dispositions,
+                        limited_check_authorized, decisions)
 
     change = from_payload(preview_art["change"])              # by value, not the mutable object
+    if _semantic_change(change) != preview_art["semantic_change"]:
+        raise ArtifactError("preview change payload does not match its hashed semantic projection.")
+    canonical = _canonical_decisions(grouping_disposition, impact_dispositions,
+                                     limited_check_authorized, decisions)
+    change.confirmation_id = _confirmation_id(preview_art["preview_instance_id"], canonical)
     confirmed = confirm(change, grouping_disposition=grouping_disposition,
                         impact_dispositions=impact_dispositions,
                         limited_check_authorized=limited_check_authorized, decisions=decisions)
     art = {
+        "schema": ARTIFACT_SCHEMA,
         "kind": "confirmed",
+        "preview_instance_id": preview_art["preview_instance_id"],
+        "preview_artifact_digest": preview_art["preview_artifact_digest"],
+        "selected_decisions": canonical,
         "change": to_payload(confirmed),
+        "semantic_change": _semantic_change(confirmed),
         "destination": preview_art["destination"],
         "request_date": preview_art["request_date"],
         "hotel_confirmed": preview_art["hotel_confirmed"],
         "operation_ref": confirmed.operation_ref,
-        "selected_decisions": {
-            "grouping_disposition": confirmed.grouping_disposition,
-            "limited_check_authorized": confirmed.limited_check_authorized,
-            "impact_dispositions": {str(i): imp.disposition
-                                    for i, imp in enumerate(confirmed.detected_related_impacts)},
-            "decisions": dict(confirmed.authorized_decisions),
-        },
     }
     art["confirmed_artifact_digest"] = _confirmed_digest(art)
     return art
 
 
-def verify_confirmed_artifact(art: dict) -> RoomingChange:
-    """Reconstruct + verify a ConfirmedArtifact (digest + confirmed-proposal identity).
+_CONFIRMED_REQUIRED = ("schema", "kind", "preview_instance_id", "preview_artifact_digest",
+                       "selected_decisions", "change", "semantic_change", "destination",
+                       "request_date", "hotel_confirmed", "operation_ref",
+                       "confirmed_artifact_digest")
 
-    Returns the confirmed :class:`RoomingChange`. Fails closed (:class:`ArtifactError`) on a
-    tampered digest, an unconfirmed change, or an ``operation_ref`` that no longer matches
-    the reconstructed content (execution must never manufacture confirmation)."""
-    if art.get("kind") != "confirmed":
+
+def verify_confirmed_artifact(art: dict) -> RoomingChange:
+    """Reconstruct + verify a ConfirmedArtifact (schema, required fields, digest, embedded
+    preview identity, semantic projection, and confirmed-proposal identity). Fails closed
+    (:class:`ArtifactError`) on any mismatch — execution never manufactures confirmation."""
+    if not isinstance(art, dict) or art.get("kind") != "confirmed":
         raise ArtifactError("not a confirmed artifact.")
-    if _confirmed_digest(art) != art.get("confirmed_artifact_digest"):
-        raise ArtifactError("confirmed artifact failed value-reconstruction/digest check (tampered).")
+    if art.get("schema") != ARTIFACT_SCHEMA:
+        raise ArtifactError(f"unsupported artifact schema {art.get('schema')!r}.")
+    for req in _CONFIRMED_REQUIRED:
+        if req not in art:
+            raise ArtifactError(f"confirmed artifact missing required field {req!r}.")
+    if not art["preview_instance_id"]:
+        raise ArtifactError("confirmed artifact missing preview_instance_id.")
+    if _confirmed_digest(art) != art["confirmed_artifact_digest"]:
+        raise ArtifactError("confirmed artifact failed digest check (tampered).")
     change = from_payload(art["change"])
     if not change.operation_ref:
         raise ArtifactError("artifact is not confirmed (no operation_ref); cannot execute.")
+    if _semantic_change(change) != art["semantic_change"]:
+        raise ArtifactError("confirmed change payload does not match its hashed semantic projection.")
     if compute_operation_ref(change) != art["operation_ref"] or change.operation_ref != art["operation_ref"]:
         raise ArtifactError("confirmed artifact identity mismatch; scope/deltas were altered.")
+    return change
+
+
+def verify_durable_confirmed(art: dict, requested_op_ref: str, backend_identity: dict,
+                             state_binding) -> RoomingChange:
+    """Verify a durable ConfirmedArtifact envelope at recovery (§ durable recovery).
+
+    On top of :func:`verify_confirmed_artifact`: the envelope's internal ``operation_ref``
+    must equal the requested StateStore key, and the artifact destination must equal BOTH the
+    freshly-derived backend destination AND the StateStore target binding. Any mismatch fails
+    closed."""
+    change = verify_confirmed_artifact(art)
+    if art["operation_ref"] != requested_op_ref:
+        raise ArtifactError(
+            f"durable artifact internal operation_ref {art['operation_ref']!r} != requested "
+            f"StateStore key {requested_op_ref!r}.")
+    actual = _dest(backend_identity)
+    if art["destination"] != actual:
+        raise ArtifactError(f"durable artifact destination {art['destination']!r} != backend {actual!r}.")
+    if state_binding != actual:
+        raise ArtifactError(f"StateStore binding {state_binding!r} != backend destination {actual!r}.")
     return change

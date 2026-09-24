@@ -121,8 +121,25 @@ def _render_drafts(change, applied_rids, hotel_confirmed):
         return ({}, False, f"draft generation failed: {exc}")
 
 
-def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
-    """Execute a confirmed ``change`` against ``store``; persist idempotency in ``state``."""
+def incompatible_legacy_result(op, completed):
+    """A durable artifact lacks recoverable semantic evidence (§ legacy recovery): report
+    incompatible with ZERO writes and no invented output — state/op_ref preserved."""
+    detail = ("durable artifact lacks recoverable request_date/hotel_confirmed semantic "
+              "evidence; " + ("business effects historically COMPLETE but output recovery is "
+                              "unsupported/incompatible" if completed else "operation incompatible")
+              + " — no Sheet/history/draft side effect, StateStore + operation_ref preserved.")
+    return ExecutionResult(op, "incompatible_artifact",
+                           effects=[EffectResult("compatibility",
+                                                 "already_done" if completed else "failed", detail)],
+                           detail=detail)
+
+
+def execute(change, store, state, request_date="MMDD", hotel_confirmed=False, confirmed_envelope=None):
+    """Execute a confirmed ``change`` against ``store``; persist idempotency in ``state``.
+
+    ``confirmed_envelope`` (the supported live path) is the FULL canonical ConfirmedArtifact
+    persisted durably before the first business mutation; when absent (pure/unit callers) a
+    minimal envelope (change payload + request_date + hotel_confirmed) is staged."""
     op = change.operation_ref
     if not op:
         raise ValueError("change is not confirmed (no operation_ref); call change.confirm() first")
@@ -179,9 +196,14 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
         # even after a later human Sheet edit (drafts describe the historical operation).
         result.drafts, drafts_ok, ddetail = _render_drafts(change, change.target_record_ids,
                                                            hotel_confirmed)
-        result.effects.append(EffectResult(
-            "drafts", "verified" if drafts_ok else "uncertain",
-            "regenerated from confirmed artifact" if drafts_ok else ddetail))
+        if drafts_ok:
+            result.effects.append(EffectResult("drafts", "verified", "regenerated from confirmed artifact"))
+        else:
+            # Business/history stay already-done, but the top-level result must NOT remain a
+            # clean noop when required draft output failed — it is uncertain and retryable (B6).
+            result.overall = "uncertain"
+            result.detail = "business/history already complete; draft output failed — retryable (§18)"
+            result.effects.append(EffectResult("drafts", "uncertain", ddetail))
         return result
 
     # (B7-C) Record-global unresolved state: a NEW operation must not run over a record
@@ -238,11 +260,13 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
     # (B7-A) Stage the confirmed artifact so a restart can reconstruct THIS exact
     # operation. In-memory only here; the first begin_record flush persists it (no extra
     # flush → durable idempotency ordering unchanged).
-    # Stage the confirmed artifact WITH its fixed semantic inputs (request_date +
-    # hotel_confirmed), so a restart/recovery loads them durably rather than accepting new
-    # caller values (§17/§19).
-    state.stage_operation(op, {**to_payload(change),
-                               "request_date": request_date, "hotel_confirmed": hotel_confirmed})
+    # Persist the FULL confirmed artifact (or a minimal envelope for pure callers) BEFORE the
+    # first business mutation, so a restart/recovery loads request_date/hotel_confirmed and the
+    # full identity/decision evidence durably rather than accepting new caller values (§17/§19,
+    # round-4 §4). A minimal envelope carries the change payload at top level.
+    envelope = confirmed_envelope or {**to_payload(change),
+                                      "request_date": request_date, "hotel_confirmed": hotel_confirmed}
+    state.stage_operation(op, envelope)
 
     for rid in change.target_record_ids:
         deltas = change.field_deltas.get(rid, [])
@@ -361,9 +385,13 @@ def execute(change, store, state, request_date="MMDD", hotel_confirmed=False):
                     if wrote and landed:
                         effects.append(EffectResult("request_history_append", "verified", line))
                     else:
+                        # The append MAY have landed (write raised, or read-back failed/ambiguous):
+                        # report UNCERTAIN (not definitively failed), never blind-append again; the
+                        # durable pre-write history intent enables reconciliation (B7-B, round-4 §8).
                         request_history_ok = False
-                        effects.append(EffectResult("request_history_append", "failed",
-                                                    write_detail or "history write not verified on re-read"))
+                        effects.append(EffectResult("request_history_append", "uncertain",
+                                                    write_detail or "history write not verified on re-read; "
+                                                    "may have landed — uncertain, not retried"))
         else:
             effects.append(EffectResult("request_history_append", "skipped"))
 

@@ -1,9 +1,13 @@
 # LIVE-1 Runbook — Hotel Ops Rooming List (throwaway)
 
-*Created 2026-09-22 · Status: **FOR PO REVIEW — not yet executed**. No Sheet
-mutation has occurred. Grounded in `PRD_HotelOps_PG_RoomingList.md`, the
-implemented `hotelops_pg` spine + its tests, and the 9/20 read-only preflight
-(last-known layout, **to be re-confirmed live before execution**).*
+*Created 2026-09-22 · Updated 2026-09-23 · Status: **A1 ID adoption = LIVE
+VERIFIED** (rows r8/r9/r13 adopted); **normal business scenarios (B1/B2/C1/E1/F1)
+= PENDING PO review — not yet executed.** A1 was the only Sheet mutation to date
+— an authorized system-maintenance id-adoption write (three cells); no
+business-field, Request History, draft, or StateStore business mutation has
+occurred. Grounded in `PRD_HotelOps_PG_RoomingList.md`, the implemented
+`hotelops_pg` spine + its tests, and the 9/20 read-only preflight (last-known
+layout, **to be re-confirmed live before execution**).*
 
 > **Prime directive:** every scenario runs ONLY against the PO-approved,
 > PII-free **throwaway** spreadsheet, identified through the Hotel-isolated
@@ -27,10 +31,21 @@ Run the read-only verifier and require every line to pass **from fresh reads**
 | P5 | No duplicate `rooming_record_id` | `plan_adoption` | none |
 | P6 | All nonblank `Payment` canonical (Production/Personal) | `canonical_payment` | canonical |
 | P7 | `Request History` header resolves | `_layout`/`fields` | resolves |
-| P8 | Eligible blank-id rows are exactly the LIVE-1 adoption targets | `plan_adoption` | Charlie r8, TBD-DP r9, Golf r13 |
+| P8 (pre-A1) | Eligible blank-id rows are exactly the A1 adoption targets | `plan_adoption` | Charlie r8, TBD-DP r9, Golf r13 |
+| P8 (post-A1) | No eligible blank-id operational rows remain **and** each A1-adopted id resolves to exactly one row | `plan_adoption` | r8/r9/r13 now carry unique ids |
 
-**If P1–P8 do not all pass live, STOP.** P3/P4/P8 are the throwaway-identity +
-layout proof; a mismatch means the target or the sheet changed.
+**Phase-specific P8 (A1 is LIVE VERIFIED, so the operative check depends on phase).**
+- **A1 / bootstrap** uses **P8 (pre-A1)**: the eligible blank-id rows must be exactly
+  the adoption targets (Charlie r8 / TBD-DP r9 / Golf r13).
+- **All post-A1 scenarios (B1/B2/C1/E1/F1)** use **P8 (post-A1)**: no eligible
+  blank-id *operational* row may remain, and each id adopted in A1 must resolve to
+  exactly one row. A **duplicate, missing, or ambiguous** identity is a **STOP**. A
+  newly-appeared eligible blank-id row means **B1 must NOT proceed** — it requires a
+  separate adoption/reconciliation cycle first; never fold a new blank into a
+  business change.
+
+**If the phase's applicable P1–P8 do not all pass live, STOP.** P3/P4/P8 are the
+throwaway-identity + layout proof; a mismatch means the target or the sheet changed.
 
 ### The exact-instance gate (mandatory before ANY mutation)
 
@@ -170,6 +185,21 @@ explicitly does not add.
   helpers for tests, **not** the operational entrypoint, and must not be named as such.
   For the Echo B1 scenario: `request_date=0922`, `hotel_confirmed=False`, ApprovalDecisions
   empty.
+  - **Deterministic confirmation:** confirming the SAME approved preview instance + the SAME
+    ApprovalDecisions always yields the SAME `operation_ref` and ConfirmedArtifact (no random
+    id on retry). Different valid decisions, or a separate preview instance, yield a distinct
+    identity. Every ApprovalDecision must select only a **presented** canonical option.
+  - **Durable recovery:** the FULL ConfirmedArtifact is persisted before the first Sheet
+    mutation; `recover` loads it, requires the durable key == the artifact's internal
+    `operation_ref`, verifies the confirmed digest, and requires artifact destination ==
+    backend destination == StateStore binding — else fails closed with zero writes.
+    `request_date`/`hotel_confirmed` are loaded durably and cannot be changed on retry.
+  - **Legacy:** a durable artifact lacking recoverable `request_date`/`hotel_confirmed` is
+    reported **incompatible** (no invented defaults, no migration/rebind, zero writes); a
+    historically-complete op reports output-recovery unsupported rather than inventing output.
+  - **Draft recovery** regenerates Kakao/email purely from the confirmed artifact and never
+    replays a business/history write; if regeneration fails, the result is uncertain (not a
+    clean no-op) and retryable.
   - **Preview is READ-ONLY** (`for_write=False`): it verifies but never establishes target
     authority and writes neither the Sheet nor the StateStore.
   - **Confirmation/execution independently REOPEN the configured authority** (`for_write=True`)
@@ -312,9 +342,11 @@ explicitly does not add.
 ### F1 — Baseline activation → refresh diff → reset (§8, §9, B9)
 - **Purpose:** yellow is an on-demand, id-keyed baseline diff — never a commit-time
   output; refresh highlights changes vs an explicitly-activated baseline; reset clears.
-- **Entrypoint:** `yellow_reset(store, state, service, sheet_id, persist=…)` to
-  activate a baseline → make a B1-style change → `yellow_refresh(store, state,
-  service, sheet_id)` → `yellow_reset` to clear.
+- **Entrypoint:** `yellow_reset(store, state, service, sheet_id)` inside
+  `with open_rooming_store_and_state(for_write=True) as (store, state, _):` (exclusive StateStore lock held for the
+  reset; no `persist` injection) to activate a baseline → make a B1-style change →
+  `yellow_refresh(store, state, service, sheet_id)` (read-only session) → `yellow_reset`
+  to clear. A competing writer gets `StateBusyError` with zero mutation.
 - **Starting state:** A1 done; **no baseline yet** (a refresh with no baseline must
   STOP and ask — no automatic first baseline, §8).
 - **Target/fields:** highlighting applies to the changed record's comparison cells
@@ -323,7 +355,8 @@ explicitly does not add.
   changed record's changed comparison cells; reset clears all highlight.
 - **This step mutates cell FORMATTING** (`batchUpdate` background) — reversible.
 - **Request History / Draft:** none from yellow.
-- **Durable state:** baseline snapshot persisted per `persist`.
+- **Durable state:** baseline staged as `pending`, durably verified, then atomically
+  promoted to `active` (schema 1 container).
 - **Failure condition:** refresh with no activated baseline → STOP/ask (no silent
   first baseline); highlight that cannot be tied to a record id → stop.
 - **Cleanup/restoration:** `yellow_reset` to clear all highlighting; discard the
@@ -335,8 +368,12 @@ explicitly does not add.
 
 ## Execution order & stop rule
 
-1. Section 0 preconditions (read-only) — **must all pass live.**
-2. A1 → B1 → B2 → F1 (constructive), then C1 → D1 → D2 (fail-fast), then E1.
+1. Section 0 preconditions (read-only) — the phase's applicable P1–P8 **must all
+   pass live**: A1 uses the **pre-A1** set (P8 pre-A1); B1/B2/C1/E1/F1 use the
+   **post-A1** set (P8 post-A1). A1 having been LIVE VERIFIED, live re-runs now begin
+   from the post-A1 set unless a fresh bootstrap is required.
+2. A1 (already LIVE VERIFIED) → B1 → B2 → F1 (constructive), then C1 → D1 → D2
+   (fail-fast), then E1.
 3. After each scenario: **read the Sheet back**, compare to expected, perform the
    documented restoration, **read again to confirm restoration** before the next
    scenario. Never infer success from an API response alone.

@@ -72,6 +72,13 @@ class RenderTargetError(RuntimeError):
 _IDENTITY_KEYS = ("spreadsheet_id", "tab", "sheet_gid")
 
 
+def _is_numeric_gid(value):
+    """A valid numeric Sheets gid is an ``int`` (``0`` IS valid) but NOT a ``bool``,
+    ``str`` (e.g. ``"0"``), or ``None`` — the single authority for "is this a real gid"
+    reused by both the mutating-boundary identity check and the render-target check."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _require_bound_authority(store, state, flow):
     """Defence at the mutating boundary (B2): an OPERATIONAL store may only mutate/reconcile
     through a durable StateStore whose target binding EXACTLY matches the store backend's
@@ -87,7 +94,7 @@ def _require_bound_authority(store, state, flow):
     """
     from hotelops_pg.state_store import StateAuthorityError
     if not getattr(store.backend, "operational", False):
-        return                              # EXPLICIT pure/test backend — injectable, unchanged
+        return None                         # EXPLICIT pure/test backend — injectable, unchanged
     try:
         identity = store.backend.destination_identity()
     except Exception as exc:                # noqa: BLE001 — operational identity MUST resolve
@@ -95,7 +102,10 @@ def _require_bound_authority(store, state, flow):
             f"operational {flow}: the store's destination identity failed to resolve "
             f"({exc!r}); fail closed before any business mutation (§0)."
         )
-    if not isinstance(identity, dict) or any(not identity.get(k) for k in _IDENTITY_KEYS):
+    sid, tab, gid = (identity.get("spreadsheet_id"), identity.get("tab"),
+                     identity.get("sheet_gid")) if isinstance(identity, dict) else (None, None, None)
+    if not (isinstance(sid, str) and sid.strip() and isinstance(tab, str) and tab.strip()
+            and _is_numeric_gid(gid)):      # gid=0 is VALID; None/str/bool are not
         raise StateAuthorityError(
             f"operational {flow}: destination identity {identity!r} is missing/malformed; "
             "fail closed (§0)."
@@ -112,6 +122,7 @@ def _require_bound_authority(store, state, flow):
             f"destination {identity!r}; it is unbound. Establish authority via the operational "
             "boundary before any business mutation (§0)."
         )
+    return identity                         # verified operational destination (for render-target matching)
 
 
 def _require_durable(state, flow):
@@ -144,11 +155,37 @@ def _require_render_target(service, sheet_id, flow):
             f"operational {flow} requires a Sheets render service; a diff-only / "
             "renderer-less call must not report success (§8/§9, B9)."
         )
-    if sheet_id is None:
+    if not _is_numeric_gid(sheet_id):
         raise RenderTargetError(
             f"operational {flow} requires an explicit numeric target sheet id (the verified "
-            "'01. Rooming List' gid); it must not assume 0 (B9)."
+            f"'01. Rooming List' gid); {sheet_id!r} is not a valid integer gid (0 is valid; "
+            "None / str such as '0' / bool are not) and it must not assume 0 (B9)."
         )
+
+
+def _require_operational_render(store, state, service, sheet_id, flow):
+    """Full operational precondition for a yellow render (B9 + §0 authority), BEFORE any
+    read / persist / render.
+
+    Fails closed if the durable authoritative state is missing, unbound, or target-mismatched;
+    the backend destination identity is missing/malformed; the supplied ``sheet_id`` is not a
+    valid integer gid; or ``sheet_id`` does not EXACTLY equal the backend destination's actual
+    ``sheet_gid`` (so a wrong gid can never be formatted). Reuses the established mutating-
+    boundary authority (``_require_bound_authority``) rather than a parallel target notion; the
+    pure/injectable (non-operational) backend path is unchanged — durability, a present renderer
+    and a valid-gid still apply, but identity is ``None`` there so the binding and the
+    ``sheet_id``↔destination match are not enforced (that path can never reach the LIVE Sheet).
+    """
+    _require_durable(state, flow)                            # durable authoritative state (both flows, B8)
+    identity = _require_bound_authority(store, state, flow)   # bound authority; None = pure/test path
+    _require_render_target(service, sheet_id, flow)           # renderer present + valid numeric gid
+    if identity is not None and sheet_id != identity["sheet_gid"]:
+        raise RenderTargetError(
+            f"operational {flow}: supplied sheet_id {sheet_id!r} does not match the backend "
+            f"destination gid {identity['sheet_gid']!r}; refusing to format a different tab "
+            "(B9/§0)."
+        )
+    return identity
 
 
 # Payment vocabulary is PRD-enumerated (§20). Recognizing a trailing payment token
@@ -555,18 +592,20 @@ def confirm_preview(preview, *, grouping_disposition="", impact_dispositions=Non
     )
 
 
-def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_confirmed=False):
+def execute_confirmed(store, state, confirmed, *, request_date="MMDD", hotel_confirmed=False,
+                      confirmed_envelope=None):
     """Execute (or safely retry/recover) ONE already-confirmed operation artifact (B7-A).
 
     Requires durable state (B8). Re-runnable by contract: a retry of the SAME confirmed
     artifact reconciles against the durable journal via ``execute`` and never
-    re-authorizes, re-applies, or duplicates history (§15). This is the operational
-    EXECUTE step, deliberately distinct from :func:`confirm_preview`.
+    re-authorizes, re-applies, or duplicates history (§15). ``confirmed_envelope`` (the
+    supported live path) is the FULL canonical ConfirmedArtifact staged durably before the
+    first business mutation. This is the operational EXECUTE step, distinct from ``confirm_preview``.
     """
     _require_durable(state, "commit")                    # B8: fail before any mutation
     _require_bound_authority(store, state, "commit")     # B2: bound authority before mutation
     return execute(confirmed, store, state, request_date=request_date,
-                   hotel_confirmed=hotel_confirmed)
+                   hotel_confirmed=hotel_confirmed, confirmed_envelope=confirmed_envelope)
 
 
 def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed=False):
@@ -587,13 +626,23 @@ def recover(store, state, operation_ref, *, request_date="MMDD", hotel_confirmed
             f"no persisted confirmed operation {operation_ref!r} to recover; nothing was "
             "durably staged (§15, B7-A)."
         )
-    # request_date / hotel_confirmed are fixed at confirmation and loaded from the DURABLE
-    # artifact — a retry/recovery can never change their meaning with new caller values
-    # (§17/§19). Legacy payloads without them fall back to the caller defaults.
-    rd = payload.get("request_date", request_date)
-    hc = payload.get("hotel_confirmed", hotel_confirmed)
-    confirmed = from_payload(payload)
-    return execute(confirmed, store, state, request_date=rd, hotel_confirmed=hc)
+    # request_date / hotel_confirmed are FIXED at confirmation and loaded ONLY from the
+    # durable artifact — the caller ``request_date``/``hotel_confirmed`` args are ignored so a
+    # retry can never change their meaning (§17/§19, round-4 §5). NO invented defaults.
+    if payload.get("kind") == "confirmed":
+        from hotelops_pg.change import verify_durable_confirmed
+        identity = store.backend.destination_identity()  # operational (guard already passed)
+        confirmed = verify_durable_confirmed(payload, operation_ref, identity, state.target_binding)
+        return execute(confirmed, store, state, request_date=payload["request_date"],
+                       hotel_confirmed=payload["hotel_confirmed"], confirmed_envelope=payload)
+    if "request_date" in payload and "hotel_confirmed" in payload:   # minimal (pure/unit) envelope
+        confirmed = from_payload(payload)
+        return execute(confirmed, store, state, request_date=payload["request_date"],
+                       hotel_confirmed=payload["hotel_confirmed"])
+    # Legacy artifact missing recoverable semantic evidence → incompatible; never invent
+    # request_date="MMDD"/hotel_confirmed=False, never migrate/rebind, zero writes (round-4 §6).
+    from hotelops_pg.execution import incompatible_legacy_result
+    return incompatible_legacy_result(operation_ref, state.is_executed(operation_ref))
 
 
 def commit(store, state, preview, *, grouping_disposition="", impact_dispositions=None,
@@ -638,7 +687,7 @@ def yellow_refresh(store, state, service, sheet_id):
     from hotelops_pg.baseline import refresh
     from hotelops_pg.yellow_sheets import apply_yellow
 
-    _require_render_target(service, sheet_id, "yellow refresh")
+    _require_operational_render(store, state, service, sheet_id, "yellow refresh")
 
     obs = {}
 
@@ -653,7 +702,7 @@ def yellow_refresh(store, state, service, sheet_id):
     return result
 
 
-def yellow_reset(store, state, service, sheet_id, persist=None):
+def yellow_reset(store, state, service, sheet_id):
     """Operational yellow reset — DURABLE state (B8) + validated observation + real render.
 
     Preserves the R3 §9 sequence: capture candidate → persist → verify/activate → NEW
@@ -661,9 +710,11 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     and the numeric ``sheet_id`` are BOTH required with no default and validated up front
     (``RenderTargetError``, before ``_require_durable`` and before any capture/persist), so
     there is no ``render=None``/``sheet_id=0`` call form that returns a successful reset
-    without delivering the formatting to a verified target. ``persist`` stays
-    injectable for durability tests; the real Sheets render is supplied by the operational
-    entry (distinct from any test-injected domain render).
+    without delivering the formatting to a verified target. There is NO persist injection:
+    the reset always runs the verified pending → durable verify → promotion lifecycle
+    (failure injection lives only in the domain seam ``baseline.reset``). On an operational
+    backend the state MUST come from the exclusive write session
+    (``open_rooming_store_and_state(for_write=True)``), so the lock is held for the whole reset.
 
     Authority guard (R3-C, §9/AC-12c): while baseline authority is indeterminate, further
     yellow refresh/reset are blocked and NO formatting request is issued. Failure semantics
@@ -672,15 +723,19 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
     activation → new baseline retained, ``activated_render_incomplete`` (no rollback).
     """
     from hotelops_pg.baseline import AUTHORITY_UNCERTAIN, UncertainBaselineError, _diff, reset
+    from hotelops_pg.state_store import StateAuthorityError
     from hotelops_pg.yellow_sheets import apply_yellow
 
-    _require_render_target(service, sheet_id, "yellow reset")
-    _require_durable(state, "yellow reset")
+    identity = _require_operational_render(store, state, service, sheet_id, "yellow reset")
 
     if state.authority == AUTHORITY_UNCERTAIN:
         raise UncertainBaselineError(
             "baseline authority uncertain; yellow reset blocked until re-verified (R3-C, §9)"
         )
+    if identity is not None and not state.lock_held:
+        raise StateAuthorityError(
+            "operational yellow reset requires the exclusive StateStore write session "
+            "(open_rooming_store_and_state(for_write=True)); refusing an unlocked state.")
 
     obs = {}
 
@@ -697,4 +752,4 @@ def yellow_reset(store, state, service, sheet_id, persist=None):
                      result, obs["records"], obs["headers"], sheet_id, obs["header_row"])
         return result
 
-    return reset(observe, state, persist=persist, render=render)
+    return reset(observe, state, render=render)

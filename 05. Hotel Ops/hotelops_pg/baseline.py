@@ -18,10 +18,16 @@ Reset is snapshot-based with an activation/cutoff/failure contract (R3 §9):
   B) activated but render fails → new baseline authoritative (``activated_render_incomplete``);
   C) authority indeterminate → ``uncertain`` + block further yellow ops.
 """
+import uuid
 from dataclasses import dataclass, field
 
 from hotelops_pg import fields
-from hotelops_pg.state_store import AUTHORITY_UNCERTAIN
+from hotelops_pg.state_store import (
+    ACT_ACTIVATED,
+    ACT_PREVIOUS,
+    AUTHORITY_UNCERTAIN,
+    BaselineStateError,
+)
 
 
 class NoBaselineError(RuntimeError):
@@ -100,15 +106,42 @@ def refresh(read, state) -> RefreshResult:
 def reset(read, state, persist=None, render=None) -> ResetResult:
     """Snapshot-based reset with R3 activation/cutoff/failure semantics (§9).
 
-    ``persist`` (default ``state.persist_baseline``) and ``render`` (default the
-    diff) are injectable so failure modes are testable. This also serves as the
-    INITIAL baseline capture when none exists (§8 workflow, AC-33).
+    Default (``persist=None``): the durable verified-before-activation lifecycle —
+    capture candidate → freeze attempt id + expected predecessor generation → stage as
+    ``pending`` (active preserved) → reload + verify the durable pending → atomically
+    promote (``state.establish_baseline``). Outcome mapping: activated → render
+    (``activated_render_incomplete`` on render failure); previous → ``failed_before_activation``;
+    uncertain → ``uncertain`` + indeterminate.
+
+    An injected ``persist`` keeps the legacy direct-activate seam (persist → reload →
+    verify) so persist-failure tests stay expressible. ``render`` (default the diff) is
+    injectable. This also serves as the INITIAL baseline capture when none exists (§8, AC-33).
     """
-    persist = persist or state.persist_baseline
     render = render or (lambda recs, base: _diff(recs, base))
 
     # 1. capture candidate
     candidate = _capture(read())
+
+    if persist is None:
+        # 2. freeze attempt identity + promotion predecessor before any durable write.
+        # Malformed/ambiguous authority fails closed from the durable structure itself —
+        # nothing is written (no repair, no dependence on persisting 'uncertain').
+        try:
+            state.validate()
+            predecessor = state.active_generation()
+        except BaselineStateError as exc:
+            return ResetResult("uncertain", "indeterminate",
+                               detail=f"durable baseline malformed: {exc}; authority uncertain (R3-C)")
+        outcome = state.establish_baseline(candidate, attempt_id=uuid.uuid4().hex,
+                                           expected_predecessor=predecessor,
+                                           target_binding=state.target_binding)
+        if outcome == ACT_PREVIOUS:
+            return ResetResult("failed_before_activation", "previous",
+                               detail="new baseline not activated; previous baseline remains authoritative")
+        if outcome != ACT_ACTIVATED:
+            return ResetResult("uncertain", "indeterminate",
+                               detail="could not establish baseline authority; authority uncertain (R3-C)")
+        return _render_activated(read, state, render)
 
     # 2–3. persist durably + verify activation. Failure here = BEFORE activation.
     try:
@@ -118,12 +151,26 @@ def reset(read, state, persist=None, render=None) -> ResetResult:
                            detail=f"persist failed before activation: {exc}")
     # Verify DURABLE activation by reloading from storage (not merely inspecting the
     # already-mutated in-memory copy) — proves the new baseline is really persisted (B8).
-    state.reload()
-    if not state.has_baseline or state.get_baseline() != candidate:
+    # A reload/verification READ that itself raises must NOT let reset escape as success with
+    # authority still 'active' — any failure to establish post-persist authority is R3-C
+    # indeterminate (same as a verification mismatch), so subsequent yellow ops stay blocked.
+    try:
+        state.reload()
+        verified = state.has_baseline and state.get_baseline() == candidate
+    except Exception as exc:  # noqa: BLE001 — post-persist verification read failed
+        state.mark_uncertain()
+        return ResetResult("uncertain", "indeterminate",
+                           detail=f"post-persist baseline verification read failed: {exc}; "
+                                  "authority uncertain (R3-C)")
+    if not verified:
         state.mark_uncertain()
         return ResetResult("uncertain", "indeterminate",
                            detail="could not verify persisted baseline; authority uncertain (R3-C)")
 
+    return _render_activated(read, state, render)
+
+
+def _render_activated(read, state, render) -> ResetResult:
     # 4. NEW baseline authoritative.
     # 5–6. read current sheet for comparison + render from that snapshot.
     try:

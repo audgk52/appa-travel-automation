@@ -114,15 +114,16 @@ def test_operational_reset_uses_final_comparison_snapshot(make_store, durable_st
     store, backend = make_store([record(name="James", record_id="rl-a", stay_id="S1",
                                         **{fields.REMARK: "A"})])
     h = _headers(backend)
-    real_persist = durable_state.persist_baseline
+    real_establish = durable_state.establish_baseline
 
-    def persist_then_mutate(values):
-        real_persist(values)                                     # candidate "A" becomes durable
+    def establish_then_mutate(values, **kw):
+        out = real_establish(values, **kw)                       # candidate "A" becomes durable
         backend.grid[1][h[fields.REMARK]] = "B"                  # change BEFORE final read
+        return out
 
+    durable_state.establish_baseline = establish_then_mutate
     fake = FakeSheets()
-    res = yellow_reset(store, durable_state, service=fake, sheet_id=GID,
-                       persist=persist_then_mutate)
+    res = yellow_reset(store, durable_state, service=fake, sheet_id=GID)
 
     assert res.status == "ok"
     assert durable_state.get_baseline()["rl-a"][fields.REMARK] == "A"   # new baseline = candidate
