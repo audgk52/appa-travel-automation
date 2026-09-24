@@ -12,7 +12,7 @@ Hotel Ops v1 closure. Hard stop tonight.
 
 1. **Push + confirm state.** Confirm current branch, that `db71d01` is pushed, and update the
    "(confirm)" rows in `STATUS.md` from the session logs / state journal. Read-only. No code.
-2. **C1 → D1 → D2 live**, following `RUNBOOK_LIVE1_RoomingList.md` on the PII-free throwaway Sheet.
+2. **D1 → D2 live**, following `RUNBOOK_LIVE1_RoomingList.md` on the PII-free throwaway Sheet.
    Preflight first. Read back, restore, read again after each. Stop on any material safety failure.
 3. **UAT entry point** — _decision from Myungha:_ ___
 4. **Path B end-to-end** with one realistic instruction (e.g. `"<Traveler> checkout 11/12 → 11/14"`):

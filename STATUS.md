@@ -19,7 +19,7 @@
 | B2 identity across reorder | ✅ LIVE VERIFIED (9/23) |
 | F1 baseline / refresh / reset | ✅ minimal live gate passed (9/24) |
 | E1 retry idempotency | ✅ LIVE VERIFIED (9/23) |
-| C1 stale dependency fail-fast | ⬜ |
+| C1 stale dependency fail-fast | ✅ LIVE VERIFIED (9/23) — stale op correctly absent from state journal |
 | D1 duplicate ID halt | ⬜ |
 | D2 schema fail-fast | ⬜ |
 | Path B end-to-end (real-style instruction) | ⬜ |

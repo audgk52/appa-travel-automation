@@ -28,7 +28,10 @@ When you finish a task, always report the **exact commit hash** and test count s
 ## Non-negotiable safety rules
 
 1. **No real PII, ever.** Real rooming lists, travel memos, passports, and itineraries stay local
-   and gitignored. Live verification uses only the PII-free throwaway Sheet. Never weaken `.gitignore`.
+   and gitignored. Never weaken `.gitignore`. Live work touches only the two PII-free Sheets:
+   - **LIVE-1 throwaway Sheet** — runbook scenarios (A1–F1, C1/D1/D2).
+   - **UAT test Sheet** — Myungha's UAT.
+   The repo is public: never write a Sheet ID, key path contents, or key material into any tracked file.
 2. **No business write before human confirmation.** preview → Myungha confirms → revalidate → write.
    (Sole exception: authorized `rooming_record_id` adoption, per PRD §2.)
 3. **Nothing is sent.** Kakao/email are drafts only. Sending is out of scope.
@@ -37,8 +40,11 @@ When you finish a task, always report the **exact commit hash** and test count s
 5. **Fail closed.** When state, identity, target, or schema is ambiguous → stop and report, don't guess.
 6. **Verify by reading back.** Never report success from an API response alone. Outputs describe
    verified state, not intended state. Unknown outcome = `uncertain`, not `failed` or `ok`.
-7. **Live operations go through the supported `live_ops` facade.** Test seams / dependency injection
-   must not be reachable from operational entrypoints.
+7. **Live operations use exactly two supported paths.**
+   - Business changes: the `live_ops` facade — `preview` / `confirm` / `execute_confirmed` / `recover`.
+   - Yellow refresh/reset: `spine.yellow_refresh` / `spine.yellow_reset`, called inside
+     `sheet_store.open_rooming_store_and_state(for_write=True)`.
+   Any other operational path that uses a test seam / injected store or state is forbidden.
 8. **Live runs follow `05. Hotel Ops/RUNBOOK_LIVE1_RoomingList.md` exactly** — exact-instance gate,
    read back, restore, read again. On any material safety failure: STOP.
 
@@ -59,14 +65,26 @@ Run from the repo root (subshells, so both lines work pasted together). Verified
 (cd "02. Dispatch"  && python -m pytest -q)     # Dispatch
 ```
 Run the full regression for the agent you touched before every commit you hand to audit.
-Hotel Ops durable state lives at `~/.appa/hotel_ops/state.json` (+ `.lock` sidecar) — never commit it.
+Hotel Ops durable state (each with a `.lock` sidecar) — never commit it:
+- `~/.appa/hotel_ops/state.json` — LIVE-1 throwaway Sheet
+- `~/.appa/hotel_ops_uat/state.json` — UAT test Sheet (not created yet as of 9/24)
+
+Live-run environment variables (names only — set them locally, never write values into the repo):
+`APPA_HOTEL_GSHEET_ID`, `APPA_HOTEL_GSHEET_TAB`, `APPA_HOTEL_STATE_PATH`, `APPA_GOOGLE_SA_KEY`
+(run from `05. Hotel Ops` with `PYTHONPATH=$PWD`). `APPA_GSHEET_ID` is Dispatch's — see rule 4.
 
 ## Document conventions
 
-- Per agent: `PRD_*.md` (contract, source of truth) · `DESIGN_*` / `PLAN_*` · `RUNBOOK_*` · `REVIEW_*` (audits).
-- PRD decisions carry evidence tags: `[A]` artifact · `[M]` Myungha decision · `[⌂]` architecture · `[impl]`.
-  Never mark something `[M]` unless Myungha actually decided it.
-- Session logs: `00. Session Log/JOB_YYYY-MM-DD.md` (written by `/eod`).
+- Every agent has `PRD_*.md` (contract, source of truth).
+  Dispatch also has `DESIGN_*` / `PLAN_*` / `REVIEW_*` (audits). Hotel Ops has `RUNBOOK_*` instead.
+- The Hotel Ops PRD tags decisions with evidence: `[A]` artifact · `[M]` Myungha decision ·
+  `[⌂]` architecture · `[impl]` implementation. Never mark something `[M]` unless Myungha actually decided it.
+- `00. Session Log/` holds:
+  - `JOB_YYYY-MM-DD.md` — daily session log (written by `/eod`, tracked).
+  - `HANDOFF_*.md` — old-style session handoffs (until 9/24). Replaced by `WORKLOG.md` (gitignored)
+    + `/handoff`. Untracked; they contain Sheet IDs, so don't commit them.
+  - `*_PreviewArtifact_*.json` / `*_ConfirmedArtifact_*.json` — frozen LIVE-1 artifacts (evidence). Untracked.
+- Session commands live in `.claude/commands/` (`/start`, `/handoff`, `/eod`) — that is the canonical copy.
 - `Daily_Retrospective_*_KO.md` is **Myungha's own reflection** — never write her `[ME]` judgments for her.
 
 ## How to talk to Myungha
