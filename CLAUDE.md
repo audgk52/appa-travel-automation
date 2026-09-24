@@ -47,6 +47,7 @@ When you finish a task, always report the **exact commit hash** and test count s
    Any other operational path that uses a test seam / injected store or state is forbidden.
 8. **Live runs follow `05. Hotel Ops/RUNBOOK_LIVE1_RoomingList.md` exactly** — exact-instance gate,
    read back, restore, read again. On any material safety failure: STOP.
+9. **Explicit staging only.** Never `git add .` / `git add -A` when committing — stage each file by name.
 
 ## Scope and loop discipline (deadline: 9/30)
 
@@ -67,7 +68,7 @@ Run from the repo root (subshells, so both lines work pasted together). Verified
 Run the full regression for the agent you touched before every commit you hand to audit.
 Hotel Ops durable state (each with a `.lock` sidecar) — never commit it:
 - `~/.appa/hotel_ops/state.json` — LIVE-1 throwaway Sheet
-- `~/.appa/hotel_ops_uat/state.json` — UAT test Sheet (not created yet as of 9/24)
+- `~/.appa/hotel_ops_uat/state.json` — UAT test Sheet; UAT sets `APPA_HOTEL_STATE_PATH` to this path [M] (not created yet as of 9/24)
 
 Live-run environment variables (names only — set them locally, never write values into the repo):
 `APPA_HOTEL_GSHEET_ID`, `APPA_HOTEL_GSHEET_TAB`, `APPA_HOTEL_STATE_PATH`, `APPA_GOOGLE_SA_KEY`

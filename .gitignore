@@ -51,3 +51,7 @@ __pycache__/
 .DS_Store
 .serena/
 WORKLOG.md
+
+# --- Local session artifacts (contain Sheet IDs) — keep local only ---
+00. Session Log/*.json
+00. Session Log/HANDOFF_*.md
