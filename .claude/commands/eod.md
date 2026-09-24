@@ -25,10 +25,12 @@ Do these steps in order. Do not change any code in this command.
    If today's plan slipped, add one line under "Right now" saying what slipped and why.
 
 4. **Write `00. Session Log/JOB_<YYYY-MM-DD>.md`** in the existing format:
-   1. 오늘의 목표 · 2. 완료한 작업 · 3. 잘된 점 · 4. 어려웠던 점 · 5. 근본 원인 ·
-   6. 확정한 결정 · 7. 미완료 / blocker · 8. 다음 세션 우선순위 · 9. 포트폴리오 근거 · 10. 상태 요약.
-   Facts only — commits, test counts, live evidence. Under "확정한 결정", list only decisions Myungha
-   actually made today; if unsure, write "(Myungha 확인 필요)". Do **not** write her Daily Retrospective.
+   1. 오늘의 목표 · 2. 완료한 작업 (커밋 해시, 테스트 수, live 증거, 감사 결과) ·
+   3. 확정한 결정 · 4. 미완료 / blocker · 5. 다음 세션 우선순위 · 6. 상태 요약.
+   Facts only — no interpretation or evaluation sentences. No "잘된 점 / 어려웠던 점 / 근본 원인 /
+   포트폴리오 근거" — those belong in Myungha's Daily Retrospective, which you never write.
+   Under "확정한 결정", list only decisions Myungha actually made today, one line each;
+   if unsure, write "(Myungha 확인 필요)".
 
 5. **Reset the worklog.** After the session log is written, clear `WORKLOG.md` down to a single line:
    `# WORKLOG — entries since <YYYY-MM-DD> EOD`. (Today's content now lives in the JOB log.)
@@ -42,5 +44,7 @@ Do these steps in order. Do not change any code in this command.
    - Open BLOCKERs / open decisions for Myungha
    - Suggested top 3 for tomorrow (from the schedule in `STATUS.md`)
    - Anything on the edge of scope that needs a decision
+   - ChatGPT Project 파일 재업로드 필요: if today's commits changed `CLAUDE.md` or any `PRD_*.md`
+     (check with `git log --since="today 00:00" --name-only`), list the paths; otherwise `none`.
 
 Keep the final message short: what you updated, the commit hash, push status, then the handoff block.
