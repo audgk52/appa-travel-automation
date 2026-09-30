@@ -1,0 +1,117 @@
+# --- Sensitive production data (PII) — NEVER commit/push, keep local only ---
+Reference Files/
+APPA_Notes_Compiled.md
+
+# --- 05. Hotel Ops — folder holds PII rooming data; default-deny, then allow code only ---
+05. Hotel Ops/*
+!05. Hotel Ops/.gitignore
+!05. Hotel Ops/PRD_HotelOps_PG_RoomingList.md
+!05. Hotel Ops/RUNBOOK_LIVE1_RoomingList.md
+!05. Hotel Ops/conftest.py
+!05. Hotel Ops/hotelops_pg/
+!05. Hotel Ops/tests/
+# re-ignore any PII data / runtime state / secrets that land inside the code dirs
+05. Hotel Ops/**/*.xlsx
+05. Hotel Ops/**/*.csv
+05. Hotel Ops/**/*.tsv
+05. Hotel Ops/**/*.pdf
+05. Hotel Ops/**/*.json
+05. Hotel Ops/**/*.docx
+05. Hotel Ops/**/*.doc
+05. Hotel Ops/**/*.env
+05. Hotel Ops/**/.env
+05. Hotel Ops/**/*.pem
+05. Hotel Ops/**/*.key
+05. Hotel Ops/**/*.p12
+05. Hotel Ops/**/*.crt
+05. Hotel Ops/**/*.credentials
+
+# --- 04. Doc Pipeline — default-deny; itineraries/memos/logs stay local ---
+04. Doc Pipeline/*
+!04. Doc Pipeline/PRD_DocPipeline_PA.md
+!04. Doc Pipeline/conftest.py
+!04. Doc Pipeline/doc_pipeline/
+04. Doc Pipeline/doc_pipeline/*
+!04. Doc Pipeline/doc_pipeline/__init__.py
+!04. Doc Pipeline/doc_pipeline/cli.py
+!04. Doc Pipeline/doc_pipeline/config.py
+!04. Doc Pipeline/doc_pipeline/itinerary.py
+!04. Doc Pipeline/doc_pipeline/memo.py
+!04. Doc Pipeline/doc_pipeline/pg.py
+!04. Doc Pipeline/doc_pipeline/rooming.py
+!04. Doc Pipeline/doc_pipeline/runner.py
+!04. Doc Pipeline/doc_pipeline/state.py
+!04. Doc Pipeline/doc_pipeline/travel_log.py
+!04. Doc Pipeline/tests/
+04. Doc Pipeline/tests/*
+!04. Doc Pipeline/tests/test_flow.py
+!04. Doc Pipeline/tests/test_units.py
+# re-ignore data formats even inside allowed code folders
+04. Doc Pipeline/**/*.xlsx
+04. Doc Pipeline/**/*.csv
+04. Doc Pipeline/**/*.tsv
+04. Doc Pipeline/**/*.pdf
+04. Doc Pipeline/**/*.json
+04. Doc Pipeline/**/*.docx
+04. Doc Pipeline/**/*.doc
+04. Doc Pipeline/**/*.env
+04. Doc Pipeline/**/.env
+04. Doc Pipeline/**/*.pem
+04. Doc Pipeline/**/*.key
+04. Doc Pipeline/**/*.p12
+04. Doc Pipeline/**/*.crt
+04. Doc Pipeline/**/*.credentials
+
+*.xlsx
+*.pdf
+# real Travel Memos / passports / itineraries if ever placed elsewhere
+*passport*
+*Passport*
+
+# --- Credentials / secrets — NEVER commit (repo-wide) ---
+*service_account*.json
+*service-account*.json
+*.credentials.json
+*.pem
+*.key
+*.p12
+*.crt
+.env
+*.env
+
+# --- Build artifacts ---
+*.app/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.serena/
+WORKLOG.md
+
+# --- Local session artifacts (contain Sheet IDs) — keep local only ---
+00. Session Log/*.json
+00. Session Log/HANDOFF_*.md
+
+# --- Public export hardening (appended; rules above are unchanged) ---
+# Allow each agent's requirements file inside the allow-listed agent folders
+!04. Doc Pipeline/requirements.txt
+!05. Hotel Ops/requirements.txt
+# Local run records and handoffs (repo root and every agent folder)
+UAT_*
+UAT2_*
+HANDOFF_*
+# Local tool config
+/.codex/
+/.claude/settings.local.json
+# Screen recordings / demo video
+*.mp4
+*.mov
+*.mkv
+*.webm
+# Root-level state, credentials and documents
+/state.json
+*service_account*.json
+*service-account*.json
+/*key*.json
+/*.docx
+.env*

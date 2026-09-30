@@ -1,0 +1,4 @@
+pdfplumber
+google-api-python-client
+google-auth
+# Also imports hotelops_pg from ../05. Hotel Ops in this repository (added to sys.path; no extra package).
