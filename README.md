@@ -3,7 +3,8 @@
 > 영화·드라마 제작 현장의 트래블 코디네이터 업무를 데이터 흐름과 판단 단계로 분해하고,
 > 사람의 승인을 유지한 채 반복 후속 작업을 자동화한 개인 프로젝트입니다.
 
-[![APPA 시연 영상 (4분 38초, 한국어 자막)](https://img.youtube.com/vi/t6W0TLGNT8s/maxresdefault.jpg)](https://youtu.be/t6W0TLGNT8s)
+<p align="center"><a href="https://youtu.be/t6W0TLGNT8s"><img src="assets/demo-thumbnail.png" alt="APPA 시연 영상 보기 (4분 38초, 한국어 자막)" width="720"></a></p>
+<p align="center"><b><a href="https://youtu.be/t6W0TLGNT8s">▶ 시연 영상 보기 (4분 38초, 한국어 자막)</a></b></p>
 
 **▶ 시연 영상** — GPT로 만든 가상 여행자의 왕복 일정표를 입력으로, 세 에이전트가 이어지는 흐름을 보여줍니다.
 Hotel Ops(루밍리스트 변경과 노란색 변경 표시) → Doc Pipeline(트래블 메모·트래블 로그 작성) →
@@ -501,6 +502,7 @@ Python 3 환경에서 에이전트마다 가상환경을 만들어 `requirements
 | `02. Dispatch` | Dispatch 에이전트, PRD, 설계·리뷰·설정 문서 |
 | `04. Doc Pipeline` | Doc Pipeline 에이전트와 PRD |
 | `05. Hotel Ops` | Hotel Ops 에이전트, PRD, 실행 런북 |
+| `assets` | README용 이미지(시연 영상 썸네일) |
 | `CLAUDE.md`, `AGENTS.md` | 구현을 맡은 AI(Claude Code)에게 주는 규칙: 안전 규칙, 범위, 역할 분담 |
 
 ### 문서
